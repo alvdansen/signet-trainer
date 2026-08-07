@@ -3683,10 +3683,22 @@ def _h3_load_component(component_dir: str, *, device: str, dtype: Any) -> Any:
     memory=(80 * 1024, 200 * 1024),
     timeout=TWENTY_FOUR_HOURS,
 )
+def _h3_frame_buckets(config: Any) -> tuple[int, ...]:
+    """The declared frame buckets' F values, for the position-ids builder and the strategy.
+
+    SigneConfig guarantees every bucket parses, that their W x H equals the run's canvas, and that
+    `training_dims[2]` is among them — so this is a read, not a second opinion.
+    """
+    from signet_trainer.config.validators import validate_h3_resolution_bucket  # noqa: PLC0415
+
+    return tuple(sorted({validate_h3_resolution_bucket(b)[2] for b in config.data.resolution_buckets}))
+
+
 def h3_preprocess(
     metadata_path: str,
     output_dir: str,
     target_frames: int,
+    frame_buckets: tuple[int, ...],
     target_aspect: tuple[int, int],
     reference_image_short_edge: int,
     reference_pair_seed: int,
@@ -3865,11 +3877,48 @@ def h3_preprocess(
             "(h3.preprocess_overwrite=false)."
         )
     canvas_height, canvas_width = resolve_canvas_size(*target_aspect)
-    n_target_video = h3_latent_frames(int(target_frames)) * rows_of(canvas_height, canvas_width)
-    n_target_audio = h3_audio_rows(int(target_frames))
+
+    # ── FRAME-COUNT BUCKETING ────────────────────────────────────────────────────────────────────
+    # A row may name its own `target_frames`; otherwise it takes `target_frames` (training_dims F).
+    # ⛔ NO SILENT DEFAULT WHEN BUCKETS ARE DECLARED. This function's contract is that a threading
+    # gap must be a loud error, not a wrong default (see the docstring above). A typo'd manifest key
+    # (`frames`, `n_frames`) would otherwise stage the whole corpus at ONE count and encode clean —
+    # `_h3_read_video_rgb` only refuses clips SHORTER than requested — so a mixed-length design
+    # would evaporate with no error anywhere.
+    declared = tuple(sorted({int(f) for f in frame_buckets}))
+    multi = len(declared) > 1
+
+    def _row_frames(row: dict, index: int) -> int:
+        if "target_frames" not in row:
+            if multi:
+                raise KeyError(
+                    f"[h3_preprocess] manifest row {index} names no 'target_frames', but this run "
+                    f"declares {len(declared)} frame buckets {declared}. With more than one bucket "
+                    f"there is no safe default — a row must say which one it is."
+                )
+            return int(target_frames)
+        frames = int(row["target_frames"])
+        if frames not in declared:
+            raise ValueError(
+                f"[h3_preprocess] manifest row {index} declares target_frames={frames}, which is "
+                f"not a declared bucket {declared}. Add it to data.resolution_buckets (it is then "
+                f"priced by the config-load budget) or restage the row."
+            )
+        return frames
+
+    # Sweep the WHOLE manifest before the smoke and before PHASE A pushes the corpus through
+    # Qwen3-VL-32B. Discovering an undeclared count on row 700 of 800 wastes the entire encode.
+    row_frames = [_row_frames(row, i) for i, row in enumerate(rows)]
+    used = tuple(sorted(set(row_frames)))
+    n_target_video_by_frames = {
+        f: h3_latent_frames(f) * rows_of(canvas_height, canvas_width) for f in used
+    }
+    n_target_audio_by_frames = {f: h3_audio_rows(f) for f in used}
+    n_target_video = n_target_video_by_frames[row_frames[0]]
+    n_target_audio = n_target_audio_by_frames[row_frames[0]]
     print(
         f"[h3_preprocess] {len(rows)} sample(s); canvas {canvas_width}x{canvas_height}, "
-        f"{target_frames} pixel frames -> {h3_latent_frames(int(target_frames))} latent frames, "
+        f"frame bucket(s) in use {used} of declared {declared}, "
         f"{n_target_video} target video rows + {n_target_audio} target audio rows; reference short "
         f"edge {reference_image_short_edge}, {references_per_sample} slot(s)/sample; ceiling "
         f"{max_packed_rows} packed rows."
@@ -3907,7 +3956,7 @@ def h3_preprocess(
             smoke_vae,
             clip_pixels=_h3_read_video_rgb(
                 data_root / smoke_row["media_path"],
-                int(target_frames),
+                int(row_frames[0]),
                 canvas_height,
                 canvas_width,
             ),
@@ -3918,7 +3967,7 @@ def h3_preprocess(
             reference_descriptor=None if no_reference else smoke_references[0],
             latents_mean=smoke_mean,
             latents_std=smoke_std,
-            clip_pixel_frames=int(target_frames),
+            clip_pixel_frames=int(row_frames[0]),
         )
     )
     # Drop OUR reference too — assign=True loader-owned CUDA storage survives `Module.to("cpu")` and
@@ -4113,7 +4162,10 @@ def h3_preprocess(
         meta = per_sample[str(rel)]
         media = data_root / row["media_path"]
 
-        pixels = _h3_read_video_rgb(media, int(target_frames), canvas_height, canvas_width)
+        frames_here = row_frames[index]
+        n_target_video = n_target_video_by_frames[frames_here]
+        n_target_audio = n_target_audio_by_frames[frames_here]
+        pixels = _h3_read_video_rgb(media, int(frames_here), canvas_height, canvas_width)
         # ⛔ D-10-DEF-12: NO `.to("cuda")` here any more, and its absence is the fix. This site used
         # to carry one and the reference site below did not, so the reference reached a CUDA-resident
         # VAE with CPU pixels — cuDNN declined, the dispatcher chose ConvBackend.Slow3d, and Slow3d
@@ -4126,7 +4178,7 @@ def h3_preprocess(
             pixels,
             latents_mean,
             latents_std,
-            pixel_frames=int(target_frames),
+            pixel_frames=int(frames_here),
         )
         del pixels
 
@@ -4649,7 +4701,7 @@ def h3_train(config_yaml: str) -> None:
     # tests/test_h3_config_reads.py pins BOTH: every config chain read here resolves against the
     # real Pydantic models, and this argument is derived from the same source as the pre-encode.
     position_ids_fn = make_h3_position_ids_fn(
-        target_frames=config.training_dims[2],
+        target_frames=_h3_frame_buckets(config),
         target_aspect=tuple(config.h3.target_aspect),
         reference_short_edge=config.h3.reference_image_short_edge,
         patch_size=EXPECTED_H3_PATCH_SIZE,
@@ -4672,7 +4724,15 @@ def h3_train(config_yaml: str) -> None:
             # and out of the loss (D-10-AUDIO). The count is a function of the campaign frame count
             # — derived here from the same `training_dims[2]` the cache was encoded at, never a
             # literal and never defaulted to 0.
-            target_audio_rows=h3_audio_rows(int(config.training_dims[2])),
+            # None under FRAME BUCKETING: H3RefStrategy then asks the builder per sample via
+            # `audio_rows_for(n_target_video)`. A per-run scalar here would synthesize one
+            # bucket's audio-row count for every sample and the RoPE builder would raise on
+            # the first sample of any other bucket — mid-run, on a metered container.
+            target_audio_rows=(
+                h3_audio_rows(int(config.training_dims[2]))
+                if len(_h3_frame_buckets(config)) == 1
+                else None
+            ),
         )
 
     # The dataset reads the ROOT from config (never a hardcoded ``.precomputed`` — that was a real
@@ -5372,7 +5432,7 @@ def h3_sample(config_yaml: str) -> None:
         # below. ``config.data.frame_count`` (D-10-DEF-1) was an AttributeError that fired only
         # AFTER load_components + enable_auto_cpu_offload + inject_lora had been paid for.
         position_ids_fn=make_h3_position_ids_fn(
-            target_frames=config.training_dims[2],
+            target_frames=_h3_frame_buckets(config),
             target_aspect=tuple(config.h3.target_aspect),
             reference_short_edge=config.h3.reference_image_short_edge,
             # Read off the PEFT-wrapped ref2va partition (`base_transformer` is the same object

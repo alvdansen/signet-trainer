@@ -27,6 +27,7 @@ from pathlib import Path
 
 from signet_trainer.conditioning.h3_geometry import max_packed_rows_for_budget
 from signet_trainer.config.load import load_config_from_text
+from signet_trainer.config.validators import validate_h3_resolution_bucket
 from signet_trainer.dryrun.shapes import run_dryrun
 from signet_trainer.modal.app import (
     APP_NAME,
@@ -327,6 +328,12 @@ def _h3_encode_params(cfg: object) -> dict[str, object] | None:
         "output_dir": cfg.data.preprocessed_data_root,
         # geometry: training_dims is [W, H, F], so F is the H3 target frame count (17n+5).
         "target_frames": cfg.training_dims[2],
+        # FRAME-COUNT BUCKETING. The declared buckets' F values, so a manifest row may name its
+        # own `target_frames` and be refused if it is not one of them. training_dims F remains the
+        # DEFAULT for a row that names none, and SigneConfig guarantees it is in this set.
+        "frame_buckets": tuple(
+            sorted({validate_h3_resolution_bucket(b)[2] for b in cfg.data.resolution_buckets})
+        ),
         "target_aspect": cfg.h3.target_aspect,
         # cfg.h3 — the locked D-10-* recipe values, every one a documented field (D-NOHARDCODE).
         "reference_image_short_edge": cfg.h3.reference_image_short_edge,
