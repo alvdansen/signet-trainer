@@ -190,7 +190,14 @@ def _h3_worst_case_budget(cfg: SignetConfig) -> H3DryrunBudget:
     CPU-pure: geometry ints only, no ``torch``, no ``ltx_core``, no ``modal``.
     """
     h3 = cfg.h3
-    target_frames = cfg.training_dims[2]
+    # FRAME-COUNT BUCKETING: price the LARGEST declared bucket, not training_dims F. This gate's
+    # whole justification is "the run would have been caught locally" — pricing the default bucket
+    # would leave a longer declared one unproven all the way to a metered OOM.
+    from signet_trainer.config.validators import validate_h3_resolution_bucket  # noqa: PLC0415
+
+    target_frames = max(
+        validate_h3_resolution_bucket(b)[2] for b in cfg.data.resolution_buckets
+    )
     ceiling = max_packed_rows_for_budget(h3.gpu_usable_gib, h3.resident_gib, h3.mib_per_packed_row)
 
     if h3.character_reference_sizes or h3.environment_reference_sizes:

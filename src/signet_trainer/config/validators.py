@@ -62,6 +62,7 @@ from signet_trainer.conditioning.h3_geometry import (
     h3_packed_seq_len,
     h3_worst_case_packed_seq_len,
     max_packed_rows_for_budget,
+    resolve_canvas_size,
 )
 
 __all__ = [

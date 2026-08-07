@@ -781,15 +781,25 @@ class H3RefStrategy(TrainingStrategy):
         """
         return list(H3_DATA_SOURCES)
 
-    def _absent_target_audio_rows(self) -> int:
+    def _absent_target_audio_rows(self, n_target_video: int | None = None) -> int:
         """How many NOISE rows an audio-less sample contributes — never guessed, never zero.
 
-        Read in priority order from the two places that already know, and REFUSED if neither was
-        supplied. ``h3_audio_rows(target_frames)`` is a function of the campaign's frame count, which
-        this strategy is not otherwise told; deriving it from the target latents is impossible after
-        the patchify, and defaulting it to 0 is precisely the defect (the packed budget and the RoPE
-        builder both price the rows unconditionally).
+        Read in priority order from the places that already know, and REFUSED if none supplied.
+        ``h3_audio_rows(target_frames)`` is a function of the frame count, which this strategy is
+        not otherwise told; deriving it from the target latents is impossible after the patchify,
+        and defaulting it to 0 is precisely the defect (the packed budget and the RoPE builder both
+        price the rows unconditionally).
+
+        ⛔ THE PER-SAMPLE RESOLVER IS TRIED FIRST, and that ordering is load-bearing under
+        FRAME-COUNT BUCKETING. The other three sources are per-RUN scalars: with buckets {5, 22}
+        and a scalar priced at F=22, every F=5 sample would synthesize 74 noise rows where its own
+        geometry prices 16. The RoPE builder would then raise — correctly, but only once a metered
+        container is already up, and no mixed run could ever complete. In single-bucket mode the
+        resolver returns exactly what the scalars hold, so this changes nothing there.
         """
+        resolver = getattr(self.position_ids_fn, "audio_rows_for", None)
+        if resolver is not None and n_target_video is not None:
+            return int(resolver(int(n_target_video)))
         if self.target_audio_rows is not None:
             return self.target_audio_rows
         if self.expected_layout is not None:
@@ -985,7 +995,9 @@ class H3RefStrategy(TrainingStrategy):
             #     every prompt — a behavioural change that would have to be untrained later;
             #   * dropping the rows and re-deriving the geometry would diverge structurally from the
             #     inference layout and invalidate the measured 12,394-row budget.
-            n_absent_audio = self._absent_target_audio_rows()
+            # The sample's own target-video row count is what selects its frame bucket, so it is
+            # read HERE from the real tensor rather than from any per-run config value.
+            n_absent_audio = self._absent_target_audio_rows(int(target.shape[1]))
             audio_rows = torch.zeros(
                 (1, n_absent_audio, deps.audio_in_channels),
                 dtype=target.dtype,

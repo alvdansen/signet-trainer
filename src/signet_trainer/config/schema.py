@@ -37,12 +37,14 @@ from signet_trainer.config.validators import (
     H3_VISUAL_CONDITION_PIN,
     h3_packed_seq_len,
     max_packed_rows_for_budget,
+    resolve_canvas_size,
     validate_a2v_lora_targets,
     validate_batch_size,
     validate_conditioning_items,
     validate_conditioning_mode,
     validate_h3_frames,
     validate_h3_reference_budget,
+    validate_h3_resolution_bucket,
     validate_h3_resolution_buckets,
     validate_h3_seq_len_budget,
     validate_height,
@@ -1716,6 +1718,45 @@ class SignetConfig(_Base):
         if self.model.family == "h3":
             validate_h3_frames(self.training_dims[2])
             validate_h3_resolution_buckets(self.data.resolution_buckets)
+            # FRAME-COUNT BUCKETING: the declared buckets are LOAD-BEARING on the H3 path as of
+            # this change. They used to be validated and then ignored, so two guards are needed
+            # before anything reads them.
+            parsed_buckets = [
+                validate_h3_resolution_bucket(b) for b in self.data.resolution_buckets
+            ]
+            canvas_h, canvas_w = resolve_canvas_size(*self.h3.target_aspect)
+            for bucket, (bw, bh, _bf) in zip(
+                self.data.resolution_buckets, parsed_buckets, strict=True
+            ):
+                # (1) W x H stays decorative on the H3 path — the canvas comes from
+                # h3.target_aspect, and ASPECT bucketing is a separate change (issue #1). Refuse a
+                # bucket that claims a canvas this run will not use, rather than let the config
+                # assert something untrue.
+                if (bw, bh) != (canvas_w, canvas_h):
+                    raise ValueError(
+                        f"resolution_bucket {bucket!r} declares {bw}x{bh}, but h3.target_aspect="
+                        f"{self.h3.target_aspect} resolves to {canvas_w}x{canvas_h} and the H3 "
+                        f"encode uses ONE canvas for the whole corpus. Per-bucket aspect is not "
+                        f"implemented (frame-count bucketing only) — declare every bucket at the "
+                        f"run's own canvas and vary only F."
+                    )
+            frame_buckets = sorted({bf for (_bw, _bh, bf) in parsed_buckets})
+            # (2) BACK-COMPAT. Before this change a single bucket's F was ignored, so a config
+            # could carry an F that disagreed with training_dims and still load. Making buckets
+            # load-bearing would silently redefine such a run. One bucket must agree.
+            if len(frame_buckets) == 1 and frame_buckets[0] != self.training_dims[2]:
+                raise ValueError(
+                    f"resolution_buckets declares a single frame count F={frame_buckets[0]} but "
+                    f"training_dims F={self.training_dims[2]}. These used to be allowed to "
+                    f"disagree because the H3 leg ignored the buckets; they are now load-bearing, "
+                    f"so the disagreement has to be resolved rather than silently picked between."
+                )
+            if self.training_dims[2] not in frame_buckets:
+                raise ValueError(
+                    f"training_dims F={self.training_dims[2]} is not among the declared frame "
+                    f"buckets {frame_buckets}. training_dims F is the DEFAULT bucket for a "
+                    f"manifest row that does not name its own, so it must be declared."
+                )
             max_rows = max_packed_rows_for_budget(
                 self.h3.gpu_usable_gib, self.h3.resident_gib, self.h3.mib_per_packed_row
             )
@@ -1729,7 +1770,10 @@ class SignetConfig(_Base):
                 # environment-bearing segment. This prices the WORST of the real pairing domain and
                 # names the offending pair in the refusal (T-10-05-D).
                 validate_h3_reference_budget(
-                    target_frames=self.training_dims[2],
+                    # Price the LARGEST declared bucket, not training_dims F. VRAM peak is set by
+                    # the longest target any sample may carry, so pricing the default bucket would
+                    # leave a longer declared one unchecked all the way to a metered OOM.
+                    target_frames=max(frame_buckets),
                     aspect=self.h3.target_aspect,
                     character_references=self.h3.character_reference_sizes,
                     environment_references=self.h3.environment_reference_sizes,
@@ -1747,7 +1791,8 @@ class SignetConfig(_Base):
                 # ceiling, so campaign length busts the budget even with zero references — leaving a
                 # reference-free H3 config unchecked would hand that OOM straight to a metered A100.
                 layout = h3_packed_seq_len(
-                    self.training_dims[2],
+                    # largest declared bucket — see the reference branch above
+                    max(frame_buckets),
                     self.h3.target_aspect,
                     (),
                     self.h3.prompt_tokens_estimate,
