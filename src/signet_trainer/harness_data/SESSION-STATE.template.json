@@ -1,0 +1,12 @@
+{
+  "triage_mode": "strict",
+  "session_cap_usd": 10.0,
+  "optimization_target": "draft",
+  "sampling_plan": {
+    "generate_samples": true,
+    "venue": "parallel",
+    "note": ""
+  },
+  "blankets": [],
+  "spend": []
+}

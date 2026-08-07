@@ -1,0 +1,111 @@
+# =============================================================================
+# Example character-likeness chain — ROUND 2 (WARM RESTART).  LTX-2.3-22b, video-only.
+#
+# Genericized from a production campaign config. The D-9-CHAINED warm-restart tail:
+# identical LOCKED recipe as campaign_r1, EXCEPT training.init_adapter_path warm-starts
+# the trainable adapter from r1's FINAL checkpoint (fresh optimizer at step 0 — the
+# chain seam, 09-05). r1 is cold; r2 continues the likeness on top of r1's learned adapter.
+#
+# Every precedent→signet deviation is in the campaign's deviation ledger (never silent).
+# All gate-finalized fields were locked at the Wave-3 gate (operator, 2026-07-10).
+#
+# Zero GPU / zero spend to author.
+# =============================================================================
+
+# FINALIZED at the Wave-3 gate (operator 2026-07-10) — see campaign_r1.example.yaml; the chain shares
+# the two-bucket layout (832x480x25 landscape + 416x736x25 portrait, F=25 floor → 13/16 clips).
+training_dims: [1280, 704, 81]  # heaviest bucket (multi-F)
+
+data:
+  # r2 REUSES r1's encoded corpus (decided at the Wave-3 prep stage): the warm restart is
+  # via the adapter (init_adapter_path below); same data, same buckets — no second encode,
+  # no second encode spend. Logged in DECISION-LOG.md (09-07 Task 2). Path is on the
+  # signe-trainer-dataset Volume (/dataset mount — signet convention, not the prior project's /vol).
+  preprocessed_data_root: /dataset/.precomputed_campaign_mf
+  metadata_path: /dataset/campaign/metadata.jsonl
+  num_dataloader_workers: 2
+  batch_size: 1
+  resolution_buckets:  # MULTI-LENGTH, shared with r1
+    - 1280x704x25
+    - 1280x704x49
+    - 1280x704x81
+    - 416x736x81
+
+lora:
+  rank: 42   # DEVIATION — precedent likeness rank (signet default 64); MUST match r1 for a clean warm restart
+  alpha: 42  # DEVIATION — alpha == rank; MUST match r1
+  dropout: 0.0
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  max_steps: 3000  # production round unit (operator 2026-07-11 correction)
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  optimizer: adamw8bit
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30
+  # Scheduler CONFIRM resolved (operator 2026-07-10): precedent-faithful CONSTANT LR via
+  # min_lr_ratio 1.0 (LambdaLR floor = peak → flat 5e-5). Matches r1.
+  scheduler: cosine_with_min_lr  # label of the one built scheduler; min_lr_ratio 1.0 makes it constant
+  min_lr_ratio: 1.0  # CONSTANT LR (precedent-faithful; ledger deviation #2 resolved)
+  warmup_steps: 0
+  checkpoint_every: 200
+  keep_checkpoints: 25
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+  # D-9-CHAINED warm-restart seam (09-05): warm-start the trainable adapter from r1's FINAL
+  # checkpoint dir (Volume-relative under the checkpoints Volume; fresh optimizer at step 0).
+  # RE-POINTED 2026-07-11 after r1 completed (was SET-AFTER-R1): r1 reached 1200/1200, final
+  # dir confirmed on the Volume via `modal volume ls signe-trainer-checkpoints outputs/campaign_r1`.
+  init_adapter_path: outputs/campaign_r1_mf/checkpoint-step-02400-loss-0.2026  # REAL final dir read off the Volume 2026-07-12 (r1_mf stopped at 2400 by the operator's chain call; Modal preemption ended the round there)
+
+offload:
+  blocks_to_swap: 24  # OFFL-02 active block-swap; raised for native-res headroom
+
+modal:
+  hourly_rate_usd: 1.64      # DEVIATION — A100-80GB rate; the precedent used 4.0 (H100)
+  cost_guardrail_usd: 20.0
+  est_hours: 8.0             # 3000 steps, multi-F + in-loop renders
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+  # wandb: secret attached but NO train_loop logging wired — a NO-OP here (see ledger).
+
+validation:
+  interval: 250
+  in_loop_sampling: true
+  num_inference_steps: 40  # operator-locked eval spec (2026-07-10, prior campaign): 40 steps — supersedes the precedent 10-step render
+  # Eval prompt SET (operator 2026-07-11: one prompt is never enough). in-loop renders prompts[0].
+  prompts:
+    - "a cinematic film still of the subject in evening wear, classic key lighting"
+    - "close-up, the subject looks ahead outdoors, soft daylight"
+    - "medium shot, the subject stands at a window holding a coffee cup, morning light"
+    - "close-up, the subject smiles and speaks, at an indoor party"
+    - "wide shot, the subject walks down a city street at night"
+    - "medium close-up, the subject sings softly, seated by a brick wall"
+  frame_count: 81          # 5s eval clips (operator 2026-07-11; the locked eval spec: 81f) — inference longer than the 25f training windows, accepted
+  guidance_scale: 4.0  # operator-locked eval spec
+  num_samples: 1
+  seed: 42
+  width: 1280              # native-scale primary bucket (operator 2026-07-11)
+  height: 704              # native-scale primary bucket (operator 2026-07-11)
+  two_stage_upscale: false # precedent F5
+
+conditioning:
+  mode: none
+
+seed: 42
+output_dir: outputs/campaign_r2_mf

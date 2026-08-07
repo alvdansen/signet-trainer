@@ -1,0 +1,124 @@
+[project]
+name = "signet-trainer"
+version = "0.1.0b1"
+description = "Video LoRA trainer with first-class reference control (single-frame, multi-frame, IC-LoRA), anchored on LTX-2.3 and MiniMax-H3, targeting Modal."
+readme = "README.md"
+requires-python = ">=3.11"
+# NOT an SPDX identifier — this project ships the Signet Trainer License 1.0.0 (a PolyForm
+# Small Business 1.0.0 derivative with a modified eligibility threshold), so the license is
+# declared by FILE. Do not "fix" this to an SPDX string; there isn't one that means this.
+license = { file = "LICENSE" }
+authors = [{ name = "PromptCrafted / Alvdansen Labs", email = "minta@promptcrafted.com" }]
+maintainers = [{ name = "PromptCrafted / Alvdansen Labs", email = "minta@promptcrafted.com" }]
+keywords = [
+    "lora",
+    "video",
+    "diffusion",
+    "ltx",
+    "ltx-video",
+    "minimax-h3",
+    "modal",
+    "training",
+    "reference-control",
+    "ic-lora",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    # Core, local/CI-runnable deps. Must import with ZERO Modal/ltx-core/CUDA on Windows.
+    "pydantic>=2.10.4", # ltx-trainer's floor; v2 syntax (model_validator/field_validator)
+    "modal>=1.5,<2",    # serverless GPU; imported ONLY under src/signet_trainer/modal/ (Anti-Pattern 6)
+    "pyyaml>=6",        # YAML run-config load
+    "torch>=2.6",       # dry-run synthetic-tensor shape work; CPU build is enough locally
+]
+
+[project.optional-dependencies]
+# Heavy LTX/CUDA deps needed ONLY inside the Modal container. Keeping these out of the core
+# install is what makes the local dry-run honest (zero GPU, zero Modal spend) on Windows.
+modal-runtime = [
+    # NOTE: ltx-core / ltx-trainer are deliberately ABSENT here — they are NOT on any PyPI index.
+    # The canonical GPU image git-installs them from github.com/Lightricks/LTX-2 pinned at
+    # LTX2_COMMIT_SHA (src/signet_trainer/modal/app.py), which is the reproducible, tamper-evident
+    # source. A bare `ltx-core` name on the documented `pip install -e ".[modal-runtime]"` path is a
+    # live supply-chain vector (`ltx-core` is name-squatted on PyPI by an unverified publisher), so
+    # it must never appear here. See tests/test_pyproject_supply_chain.py.
+    "peft>=0.14",
+    "accelerate>=1.2",
+    "diffusers>=0.32",
+]
+# Dev/test extra.
+dev = [
+    "pytest>=8",
+]
+# ⛔ The H3 processor-output PARITY gate, and the ONLY reason this project declares
+# `transformers` locally at all. `tests/test_h3_processor_output_parity.py` runs the REAL
+# `Qwen3VLProcessor.__call__` against `prep/h3_encode.build_h3_processor_inputs` and diffs their
+# output KEY SETS.
+#
+# The version MUST equal `src/signet_trainer/modal/app.py::TRANSFORMERS_VERSION` byte-for-byte
+# (asserted by `test_the_pinned_version_is_identical_here_and_on_the_image`). That identity IS the
+# point: `return_mm_token_type_ids` defaults True at 5.14.1 and False at 5.2.x, so a parity check
+# executed at any other version would pass while the real dispatch failed — manufacturing
+# confidence rather than removing it.
+#
+# `torchvision` is a FIXTURE dependency, not a conditioning-critical one: it selects which
+# image/video sub-processor backend `transformers` exposes, and the H3 image carries it
+# (`torchvision~=0.22`), so requiring it makes the local fixture the same classes the container
+# builds. It is intentionally unpinned here because it must match whatever `torch` the environment
+# already has — installing this group into an env with a pinned torch is not the recommended path;
+# the isolated overlay venv is (see the test's failure message for the two commands).
+h3-parity = [
+    "transformers==5.14.1",
+    "torchvision",
+]
+
+[project.urls]
+Homepage = "https://promptcrafted.com"
+Documentation = "https://promptcrafted.com"
+"Commercial licensing" = "mailto:minta@promptcrafted.com"
+
+[project.scripts]
+# The single CI-runnable hard gate: a CPU/GPU-free shape check over a real run config.
+signet-dryrun = "signet_trainer.dryrun.shapes:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/signet_trainer"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/configs",
+    "/scripts",
+    "/docs",
+    "/LICENSES",
+    "/LICENSE",
+    "/NOTICE",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+]
+
+# Ship the license inventory inside built artifacts. Every path here MUST exist in the tree.
+[tool.hatch.build]
+artifacts = []
+[tool.hatch.build.force-include]
+"LICENSE" = "LICENSE"
+"NOTICE" = "NOTICE"
+"LICENSES/Apache-2.0.txt" = "LICENSES/Apache-2.0.txt"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Make the src-layout package importable for a bare `python -m pytest` from the repo root,
+# so the dry-run gate is an honest, GPU-free, install-free CI check on Windows.
+pythonpath = ["src"]

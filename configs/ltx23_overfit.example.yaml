@@ -1,0 +1,93 @@
+# Tiny correctness-OVERFIT run config (D-RUN-1) — the FIRST metered Modal run.
+#
+# This is a THROWAWAY correctness proof, NOT a real likeness LoRA. A handful of steps on the
+# 6 already-encoded Phase-2 .precomputed clips (free, instant, already on signe-trainer-dataset)
+# to prove: a non-corrupt adapter (TRAIN-01), a save->load roundtrip (INFR-03), and
+# resume-after-preemption from the Volume checkpoint (TRAIN-07). blocks_to_swap=0 makes this the
+# no-block-swap baseline-clean evidence for OFFL-03. A real likeness LoRA is a SEPARATE later
+# approval (deferred, D-RUN-1).
+#
+# training_dims = [width, height, frames] — MATCHES the already-encoded Phase-2 latents
+# (768x352x81 bucket, latent (128,11,11,24) — D-DATA-1; NOT the precedent 640x480 black-bar bug).
+# The four LTX constraints hold:
+#   (81 - 1) % 8 == 0   ->  valid frame count
+#   352 % 32 == 0       ->  valid height
+#   768 % 32 == 0       ->  valid width
+#   data.batch_size = 1 ->  single-bucket
+training_dims: [768, 352, 81]
+
+data:
+  # The Phase-2 precomputed root on the mounted signe-trainer-dataset Volume (/dataset at run time).
+  # A STRING here — NOT FS-validated locally; existence is checked Modal-side where the Volume mounts.
+  preprocessed_data_root: /dataset/.precomputed
+  num_dataloader_workers: 2
+  batch_size: 1
+  # Narrow to the single 81-frame bucket the 6 Phase-2 clips were encoded into (all 768x352x81).
+  resolution_buckets:
+    - 768x352x81
+
+lora:
+  rank: 64                   # the operator's choice for identity capacity (the precedent likeness value was 42).
+  alpha: 64                  # rank == alpha -> PEFT scale 1.0 -> clean PEFT->LTX key conversion.
+  dropout: 0.0
+  # SCAFFOLD-BUG FIX (03-01): attn-only [to_k,to_q,to_v,to_out.0] silently under-fit identity
+  # (HANDOFF.md:19). ff.net is ~2/3 of block params and where identity is encoded -> MUST be targeted.
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # OVERFIT step budget — a handful of steps, enough to drive checkpoint + interrupt + resume,
+  # NOT a real LoRA (D-RUN-1). checkpoint_every < max_steps so a committed checkpoint exists to
+  # resume from BEFORE the deliberate interrupt (TRAIN-07 / landmine #1).
+  max_steps: 50
+  checkpoint_every: 10
+  learning_rate: 5.0e-5      # beat 1e-4 in the precedent A/B
+  weight_decay: 0.01
+  optimizer: adamw8bit       # NEVER Prodigy (banned; breaks differential-LR)
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30         # the precedent sharper-detail choice (0.10 less preferred)
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01         # flimmer template
+  warmup_steps: 0            # flimmer template
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0          # baseline-first (D-OFF-1) — the OFFL-03 no-block-swap baseline-clean run
+
+modal:
+  hourly_rate_usd: 1.64      # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing
+  cost_guardrail_usd: 50.0
+  # Overfit is ~$1: 1.64 * 0.6 = ~$0.98. The cost print reflects this cheap run before the gate.
+  est_hours: 0.6
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  # Reserved for Phase 4; interval > max_steps so NO sampling fires during the overfit (structural).
+  interval: 250
+  prompts:
+    - "a portrait of my subject, cinematic lighting"
+  frame_count: 81            # match the 81-frame latents (consistency; not exercised this run)
+  guidance_scale: 3.0
+  num_samples: 1
+  seed: 42
+
+conditioning:
+  mode: none                 # reserved for Phases 5-7 reference control
+
+seed: 42
+output_dir: outputs/ltx23_overfit

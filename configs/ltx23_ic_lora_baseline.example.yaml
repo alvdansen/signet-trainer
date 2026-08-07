@@ -1,0 +1,123 @@
+# LTX-2.3 IC-LoRA tier-2 KNOWN-GOOD baseline (Phase 7 / REF-03, D-7-LADDER tier 2 / D-7-BASELINE).
+#
+# Runs the OFFICIAL Lightricks IC-LoRA `Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control` (Canny+Depth+Pose
+# structural union — the closest structural-control match, D-7-BASELINE) through the ported distilled
+# two-stage `ICLoraPipeline` (inference/ic_lora_pipeline.py). This validates the ported inference SURFACE
+# against a KNOWN-good adapter BEFORE we train ours (kills pipeline-vs-adapter ambiguity). The official
+# adapter is a comfy-format single-file safetensors on the DISTILLED two-stage path — a DIFFERENT
+# substrate from signet's own dev single-stage PEFT V2V (ltx23_ic_lora.example.yaml); do NOT cross them.
+#
+# The adapter repo is NOT a schema field (the schema stays untouched this plan) — it is a CONSTANT in
+# modal/fns.py (OFFICIAL_IC_LORA_BASELINE_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control"). This
+# comment NAMES it so the run intent is legible from the config.
+#
+# Union-Control is `ref0.5` (reference_downscale_factor = 2): the baseline supplies a HALF-RES reference
+# and the pipeline reads downscale=2 from the ADAPTER'S SAFETENSORS METADATA at runtime (Pitfall 4b) —
+# NOT from `conditioning.reference_downscale_factor` below (which is signet's OWN training knob, kept at
+# the D-7-REF11 default 1; the baseline is inference-only, no training).
+#
+# Dispatch (gated, D-7-BLANKET): `modal run -m signet_trainer.modal.entrypoint \
+#   --config configs/ltx23_ic_lora_baseline.example.yaml --mode sample`  (cost-print + $50 guardrail +
+# approval-pause intact; blanket-approved this phase). Loading this file returns a SignetConfig with no
+# error; the distilled base variant is paired with the distilled two-stage inference path (D-7-BASEVAR).
+training_dims: [832, 480, 25]
+
+data:
+  # Only read by training paths; the baseline is a `sample` run. Point at the paired seg root anyway so
+  # the config is coherent (existence checked Modal-side only — Pitfall 1).
+  preprocessed_data_root: /dataset/.precomputed_demo_seg
+  num_dataloader_workers: 2
+  batch_size: 1
+  resolution_buckets:
+    - 832x480x25
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  # HOUSE INVARIANT: ff.net.0.proj + ff.net.2 MUST be targeted (unused by the baseline sample path, but
+  # kept coherent with the house recipe).
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+model:
+  # D-7-BASEVAR: the DISTILLED base variant — the ICLoraPipeline substrate (distilled base + 2x spatial
+  # upscaler). Pairing distilled with the distilled inference path is enforced by the schema (must set
+  # validation.two_stage_upscale: true below).
+  model_id: ltx-2.3-22b-distilled-1.1.safetensors
+  text_encoder_id: gemma-3-12b-it
+
+training:
+  # Inference-only baseline — max_steps is a REQUIRED schema field but unused by the sample path.
+  max_steps: 1
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  optimizer: adamw8bit
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01
+  warmup_steps: 0
+  checkpoint_every: 200
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0
+
+modal:
+  hourly_rate_usd: 1.64      # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing.
+  cost_guardrail_usd: 50.0
+  est_hours: 2.0
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250
+  # Baseline re-skin prompts — the official adapter reads the seg map and regenerates with a NEW prompt.
+  prompts:
+    - "a vintage muscle car driving down a coastal road, golden hour, film grain"
+    - "a futuristic silver EV on a neon city street at night, cinematic"
+  frame_count: 25            # D-7-25F.
+  guidance_scale: 3.0        # LTX guidance (re-validated per LTX, NOT the Wan-tuned 5.0).
+  num_samples: 1
+  seed: 42
+  # DISTILLED TWO-STAGE geometry constraint (07-11 live resolution): ICLoraPipeline requires height AND
+  # width divisible by 64 (stricter than the %32 single-stage/schema rule). 832 % 64 == 0 already, but
+  # the demo 480 height is only %32 (480 % 64 == 32) and the pipeline hard-rejects it. Render the
+  # baseline yardstick at the nearest %64 height (448 = 7*64); the pipeline internally resizes the
+  # 832x480 seg reference to ref0.5 of this target, so the yardstick "does the reference steer?" holds.
+  # This constraint is TWO-STAGE-only — the tier-3 dev single-stage V2V renders at the %32 832x480.
+  width: 832
+  height: 448
+  # D-7-BASEVAR: the distilled base variant renders through the distilled two-stage ICLoraPipeline —
+  # REQUIRED true so the schema pairs the distilled model_id with the distilled inference path. The
+  # fns.py sample dispatch keys the ic_lora_baseline branch on this flag.
+  two_stage_upscale: true
+
+conditioning:
+  mode: ic_lora
+  # Inference-only baseline: keep conditioning_source at the 'self' default (no paired training here).
+  # The seg-map reference the official adapter steers on rides reference_images below (Volume-relative).
+  reference_images:
+    - reference/seg/demo_holdout_00.mp4     # Row A — in-domain held-out demo seg-map clip (07-11 stages the real path).
+    - reference/seg/external_00.mp4          # Row B — external seg-map clip (generalization).
+  # signet's OWN training downscale knob — kept at the D-7-REF11 default (1). The OFFICIAL adapter's
+  # ref0.5 (downscale=2) is read from the adapter safetensors METADATA at runtime, NOT from this field.
+  reference_downscale_factor: 1
+
+seed: 42
+output_dir: outputs/ltx23_ic_lora_baseline

@@ -1,0 +1,130 @@
+# =============================================================================
+# Example character-likeness chain — ROUND 1 (COLD START).  LTX-2.3-22b, video-only.
+#
+# Genericized from a production campaign config. The LOCKED production character recipe
+# (D-9-RECIPE) translated into signet's nested Pydantic schema
+# (a prior project's `<prior-project>/_train/ltx/hr_config.yaml` → SignetConfig). This is the cold-start head
+# of a D-9-CHAINED likeness chain: r1 trains a fresh adapter from scratch
+# (NO init_adapter_path); r2 warm-restarts from r1's final checkpoint.
+#
+# Every precedent→signet deviation is written down in the campaign's deviation ledger
+# (never silent — house methodology). Deviations flagged inline below with `# DEVIATION`.
+#
+# All gate-finalized fields (max_steps + the two training buckets + constant-LR scheduler)
+# were locked at the Wave-3 ready-to-train gate with the operator's sign-off (2026-07-10). Nothing
+# was silently invented — see the ledger's FINALIZED table for the probe-informed rationale.
+#
+# Zero GPU / zero spend to author. Consumed by the gated campaign (Wave 3-4).
+# =============================================================================
+
+# training_dims = [W, H, F] — single source of truth for the validators + dry-run batch.
+# RESOLUTION CORRECTION (operator 2026-07-11): train as large as the data allows. The earlier
+# 832x480 landscape bucket was a scaled-down mistake (42% of native area). Native clips are
+# ~1280x720; 720%32!=0 so the max 32-aligned native-scale bucket is 1280x704. Portrait bucket
+# 416x736 was already ~native (406x720) and stays. TWO buckets @ F=25; 3 clips <25f dropped
+# → 13/16 trained. Cold restart at native res (the 832x480 round is a wiring artifact only).
+training_dims: [1280, 704, 81]  # heaviest bucket — dry-run validates the worst-case shape (multi-F, the operator 2026-07-11)
+
+data:
+  # Encoded-latents root on the signe-trainer-dataset Volume (mounted at /dataset — signet's
+  # convention, NOT the prior project's /vol; there is no /vol mount here). The gated `--mode preprocess`
+  # encode writes latents/ + conditions/ under this root.
+  preprocessed_data_root: /dataset/.precomputed_campaign_mf
+  # The staged campaign corpus (16 paired clips + metadata.jsonl, duplicate dropped) uploaded to
+  # the dataset Volume under campaign/ — the preprocess arm reads this metadata.jsonl.
+  metadata_path: /dataset/campaign/metadata.jsonl
+  num_dataloader_workers: 2
+  batch_size: 1  # production batch_size 1 — carried on data (single-bucket)
+  resolution_buckets:  # MULTI-LENGTH (operator 2026-07-11: the locked {25,49,81} pattern at native res)
+    - 1280x704x25  # short/mid landscape clips
+    - 1280x704x49  # the 53f clip
+    - 1280x704x81  # the four 81f landscape clips — full 5s sequences
+    - 416x736x81   # both portrait clips (81f)
+
+lora:
+  rank: 42   # DEVIATION — the precedent's validated likeness rank (signet default is 64)
+  alpha: 42  # DEVIATION — precedent alpha == rank (PEFT scale 1.0); signet default is 64
+  dropout: 0.0
+  # precedent lora_include_ff: true → the default 10-target attn1+attn2+ff.net set (ff.net is
+  # ~2/3 of block params and where identity is encoded — attn-only underfits likeness).
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # Per-round step budget: the production 3000-step round UNIT (operator 2026-07-11 correction —
+  # never scale round budgets down by corpus size; the earlier 1200 was an untagged prior).
+  max_steps: 3000  # production round unit (operator 2026-07-11)
+  learning_rate: 5.0e-5  # precedent locked (5e-5 beat 1e-4 in the A/B)
+  weight_decay: 0.01
+  optimizer: adamw8bit    # precedent locked — NEVER Prodigy (breaks on differential-LR)
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30      # the precedent's 'sharper detail' choice
+  # Scheduler CONFIRM resolved (operator 2026-07-10): precedent-faithful CONSTANT LR. Realized
+  # config-first: build_scheduler's LambdaLR floor = min_lr_ratio, so min_lr_ratio 1.0 pins
+  # lr_lambda at 1.0 for the whole round → constant 5e-5 (no code change; label kept accurate).
+  scheduler: cosine_with_min_lr  # label of the one built scheduler; min_lr_ratio 1.0 makes it constant
+  min_lr_ratio: 1.0  # CONSTANT LR (precedent-faithful; ledger deviation #2 resolved)
+  warmup_steps: 0
+  checkpoint_every: 200   # production cadence — also drives the in-loop sample cadence
+  keep_checkpoints: 25    # gap-fill — precedent keep_checkpoints 25 (09-02 field; signet default unbounded)
+  mixed_precision: bf16   # precedent compute_dtype bfloat16 (name differs)
+  gradient_checkpointing: true
+  seed: 42
+  # r1 is the COLD START head of the chain: NO init_adapter_path (fresh adapter at step 0).
+
+offload:
+  # Raised 16 → 24 for native-res headroom (~2.3x latent tokens vs 832x480; r1-lowres peaked
+  # 63 GiB at 16). Mechanical territory — verified by the run itself.
+  blocks_to_swap: 24  # OFFL-02 active block-swap (>0) — live proof under the PEFT-aware offloader
+
+modal:
+  hourly_rate_usd: 1.64      # DEVIATION — A100-80GB rate (single-A100 house rule); the precedent used 4.0 (H100)
+  cost_guardrail_usd: 20.0   # per-round guardrail
+  est_hours: 8.0             # 3000 steps, multi-F up to 81f native + in-loop renders
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+  # NOTE: wandb_secret_name is carried (secret attached) but signet has NO wandb logging wired
+  # into train_loop — the precedent's wandb_enabled/wandb_project keys are a NO-OP here. See the
+  # campaign deviation ledger's wandb row (never silent, D-9-RECIPE / RESEARCH A3 / 09-04).
+
+validation:
+  interval: 250
+  in_loop_sampling: true   # OFFL-02 decoder-on: render one prompt every checkpoint_every steps under block-swap
+  num_inference_steps: 40  # operator-locked eval spec (2026-07-10, prior campaign): 40 steps — supersedes the precedent 10-step render
+  # Eval prompt SET (operator 2026-07-11: one prompt is never enough for testing). Klippbok
+  # grammar, natural-name anchor; mix of in-distribution echoes + generalization probes.
+  # The in-loop cadence renders prompts[0]; the --mode sample review grid renders ALL.
+  prompts:
+    - "a cinematic film still of the subject in evening wear, classic key lighting"
+    - "close-up, the subject looks ahead outdoors, soft daylight"
+    - "medium shot, the subject stands at a window holding a coffee cup, morning light"
+    - "close-up, the subject smiles and speaks, at an indoor party"
+    - "wide shot, the subject walks down a city street at night"
+    - "medium close-up, the subject sings softly, seated by a brick wall"
+  frame_count: 81          # 5s eval clips (operator 2026-07-11; the locked eval spec: 81f) — inference longer than the 25f training windows, accepted
+  guidance_scale: 4.0  # operator-locked eval spec
+  num_samples: 1
+  seed: 42
+  width: 1280              # matches the primary training bucket — native scale (operator 2026-07-11)
+  height: 704              # matches the primary training bucket — native scale (operator 2026-07-11)
+  two_stage_upscale: false # precedent F5 — the 2-pass upscale obliterates likeness; single-stage only
+
+conditioning:
+  mode: none  # plain character-likeness LoRA (video-only), like the precedent — no reference control
+
+seed: 42
+# Fresh output root for the NATIVE-RES cold restart — the 832x480 outputs/campaign_r1 round is a
+# wiring artifact, kept on the Volume but excluded from the likeness-adapter lineage.
+output_dir: outputs/campaign_r1_mf

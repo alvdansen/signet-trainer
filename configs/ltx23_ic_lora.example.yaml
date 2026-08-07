@@ -1,0 +1,115 @@
+# Valid LTX-2.3 IC-LoRA in-context conditioning run config (Phase 7 / REF-03, D-7-*).
+#
+# In-context video-to-video: a paired REFERENCE clip (a compact-driving semantic segmentation map,
+# D-7-SEG) is concatenated as a clean prefix to the noised target; the adapter learns seg-map -> video
+# so real footage can be RE-SKINNED (D-7-RESKIN) — same layout/motion, new look via prompt. Loading
+# this file returns a SignetConfig with no error and passes the zero-GPU dry-run gate:
+#   `python -m signet_trainer.dryrun configs/ltx23_ic_lora.example.yaml`.
+#
+# 25-frame test clips (D-7-25F): the DOUBLED ref+target sequence (~one 49f clip's tokens) fits the
+# single A100-80GB with headroom under the mandatory two-phase VRAM pattern. The four LTX-2.3
+# constraints all hold for [832, 480, 25]:
+#   (25 - 1) % 8 == 0    -> valid frame count (8k+1)
+#   480 % 32 == 0        -> valid height
+#   832 % 32 == 0        -> valid width
+#   data.batch_size == 1 -> single-bucket
+# NO Wan-tuned scheduler/step/guidance carry-forwards (re-validated per LTX; see CLAUDE.md).
+training_dims: [832, 480, 25]
+
+data:
+  # The paired segmentation-encoded demo root on the mounted signe-trainer-dataset Volume. The
+  # canonical paired preprocess (07-06/07-11) writes the target latents here AND the reference latents
+  # under conditioning.reference_latents_dir (below). A STRING — existence checked Modal-side (Pitfall 1).
+  preprocessed_data_root: /dataset/.precomputed_demo_seg
+  num_dataloader_workers: 2
+  batch_size: 1
+  # Narrow to the single demo 25-frame test bucket (832x480x25 — WxHxF). LTX-valid: (25-1)%8==0,
+  # 480%32==0, 832%32==0.
+  resolution_buckets:
+    - 832x480x25
+
+lora:
+  rank: 64                   # the operator's identity-capacity choice (house default).
+  alpha: 64                  # rank == alpha -> PEFT scale 1.0 -> clean PEFT->LTX key conversion.
+  dropout: 0.0
+  # HOUSE INVARIANT: ff.net.0.proj + ff.net.2 MUST be targeted (ff.net is ~2/3 of block params and
+  # where identity is encoded; attn-only silently under-fits). Never drop these two.
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # The locked LTX-2.3 LoRA recipe (adamw8bit / 5e-5 / rank 64 / seed 42). max_steps is a REQUIRED
+  # run-specific field; the tiny seg overfit sets its own budget (see the overfit variant).
+  max_steps: 100
+  learning_rate: 5.0e-5      # beat 1e-4 in the house A/B.
+  weight_decay: 0.01
+  optimizer: adamw8bit       # NEVER Prodigy (banned; breaks differential-LR).
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30         # sharper-detail choice (house default).
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01         # flimmer template.
+  warmup_steps: 0            # flimmer template.
+  checkpoint_every: 200      # ~200-step checkpoint + sample cadence.
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0          # baseline-first (D-OFF-1); harvested block_swap.py is UNVALIDATED on LTX.
+
+modal:
+  hourly_rate_usd: 1.64      # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing.
+  cost_guardrail_usd: 50.0
+  est_hours: 2.0
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250
+  # Re-skin prompts for the IC-LoRA V2V grid (D-7-GRIDCOL): the adapter reads the semantic map and
+  # regenerates with a NEW prompt, keeping layout/motion.
+  prompts:
+    - "a vintage muscle car driving down a coastal road, golden hour, film grain"
+    - "a futuristic silver EV on a neon city street at night, cinematic"
+  frame_count: 25            # match the 25f test clips (D-7-25F).
+  guidance_scale: 3.0        # LTX guidance (NOT the Wan-tuned 5.0); re-validated per LTX (CLAUDE.md).
+  num_samples: 1
+  seed: 42
+  # Render geometry pinned EXPLICITLY to the demo 832x480 bucket (WR-08 / config-first): without
+  # these the sample path renders at the 768x352 schema defaults — a different resolution AND aspect
+  # ratio, silently re-scaling the reference the grid is judged against. Both values are %32-valid.
+  width: 832
+  height: 480
+
+conditioning:
+  mode: ic_lora
+  # D-7-CONDSOURCE: paired — the reference latents come from the paired reference_latents/ pre-encode
+  # (the seg-map clips), NOT sampled from the target itself. Phase 7 re-widens the allowlist to
+  # accept 'paired' (only valid in ic_lora mode; the lean field-split rejects it elsewhere).
+  conditioning_source: paired
+  # Sub-dir under data.preprocessed_data_root holding the paired reference (seg-map) latents (mirrors
+  # the upstream ltx-trainer video_to_video default). Existence checked Modal-side (Pitfall 1).
+  reference_latents_dir: reference_latents
+  # D-7-REF11: reference kept 1:1 with the target for this first proof (one fewer variable). The field
+  # still lands per D-NOHARDCODE; canonical type is int (RESEARCH A1) — 1 == no downscale.
+  reference_downscale_factor: 1
+  # metadata.jsonl column naming each sample's reference clip, consumed by the paired preprocess.
+  reference_column: reference_path
+  # D-7-PALETTE: names WHICH palette table in data/seg_palette.py the seg-map remap uses — the palette
+  # is config-SELECTED, never an anonymous hardcode (D-NOHARDCODE). ~6-8 high-contrast driving classes.
+  seg_palette_name: compact_driving_v1
+
+seed: 42
+output_dir: outputs/ltx23_ic_lora_example

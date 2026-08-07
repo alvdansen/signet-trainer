@@ -1,0 +1,211 @@
+signet-trainer
+Copyright (c) 2026 PromptCrafted / Alvdansen Labs
+
+This product includes software developed by PromptCrafted / Alvdansen Labs.
+
+signet-trainer is distributed under the Signet Trainer License 1.0.0 (see LICENSE).
+The third-party components credited below remain under their ORIGINAL licenses;
+nothing in the Signet Trainer License restricts your rights in them.
+
+--------------------------------------------------------------------------------
+Compute sponsorship
+--------------------------------------------------------------------------------
+
+Training and inference for this project run on Modal (https://modal.com), whose
+sponsored GPU credits made the development and validation of this trainer
+possible. Thank you.
+
+--------------------------------------------------------------------------------
+Provenance / derived work
+--------------------------------------------------------------------------------
+
+signet-trainer is a clean-room build that harvested and ported a validated
+LTX-2.3 foundation from the following projects:
+
+1. enochiatron (private repository)
+   Copyright (c) 2026 Alvdansen Labs / PromptCrafted
+   Licensed under the MIT License (full text below).
+
+   Ported: the LTX-2.3 model loader, the canonical pre-encoding path, the
+   flow-matching training loop, checkpoint/resume, and the validation-gate
+   discipline.
+
+2. flimmer-trainer — Alvdansen Labs
+   Copyright (c) 2026 Alvdansen Labs
+   Licensed under the MIT License (full text below).
+
+   Ported: the block-swap CPU/GPU offloader (subsequently made PEFT-LoRA-aware
+   in this repository). See item 3 — that offloader has an upstream of its own.
+
+3. musubi-tuner — kohya-ss — https://github.com/kohya-ss/musubi-tuner
+   Licensed under the Apache License, Version 2.0.
+
+   `src/signet_trainer/offload/block_swap.py` originated as musubi-tuner-derived
+   code, reaching this repository via flimmer-trainer. The file's own header
+   records that provenance.
+
+   NOTICE OF CHANGES (Apache-2.0 §4(b)): the file has been modified from its
+   upstream form. It was harvested Wan-validated rather than LTX-validated, and
+   was subsequently made PEFT-LoRA-aware — `_get_linear_weights` was changed to
+   descend into PEFT wrappers and enumerate every active adapter's `lora_A` /
+   `lora_B` leaves, only large base weights are swapped, LoRA sub-Linears are
+   kept GPU-resident, and the device guard was widened to scan all tracked
+   weights. Further local changes may exist; consult the git history for the
+   complete record.
+
+   A copy of the Apache License 2.0 is included at LICENSES/Apache-2.0.txt.
+
+4. LTX-2 / ltx-trainer — Lightricks — https://github.com/Lightricks/LTX-2
+
+   The LTX-2 packages (`ltx-core`, `ltx-trainer`, `ltx-pipelines`) are NOT
+   vendored into this repository — the Modal GPU image git-installs them from
+   the upstream repository at a pinned commit
+   (`d6053703e00195bc668cbd1d5eda9dc0b2e7b74a`, recorded as `LTX2_COMMIT_SHA` in
+   `src/signet_trainer/modal/app.py`).
+
+   HOWEVER, portions of this repository are DERIVED FROM that upstream source
+   and say so in their own docstrings. These are not merely "usage" — they are
+   ports:
+
+     - `src/signet_trainer/conditioning/ic_lora.py` — declares itself "a verbatim
+       port of the canonical `VideoToVideoStrategy`"
+       (`packages/ltx-trainer/src/ltx_trainer/training_strategies/video_to_video.py`
+       at the pinned SHA), re-expressed onto this project's
+       `ModelInputs` / `Modality` / `StepDeps` contract.
+     - `src/signet_trainer/inference/sampler.py` — the keep-token pinning formula
+       (`pin_keep_tokens`, around line 320) is declared VERBATIM the conditioning
+       copy-back inside upstream `ValidationSampler._run_denoising`
+       (`validation_sampler.py:571-577` at the pinned SHA); the waveform
+       trim/pad helper (`_fit_waveform_to_duration`, around line 734) is declared
+       VERBATIM the trim/pad of upstream
+       `process_videos.VideoDataset._extract_audio` (`:194-205`).
+
+   These portions remain subject to the upstream LTX-2 license. Consult the
+   license shipped with `github.com/Lightricks/LTX-2` at the pinned commit and
+   comply with it; nothing in the Signet Trainer License enlarges or restricts
+   your rights in Lightricks' code.
+
+5. diffusers — Hugging Face — https://github.com/huggingface/diffusers
+   Licensed under the Apache License, Version 2.0.
+
+   `diffusers` is a declared dependency (the Modal GPU image installs it from
+   git at the pinned commit `9f169d98d0bce392a889c3b6524d0d97734dfc0e`, recorded
+   as `DIFFUSERS_SHA` in `src/signet_trainer/modal/app.py`), but this repository
+   ALSO contains code transcribed from it:
+
+     - `src/signet_trainer/conditioning/h3_packing.py` — the module docstring
+       states it is "transcribed from diffusers" and cites, at the pinned SHA,
+       `src/diffusers/modular_pipelines/minimax_h3/before_denoise.py`. The
+       `patchify_video_latents` implementation (around lines 144-169) follows
+       upstream `patchify_video_latents` (L44-73) line-for-line, and the RoPE
+       `position_ids` construction follows the cited `_ROPE_*` constants and the
+       `_spatial_position_grid` / `_temporal_position_grid` /
+       `_frame_position_grid` / `_fill_audio_positions` helpers.
+     - `src/signet_trainer/prep/h3_encode.py` — the video-VAE encode recipe
+       (around lines 167 and 287) is declared "transcribed line-for-line from
+       `encoders.py:102-136`", read at the same pinned diffusers SHA under
+       `src/diffusers/modular_pipelines/minimax_h3/`; the same section carries
+       the fixed keyframe-encode seed and the ImageNet pixel-normalization
+       constants read from that source.
+
+   NOTICE OF CHANGES (Apache-2.0 §4(b)): the transcribed portions have been
+   modified from their upstream form — re-expressed onto this project's tensor
+   contracts and payload shapes, with added validation, error messages, and
+   documentation. Consult the git history for the complete record.
+
+   A copy of the Apache License 2.0 is included at LICENSES/Apache-2.0.txt.
+
+--------------------------------------------------------------------------------
+Upstream dependencies (not vendored, not redistributed)
+--------------------------------------------------------------------------------
+
+This project builds on, but does not redistribute, the following:
+
+  - MiniMax-H3 — MiniMax
+  - Gemma 3 text encoder — Google
+  - Segment Anything (SAM 2.1 / SAM 3) — Meta
+  - PyTorch, PEFT, accelerate, transformers, safetensors, and the wider Hugging
+    Face ecosystem
+
+(For LTX-2 and diffusers, which are dependencies AND partial provenance, see
+items 4 and 5 above.)
+
+Each remains subject to its own license and model-usage terms. Users are
+responsible for complying with the license and access conditions of any model
+weights they download. signet-trainer does not grant, sublicense, or convey any
+rights in third-party model weights.
+
+--------------------------------------------------------------------------------
+Model-weight terms users must observe
+--------------------------------------------------------------------------------
+
+Some supported model weights carry usage restrictions that survive training and
+attach to the OUTPUTS you generate. These are obligations between you and the
+model provider; signet-trainer cannot waive them, and obtaining signet-trainer
+gives you no rights whatsoever in any model's weights.
+
+MiniMax-H3 — obligations this project cannot waive
+--------------------------------------------------
+
+If you use the H3 path in this trainer, the MiniMax-H3 model license binds you
+directly. Read it in full before you download the weights. In particular:
+
+  - EXCLUDED TERRITORIES (§I.5 / §V.4). The MiniMax-H3 license carves out
+    Excluded Territories, which include the EUROPEAN UNION, the UNITED KINGDOM,
+    the REPUBLIC OF KOREA, and the UNITED STATES. If you or your use falls
+    within an Excluded Territory, the standard grant does not reach you and you
+    must not rely on it. Verify your own position against the current license
+    text.
+
+  - YOU NEED YOUR OWN GRANT. Any grant, approval, or access this project's
+    authors obtained from MiniMax is PERSONAL TO THEM AND DOES NOT TRANSFER to
+    you. Shipping, forking, or running signet-trainer conveys no MiniMax rights.
+    You must obtain and accept your own grant from MiniMax before using H3
+    weights.
+
+  - ATTRIBUTION ON COMMERCIAL PRODUCTS (§IV.2). If you distribute a commercial
+    product or service built on H3, the license requires you to prominently
+    display "MiniMax H3" in that product or service.
+
+  - REVENUE-TRIGGERED SEPARATE AUTHORIZATION (§IV.1). Above a revenue threshold
+    (USD 20,000,000 per year in the license text as read), you must obtain
+    separate authorization from MiniMax. The threshold in the Signet Trainer
+    License is unrelated to and does not substitute for this one — they are two
+    independent obligations and you may be subject to both.
+
+  - NO CROSS-MODEL TRAINING (§V.3). The license prohibits using the model or its
+    outputs to train or improve any other AI model. Outputs generated through the
+    H3 path must NOT be used as synthetic training data for another model family
+    (for example, to train an LTX or Wan LoRA).
+
+Section numbers above reflect the license text as read during this project's
+development and are given to help you find the clauses, not to restate them
+authoritatively. The current MiniMax-H3 license governs.
+
+Read and comply with the license of every checkpoint you load — LTX-2.3, Gemma 3,
+SAM, and any other. Where a model-weight license and this project's documentation
+appear to conflict, the model-weight license governs your use of that model.
+
+--------------------------------------------------------------------------------
+MIT License — applies to items 1 and 2 above
+--------------------------------------------------------------------------------
+
+Copyright (c) 2026 Alvdansen Labs / PromptCrafted
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

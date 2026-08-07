@@ -1,0 +1,48 @@
+# prep_textseed.yaml — SAM 3 TEXT-PROMPT auto-seeding conventions as typed DATA (config-first).
+#
+# Feeds `signet_trainer.prep.textseed`, which replaces HAND-DRAWN frame-0 seeds with a text-prompted
+# SAM 3 concept detection ("a boy with curly red hair" -> binary mask). The produced seed PNGs are
+# byte-compatible with `prep.propagate`'s `load_seed` (region = WHITE(255)), so the existing
+# propagation seam (including the D-08 fwd/rev backward-seed) is reused verbatim.
+#
+# Every threshold below is TUNABLE HERE, never hardcoded in code (house config-first rule).
+# Fail-LOUD: `textseed.load_textseed_config` requires each top-level block; a half-written config
+# must never render a plausible-looking default.
+
+version: 1
+
+model:
+  # SAM 3 concept-segmentation model (accepts `text=`). Gated on HF; weights auto-pull to the cache.
+  id: facebook/sam3
+  dtype: bfloat16          # bfloat16 | float16 | float32
+  device: cuda             # cuda | cpu
+
+detect:
+  # post_process_instance_segmentation knobs (validated on the segtest_a probe: a frame-0 detection
+  # scored 0.84-0.965 with a curl-level hair boundary and no leak onto an adjacent character).
+  threshold: 0.4           # instance-score threshold inside the post-processor
+  mask_threshold: 0.5      # logit->binary threshold for the mask itself
+
+seed:
+  # Concept prompt. `null` means "must be supplied per campaign" (CLI --prompt) — the prompt names
+  # campaign material, so it is never baked into a tracked config.
+  prompt: null
+
+  # Probe frames per clip. ALWAYS includes frame 0 and the last frame (the only two frames the
+  # propagation seam can seed from); the extra evenly-spaced probes are EVIDENCE used to report
+  # where the subject actually appears.
+  n_probes: 5
+
+  # Acceptance bands for a detected instance.
+  min_score: 0.30          # accept an endpoint seed at/above this score
+  weak_score: 0.15         # fallback: accept a flagged weak seed at/above this when nothing better
+  min_coverage: 0.002      # reject specks (<0.2% of frame)
+  max_coverage: 0.90       # reject a runaway whole-frame mask
+
+  # Direction decision (D-08 fwd/rev). Forward (seed frame 0) is PREFERRED; the last frame only wins
+  # when it beats frame 0 by more than this score margin, or when frame 0 has no valid detection.
+  start_margin: 0.10
+
+  # Mask-stem subject class suffix ("<clip_stem>__<mask_type>.png"). Must exist in the coverage_bands
+  # of whichever MASK-SPEC the downstream propagation is run with.
+  mask_type: full_body

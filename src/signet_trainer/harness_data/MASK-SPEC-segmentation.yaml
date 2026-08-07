@@ -1,0 +1,67 @@
+# MASK-SPEC-segmentation.yaml — mask conventions for SEGMENTATION-DATASET export.
+#
+# Same typed shape as MASK-SPEC.yaml (prep/spec.py::load_mask_spec validates both), but tuned for a
+# different consumer: here the masks ARE the training target of a segmentation model, so they must be
+# the EXACT object boundary. The D-02 auto-extend (which deliberately over-grows masks because a
+# too-tight inpaint mask HURT likeness) is therefore DISABLED here via `max_margin_px: 0` —
+# config-first, so no code branch is needed to turn dilation off.
+#
+# Use with: prep_textseed / prep_inpaint_propagate --spec src/signet_trainer/harness_data/MASK-SPEC-segmentation.yaml
+# (or, from an installed package: --spec "$(python -c "from signet_trainer import harness_data as h;
+#  print(h.spec_path(h.MASK_SPEC_SEGMENTATION))")")
+
+version: 1
+
+# Unused on this path (no hand-painted chroma seeds — seeds come from SAM 3 text prompts), but
+# required by the fail-loud spec shape. Values mirror MASK-SPEC.yaml so the two never diverge.
+hex: "#458070"
+rgb: [69, 128, 112]
+
+chroma:
+  method: channel_relationship
+  alternate_method: distance
+  tolerance: 40
+  channel_rules:
+    b_min: 90
+    g_min: 90
+    g_minus_r_min: 30
+    b_minus_r_min: 20
+
+thresholds:
+  seed_load: 127        # >127 when binarizing a loaded seed PNG (grayscale)
+  encode_binarize: 0.5
+
+# Region = WHITE(255) end-to-end here: a segmentation dataset keeps the positive class white in both
+# the mask PNG and the manifest. There is NO staging negate on this path.
+polarity:
+  chain:
+    - "sam_region=white_255"
+    - "dataset_mask_region=white_255"
+
+# EXACT masks: every class carries max_margin_px 0 so dilate_to_target is a no-op. `target` is kept
+# as a REPORTING band only (coverage is recorded per clip), never grown toward.
+coverage_bands:
+  face:
+    target: 0.08
+    warn_below: 0.01
+    dilation:
+      max_margin_px: 0
+      grow_to_target: false
+  face_hair:
+    target: 0.14
+    warn_below: 0.01
+    dilation:
+      max_margin_px: 0
+      grow_to_target: false
+  full_body:
+    target: 0.14
+    warn_below: 0.01
+    dilation:
+      max_margin_px: 0
+      grow_to_target: false
+
+# No inpaint render on this path; a segmentation dataset has no 8n+1 / div-64 constraint. Kept for
+# spec-shape compatibility, with the frame rule relaxed to "none".
+dims:
+  spatial_divisor: 1
+  frame_rule: "none"

@@ -1,0 +1,65 @@
+# TIER-TAXONOMY.yaml — the knob -> tier partition as typed DATA (D-30 part 1).
+#
+# SINGLE SOURCE OF TRUTH for the three-tier knob partition (the draft/pro safety mechanism, D-23).
+# KNOWLEDGE.md's knob->tier table is EMITTED from this file (D-30 part 2) and must NEVER be
+# hand-edited — a hand-written table sitting beside this YAML would silently drift from it.
+#
+# DUAL-PARSER CONTRACT (load-bearing — read before editing): this file is read by TWO parsers that
+# must never disagree —
+#   1. harness_state.py (Plan 02) via yaml.safe_load
+#   2. harness_lint.py (Plan 03) via a stdlib `re` regex, because the lint is import-confined and
+#      physically CANNOT import yaml (test_memory_scaffold.py::test_harness_lint_is_import_confined).
+# Therefore every knob entry is exactly ONE LINE, flow-mapping shape, tier FIRST:
+#     <knob>: {tier: <1|2|3>, source_tags: "<tags>", note: "<why>"}
+# so both `yaml.safe_load` and `^\s{2,}([A-Za-z0-9_.]+):\s*\{\s*tier:\s*([123])\b` parse it exactly.
+# No block-nested knob entries, no YAML anchors, no aliases, no multi-line values, no unquoted notes.
+
+version: 1
+
+# D-06 fail-safe: a knob ABSENT from this file is Tier 3 (ask), never Tier 1. New knobs default to
+# ask until proven quality-neutral. The fail-safe direction protects what the model learns.
+default_tier: 3
+
+tiers:
+  1: "mode-auto — quality-neutral runs-side knobs the mode may auto-select (D-01)"
+  2: "carve-out — ALWAYS check in, even under yolo+draft; learning-adjacent (D-03/D-04)"
+  3: "house-first — learns-side; ask-when-uncovered; the mode may ONLY reword the recommendation, never auto-pick (D-05)"
+
+knobs:
+  # --- Tier 1: mode auto-selects (quality-neutral, runs-side) — D-01 + D-02 ---
+  checkpoint_every: {tier: 1, source_tags: "[house]", note: "checkpoint save cadence; quality-neutral — a denser cadence changes only run cost and artifact count, never what is learned"}
+  validation.in_loop_sampling: {tier: 1, source_tags: "[house]", note: "whether in-loop samples render during training; a run-cost knob that learns nothing"}
+  validation.num_samples: {tier: 1, source_tags: "[house]", note: "how many samples per in-loop render; cost-only, quality-neutral"}
+  sampling_plan.venue: {tier: 1, source_tags: "[house]", note: "the SESSION-STATE sampling venue (parallel vs in-loop); infra placement, not a learning knob — not a schema field"}
+  data.num_dataloader_workers: {tier: 1, source_tags: "[house]", note: "dataloader worker count; throughput-only, identical training result"}
+  training.gradient_checkpointing: {tier: 1, source_tags: "[house]", note: "recompute-vs-memory tradeoff; identical gradients, only VRAM and speed differ"}
+  quicklook_render_fidelity: {tier: 1, source_tags: "[house]", note: "harness-layer quicklook render fidelity (a dev-glance render, not a verdict); free for the mode to cheapen — verdict renders are locked in HOUSE-SPEC.yaml, not here. Not a schema field."}
+  gradient_accumulation_steps: {tier: 1, source_tags: "[house]", note: "Tier 1 per D-02 (Minta ML domain call: not something people regularly want to change, so auto it). It nominally moves effective batch but is not tuned per campaign. This DELIBERATELY overrides SCOPE section 6 Q5 — a future reader must NOT fix it back to Tier 2."}
+  # --- Tier 2: carve-out class (ALWAYS check in, even under yolo+draft) — D-03 + D-04 ---
+  training_dims: {tier: 2, source_tags: "[house] [precedent]", note: "W x H training dims (total-resolution component); resolution changes what the model sees. Native-scale house rule, never pre-shrink; ALWAYS check in (D-03)"}
+  data.resolution_buckets: {tier: 2, source_tags: "[house] [precedent]", note: "total resolution buckets; native-scale house rule, never pre-shrink; ALWAYS check in (D-03)"}
+  resolution_buckets.frame_count: {tier: 2, source_tags: "[house] [precedent]", note: "bucket frame count (bucket-F / multi-F); changes the temporal window learned; ALWAYS check in (D-03)"}
+  training.max_steps: {tier: 2, source_tags: "[house] [precedent]", note: "round sizing / step budget; changes how much the model learns; ALWAYS check in, never corpus-scaled (D-03)"}
+  lora.rank: {tier: 2, source_tags: "[house] [precedent]", note: "LoRA rank; rank ~16 favours likeness, 64 for style — a learning-capacity knob; ALWAYS check in (D-03). alpha rides the same coupled question (D-10) but alpha is Tier 3."}
+  offload.blocks_to_swap: {tier: 2, source_tags: "[house] [precedent]", note: "FULL Tier-2 carve-out, not the soft carve-out SCOPE section 3 proposed (D-04). Reason: OFFL-02 long-run adapter QUALITY under swapping is unproven — 07-13 validated freeze-mechanics only. pro prefers 0 (the proven no-swap path, paid in throughput); draft may PROPOSE raising it as the sanctioned VRAM lever with Minta confirming. Promote to Tier 1 only when a long-run quality A/B lands."}
+  # --- Tier 3: learns-side (house-first, ask-when-uncovered; mode may ONLY reword, never auto-pick) — D-05 ---
+  lr: {tier: 3, source_tags: "[house]", note: "learning rate; house default 5e-5. Tier 3 for MODE purposes (the mode may never auto-pick it) but PROMOTED to a first-class setup question (D-09) — always surfaced, house default named."}
+  lora.alpha: {tier: 3, source_tags: "[house]", note: "LoRA alpha; house default 64 (rank==alpha==64 -> scale 1.0). Asked coupled with rank (D-10). Learns-side; the mode may only reword the recommendation."}
+  target_modules: {tier: 3, fenced: true, source_tags: "[house] [precedent]", note: "HARD-FENCED (D-07): never-touch, not merely ask. Dropping ff.net is the documented same-project scaffold bug that corrupted sirena likeness. target_modules = attn1 + attn2 + ff.net is a hard house invariant; ff.net is ~2/3 of block params where identity is encoded."}
+  optimizer: {tier: 3, source_tags: "[house] [precedent]", note: "optimizer choice; house = AdamW 8-bit, never Prodigy (differential-LR precedent burned it). House-first, ask-when-uncovered."}
+  uniform_prob: {tier: 3, source_tags: "[house]", note: "flow-matching uniform sampling probability; house 0.30. The mima-F2 silent-default trap (0.30 -> 0.1) lives here — never omit the block, never auto-lower. Learns-side."}
+  scheduler: {tier: 3, source_tags: "[house]", note: "LR scheduler; house = cosine. Learns-side, house-first, ask-when-uncovered."}
+  min_lr: {tier: 3, source_tags: "[house]", note: "scheduler min_lr / min_lr_ratio; house 0.01 ratio. Learns-side, house-first."}
+  warmup: {tier: 3, source_tags: "[house]", note: "warmup steps; house default 0. Learns-side, house-first, ask-when-uncovered."}
+  weight_decay: {tier: 3, source_tags: "[house]", note: "optimizer weight decay; learns-side, house-first, ask-when-uncovered."}
+  conditioning: {tier: 3, source_tags: "[house]", note: "the conditioning.* block (reference / IC-LoRA conditioning); changes what the model conditions on. Learns-side, house-first."}
+  model.model_id: {tier: 3, source_tags: "[house] [precedent]", note: "base checkpoint filename — ONE field for BOTH train and inference (schema.py:134); fixed by training, a Minta setup decision. The render substrate is NEVER a mode lever (D-28)."}
+  methodology_round_plan: {tier: 3, source_tags: "[house]", note: "round-plan / forgetting-on-purpose methodology; a per-campaign Minta call, explicitly OUTSIDE the axis — neither mode may auto-lighten."}
+  dataset_metadata: {tier: 3, source_tags: "[house]", note: "dataset / caption metadata; changes what the model learns. Learns-side, house-first (Klippbok is the caption gold standard)."}
+  seed: {tier: 3, source_tags: "[house]", note: "eval / train seed; house default 42. Learns-side for reproducibility; house-first, the mode never auto-picks it."}
+
+# Knobs deliberately EXCLUDED from the axis. A reader must NOT be able to infer a tier for these —
+# they are not under `knobs:` on purpose. Each is off-axis for a structural reason, not a tier call.
+not_a_mode_lever:
+  - keep_checkpoints: "D-08 — NEVER a mode lever. Default is save-everything (keep_n null); draft can never prune. Setup ASKS whether to override or set a rate. Honors never-auto-delete: in a research lab the intermediaries ARE the artifacts."
+  - validation.two_stage_upscale: "D-26 — a posture-independent eval-honesty rule, not a cost knob. Already default-OFF in code (schema.py:526). Two-stage can misrepresent LoRA convergence; allowed if a user asks, but explained first. Slaved to model_id by the distilled cross-field validator (D-28)."

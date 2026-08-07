@@ -1,0 +1,158 @@
+# Signet Trainer License 1.0.0
+
+Derived from the PolyForm Small Business License 1.0.0
+(https://polyformproject.org/licenses/small-business/1.0.0/), with a modified
+eligibility threshold. PolyForm license texts are published as templates and are
+intended to be adapted.
+
+⚠ **NOT LEGAL ADVICE.** This text was drafted to express the licensor's stated
+commercial intent. Have counsel review it before any public release.
+
+Copyright (c) 2026 PromptCrafted / Alvdansen Labs
+
+## Purpose
+
+This license lets you use and share this software for free, without limitation,
+if you are an individual, a researcher, a creator, a nonprofit, or a small
+business as defined below. Larger organizations need a paid commercial license.
+
+The intent is plain: people learning, researching, and making things should
+never have to pay or ask. Companies that have raised real money or earn real
+revenue should.
+
+## Acceptance
+
+In order to receive this license, you must agree to its rules. Those rules are
+both obligations under that agreement and conditions to your license. Do not do
+anything with this software that triggers a rule you cannot or will not follow.
+
+## Copyright License
+
+The licensor grants you a copyright license to do everything you might do with
+this software that would otherwise infringe the licensor's copyright in it, for
+any **permitted purpose**.
+
+## Distribution License
+
+The licensor grants you an additional copyright license to distribute copies of
+this software. Your license to distribute covers distributing this software with
+changes and new works permitted by this license.
+
+## Notices
+
+You must ensure that anyone who gets a copy of any part of this software from you
+also gets a copy of these terms, along with the `NOTICE` file distributed with
+this software. You must not remove or alter copyright, attribution, or license
+notices, including those of the third-party projects credited in `NOTICE`.
+
+If you modify this software, you must carry prominent notices stating that you
+changed it.
+
+## Changes and New Works License
+
+The licensor grants you an additional copyright license to make changes and new
+works based on this software, for any permitted purpose.
+
+## Patent License
+
+The licensor grants you a patent license for the software that covers patent
+claims the licensor can license, or becomes able to license, that you would
+infringe by using the software as permitted by this license.
+
+## Permitted Purpose
+
+Any purpose is a permitted purpose, **except** providing to others any product
+that competes with this software, and except use by an organization that is not
+an **Eligible Licensee**.
+
+## Eligible Licensee
+
+You are an Eligible Licensee if **any** of the following is true:
+
+1. **You are an individual** using the software for your own purposes —
+   including personal, creative, freelance, and educational use — regardless of
+   your income.
+
+2. **You are a researcher or educational institution**, and your use is for
+   research, teaching, or study.
+
+3. **You are a nonprofit or charitable organization.**
+
+4. **You are an organization that, together with its affiliates:**
+   - had **less than 2,000,000 USD** (two million United States dollars) in
+     total gross revenue in the most recently completed fiscal year, **and**
+   - has raised **less than 2,000,000 USD** in total capital, cumulatively,
+     across all financing rounds — including equity, convertible instruments,
+     debt raised for operations, and grants intended as operating capital.
+
+If you cross either threshold in item 4, you are no longer an Eligible Licensee
+and must obtain a commercial license to continue using this software. You get a
+**90-day grace period** from the date you cross a threshold in which to obtain
+one, and your existing use is not retroactively a violation.
+
+"Affiliates" means organizations that control, are controlled by, or are under
+common control with you, where control means ownership of substantially all
+assets, or the power to direct management or policy.
+
+## Commercial License
+
+If you are not an Eligible Licensee, contact **minta@promptcrafted.com** for a
+commercial license. The licensor intends commercial terms to be reasonable and
+proportionate.
+
+## Fair Use
+
+This license does not limit any rights you have under applicable copyright
+exceptions and limitations, including fair use.
+
+## No Other Rights
+
+This license does not imply any other licenses, and does not grant any rights to
+the licensor's trademarks, service marks, or trade names.
+
+## Patent Defense
+
+If you make any written claim that this software infringes or contributes to
+infringement of any patent, your patent license for the software granted under
+these terms ends immediately. If your company makes such a claim, your patent
+license ends immediately for work on behalf of your company.
+
+## Violations
+
+The first time you are notified in writing that you have violated any of these
+rules, or done anything with this software not covered by your licenses, your
+licenses can nonetheless continue if you come into full compliance with these
+terms, and take practical steps to correct past violations, within **32 days** of
+receiving notice. Otherwise, all your licenses end immediately.
+
+## No Liability
+
+**As far as the law allows, this software comes AS IS, without any warranty or
+condition, and the licensor will not be liable to you for any damages arising out
+of these terms or the use or nature of this software, under any kind of legal
+claim.**
+
+## Definitions
+
+The **licensor** is the individual or entity offering these terms, and the
+**software** is the software the licensor makes available under these terms,
+including any portion of it.
+
+**You** refers to the individual or entity agreeing to these terms.
+
+**Your company** is any legal entity, sole proprietorship, or other kind of
+organization that you work for, plus all its affiliates.
+
+**Your licenses** are all the licenses granted to you for the software under
+these terms.
+
+**Use** means anything you do with the software requiring one of your licenses.
+
+## Third-Party Components
+
+This software incorporates and derives from third-party open-source projects
+under their own licenses, including Apache-2.0 and MIT licensed code. Those
+components remain under their original licenses, and nothing in this license
+restricts your rights in them. See the `NOTICE` file for the full attribution
+inventory. Where this license and a third-party license conflict as to a
+third-party component, the third-party license governs that component.

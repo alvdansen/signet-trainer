@@ -1,0 +1,101 @@
+# Phase-4 base-vs-LoRA SAMPLE config (04-04, D-RUN-1 part 1) — the ONE gated metered inference run.
+#
+# Runs the ported ltx-trainer ValidationSampler on the EXISTING Phase-3 overfit adapter
+# (outputs/ltx23_overfit on signe-trainer-checkpoints) to produce a base-vs-LoRA HTML montage for
+# Minta's visual approval (INFR-01 + INFR-02). Single-stage (grid default); the two-stage upscaler
+# toggle (04-05) stays OFF here. The LIVE in-loop metered sample is NOT run here — it rides the next
+# gated training run (D-RUN-1 part 2).
+#
+# LTX canonical params (re-validated, NO Wan params): flow-match Euler + STG is structurally enforced
+# by the sampler (LTX2Scheduler + EulerDiffusionStep); there is no UniPC/shift knob and no
+# decode_timestep field to set. num_inference_steps=30, guidance=3.0, STG scale 1.0 / blocks [29] /
+# mode stg_v, seed 42.
+#
+# Frame count: 49 is the CHEAPER valid 8k+1 bucket (correctness-first default). 81 would match the
+# training bucket (768x352x81) exactly for the sharpest overfit-divergence read — cost tradeoff
+# surfaced to Minta at the gate.
+training_dims: [768, 352, 81]
+
+data:
+  # Mounted signe-trainer-dataset Volume root (string; existence checked Modal-side at mount).
+  preprocessed_data_root: /dataset/.precomputed
+  num_dataloader_workers: 2
+  batch_size: 1
+  resolution_buckets:
+    - 768x352x81
+
+lora:
+  # Mirrors the Phase-3 overfit adapter so the PEFT config reconstructs cleanly for the LoRA column.
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # Not exercised by the sample run, but present for SignetConfig validity (mirrors the overfit recipe).
+  max_steps: 50
+  checkpoint_every: 10
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  optimizer: adamw8bit
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01
+  warmup_steps: 0
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0            # single A100-80GB, no block-swap (baseline-clean, matches Phase 3).
+
+modal:
+  hourly_rate_usd: 1.64        # A100-80GB guardrail; confirm vs live Modal pricing at the gate.
+  cost_guardrail_usd: 50.0
+  # 4 prompts x 2 columns (base+LoRA) = 8 single-stage clips at 81 frames (match training bucket). Rough est ~1.2h.
+  est_hours: 1.2
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  # The D-PROMPT-1 MIX. The "6 clip captions" collapse to ONE unique training caption — the Phase-2
+  # D-01 dataset (_stage_fresh_dataset.py) captioned all 6 showcase clips identically. That single
+  # training caption is the overfit-divergence read (the LoRA should reproduce what it memorized);
+  # the 3 canonical prompts are the stable subject-agnostic yardstick reused across Phases 5-7.
+  prompts:
+    - "a high quality cinematic animated video clip"                                   # training caption (overfit divergence read)
+    - "a woman with dark hair turns her head slowly toward the camera, soft daylight"  # canonical 1 (motion + face)
+    - "a person walks through a sunlit room, natural motion, shallow depth of field"   # canonical 2 (motion + framing)
+    - "a close-up portrait, gentle expression, cinematic lighting"                     # canonical 3 (portrait)
+  frame_count: 81
+  guidance_scale: 3.0
+  num_inference_steps: 30
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: stg_v
+  width: 768
+  height: 352
+  two_stage_upscale: false     # single-stage is the grid default (04-05 toggle stays OFF here).
+  num_samples: 1
+  interval: 250
+  seed: 42
+
+conditioning:
+  mode: none                   # reserved for Phases 5-7 reference control.
+
+seed: 42
+output_dir: outputs/ltx23_overfit   # the Phase-3 adapter dir on signe-trainer-checkpoints (LoRA column).

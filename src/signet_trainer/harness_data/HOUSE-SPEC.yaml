@@ -1,0 +1,36 @@
+# HOUSE-SPEC.yaml — the typed home of the house verdict spec (D-29).
+#
+# PATTERNS F-3 proved the house verdict spec (81f / 40 steps / guidance 4.0 / seed 42) previously
+# existed ONLY as per-config YAML values inside a campaign run config (e.g.
+# `configs/<campaign>_r5.yaml`, the validation block), which left D-24's "verdict dispatches assert
+# the house spec and reject trimmed params" with nowhere to assert FROM. This file is that home.
+#
+# DELIBERATELY DIFFERENT from schema.py::ValidationConfig defaults (frame_count=49 /
+# num_inference_steps=30 / guidance_scale=3.0, schema.py:502-517), which are the LTX-CANONICAL
+# params. The divergence is intentional (PATTERNS F-3) and schema.py is ZERO-EDIT — do not reconcile
+# them. assert_verdict_spec() (Plan 02) reads THIS file so a trimmed verdict render fails loudly
+# rather than silently misleading a go/no-go call at step ~200 (D-25).
+
+version: 1
+
+# The locked eval params — transcribed from the operator's locked eval spec as it was pinned in a
+# campaign run config, NOT from schema.py defaults. A verdict render is asserted against these and
+# rejected if trimmed. Retune per house, but retune HERE — never per dispatch.
+verdict_spec:
+  frame_count: 81            # 5s eval clips — operator-locked eval spec (2026-07-11)
+  num_inference_steps: 40    # operator-locked eval spec (2026-07-10) — supersedes a 10-step render
+  guidance_scale: 4.0        # operator-locked eval spec (2026-07-10)
+  seed: 42                   # operator-locked eval spec
+  two_stage_upscale: false   # single-stage house default (sirena F5) — see disclosures.single_stage / D-26
+  min_prompt_count: 2        # D-25 prompt-count floor — a thinner prompt set is the eval-composition trap; one prompt is never a valid verdict basis
+
+# Render tiers (D-24). The tier is declared by PURPOSE at the call site — a render is a `verdict`
+# BECAUSE a decision rides on it. `quicklook` is free for the mode to cheapen; `verdict` is locked at
+# `verdict_spec` above and is NOT a mode lever.
+render_tiers:
+  - quicklook
+  - verdict
+
+# Disclosure lines the skills restate — carried as DATA, not duplicated skill literals (D-NOHARDCODE).
+disclosures:
+  single_stage: "Rendering single-stage by default: two-stage can misrepresent LoRA convergence — the upscale stage may not fully respect the adapter convergence and can show detail the adapter did not actually learn (D-26/D-27). Two-stage is allowed if a user asks, but the convergence caveat is explained first."

@@ -1,0 +1,76 @@
+# TRAIN-07 RESUME proof config — relaunch of the ltx23_overfit run to prove resume-from-checkpoint.
+#
+# Identical to ltx23_overfit.example.yaml EXCEPT max_steps is bumped 50 -> 80 and the SAME
+# output_dir (outputs/ltx23_overfit). On launch the CheckpointManager finds the committed
+# checkpoint-step-00050 and must RESUME from global_step=50 (re-injecting the adapter — landmine #1),
+# continuing 50 -> 80, NOT cold-starting at step 0. That step-continuation + non-zero re-injected
+# adapter is the TRAIN-07 / landmine #1 correctness proof (precedent manual-relaunch resume pattern).
+training_dims: [768, 352, 81]
+
+data:
+  preprocessed_data_root: /dataset/.precomputed
+  num_dataloader_workers: 2
+  batch_size: 1
+  resolution_buckets:
+    - 768x352x81
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # Bumped past the existing checkpoint-step-50 so resume continues 50 -> 80 (proves N->N+, not restart).
+  max_steps: 80
+  checkpoint_every: 10
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  optimizer: adamw8bit
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01
+  warmup_steps: 0
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0
+
+modal:
+  hourly_rate_usd: 1.64
+  cost_guardrail_usd: 50.0
+  est_hours: 0.6
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250
+  prompts:
+    - "a portrait of my subject, cinematic lighting"
+  frame_count: 81
+  guidance_scale: 3.0
+  num_samples: 1
+  seed: 42
+
+conditioning:
+  mode: none
+
+seed: 42
+# SAME output_dir as the base overfit — this is what makes the resume find checkpoint-step-50.
+output_dir: outputs/ltx23_overfit

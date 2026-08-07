@@ -1,0 +1,51 @@
+# INVALID LTX-2.3 config — identical to ltx23_lora.example.yaml EXCEPT the frame count.
+#
+# training_dims = [768, 512, 32]:  (32 - 1) % 8 == 7 != 0  ->  REJECTED at config-load.
+# Loading this file raises a Pydantic ValidationError mentioning the frame-count rule,
+# BEFORE any GPU is provisioned. This drives the D-13 hard-gate / non-zero-exit test.
+training_dims: [768, 512, 32]
+
+data:
+  preprocessed_data_root: /data/preprocessed/my_subject
+  num_dataloader_workers: 2
+  batch_size: 1
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # Present so this file fails ONLY on the frame-count rule (not on a missing required block).
+  max_steps: 100
+
+modal:
+  hourly_rate_usd: 1.64
+  cost_guardrail_usd: 50.0
+  est_hours: 2.0
+
+validation:
+  interval: 250
+  prompts:
+    - "a portrait of my subject, cinematic lighting"
+  frame_count: 49
+  guidance_scale: 3.0
+  num_samples: 1
+  seed: 42
+
+conditioning:
+  mode: none
+
+seed: 42
+output_dir: outputs/ltx23_lora_example

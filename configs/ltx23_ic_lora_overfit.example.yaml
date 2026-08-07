@@ -1,0 +1,91 @@
+# Tiny IC-LoRA seg-overfit config (Phase 7 / REF-03, D-7-LADDER tier 3 — the SC#3 re-skin proof).
+#
+# A THROWAWAY correctness OVERFIT (the seg-map -> video steering proof), NOT a real re-skin LoRA. A
+# handful of steps on the paired 25f segmentation demo data to prove the in-context video-to-video
+# training path is non-corrupt and that the semantic map STEERS the output. Mirrors
+# ltx23_ic_lora.example.yaml but with a tiny step budget (~$1-2 class) and a mid-run checkpoint.
+#
+# training_dims = [width, height, frames] = the demo 25f test bucket (D-7-25F). The four LTX
+# constraints: (25-1)%8==0, 480%32==0, 832%32==0, batch_size==1. NO Wan carry-forwards (CLAUDE.md).
+training_dims: [832, 480, 25]
+
+data:
+  # The paired seg-encoded root that 07-11 populates (target latents + reference_latents/ seg maps).
+  # A STRING — existence checked Modal-side where the Volume mounts (Pitfall 1).
+  preprocessed_data_root: /dataset/.precomputed_demo_seg
+  num_dataloader_workers: 2
+  batch_size: 1
+  resolution_buckets:
+    - 832x480x25
+
+lora:
+  rank: 64                   # house default identity capacity.
+  alpha: 64                  # rank == alpha -> PEFT scale 1.0 -> clean PEFT->LTX key conversion.
+  dropout: 0.0
+  # HOUSE INVARIANT: ff.net.0.proj + ff.net.2 MUST be targeted; never drop these two.
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # OVERFIT step budget — a handful of steps, enough to prove a non-corrupt steering adapter, NOT a
+  # real LoRA. checkpoint_every < max_steps so a committed checkpoint exists mid-run.
+  max_steps: 50
+  checkpoint_every: 10
+  learning_rate: 5.0e-5      # beat 1e-4 in the house A/B.
+  weight_decay: 0.01
+  optimizer: adamw8bit       # NEVER Prodigy (banned; breaks differential-LR).
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30         # sharper-detail choice (house default).
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01         # flimmer template.
+  warmup_steps: 0            # flimmer template.
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0          # baseline-first (D-OFF-1) — the no-block-swap baseline-clean run.
+
+modal:
+  hourly_rate_usd: 1.64      # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing.
+  cost_guardrail_usd: 50.0
+  # Overfit is ~$1-2: 1.64 * 0.6 = ~$0.98. The cost print reflects this cheap run before the gate.
+  est_hours: 0.6
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  # interval > max_steps so NO sampling fires during the overfit (the re-skin grid is a separate
+  # gated sample invocation, not an in-loop render). frame_count/geometry match the 25f bucket.
+  interval: 250
+  prompts:
+    - "a vintage muscle car driving down a coastal road, golden hour, film grain"
+  frame_count: 25
+  guidance_scale: 3.0        # LTX guidance (NOT the Wan-tuned 5.0).
+  num_samples: 1
+  seed: 42
+  width: 832
+  height: 480
+
+conditioning:
+  mode: ic_lora
+  conditioning_source: paired          # paired seg-map reference latents (only valid in ic_lora mode).
+  reference_latents_dir: reference_latents
+  reference_downscale_factor: 1        # D-7-REF11: reference kept 1:1 for the first proof.
+  reference_column: reference_path
+  seg_palette_name: compact_driving_v1 # D-7-PALETTE: config-selected palette table (D-NOHARDCODE).
+
+seed: 42
+output_dir: outputs/ltx23_ic_lora_overfit

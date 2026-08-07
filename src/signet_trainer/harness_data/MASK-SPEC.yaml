@@ -1,0 +1,85 @@
+# MASK-SPEC.yaml — the inpaint mask conventions as typed DATA (D-03).
+#
+# SINGLE SOURCE OF TRUTH for the mask conventions (D-01/D-02/D-05): the canonical brush hex, the
+# chroma-extraction rule, the seed/encode binarize thresholds, the negate polarity chain, the
+# per-subject-class coverage bands WITH the D-02 auto-extend dilation config, and the inpaint dims
+# rules. Scripts (prep/*) AND the masking app read this file — never hardcode hex/coverage/tolerance
+# in code (D-03 rejects constants-in-code and prose-only conventions). A KNOWLEDGE.md section is
+# EMITTED from this file by harness_state.py (drift-fenced: a hand-edit fails `harness_state check`),
+# exactly as TIER-TAXONOMY.yaml drives the knob->tier table.
+#
+# Fail-LOUD contract: a half-written spec must never render a plausible convention block —
+# prep/spec.py::load_mask_spec (and harness_state.load_mask_spec) require every top-level key below
+# and shape-check the per-class dilation config. yaml.safe_load-parseable; no anchors, no aliases.
+
+version: 1
+
+# D-01 — the canonical brush hex: teal, what the operator actually painted with in r1 (auto-detected
+# uniformly across all 13 paintovers, _inpaint_prep/img_match.json paint_rgb [69,128,112]). Canonizes
+# proven reality over inventing a convention. Rejected: #FFFFFF (invisible over light/blonde hair,
+# confusable with real white pixels) and sirena red #F01C00 (red occurs in lips/clothing more than teal).
+hex: "#458070"
+rgb: [69, 128, 112]
+
+# Chroma extraction — how hand-painted teal is separated from content. Default is a
+# channel-relationship rule (the sirena teal_mask precedent shape, robust to iPad-export
+# compression); `distance` (L2-to-teal within `tolerance`) is the documented alternate. The
+# channel_rules are the teal-tuned constants (BGR ~ 112,128,69: green + blue dominate red), tunable
+# per campaign — never hardcode in the extraction code.
+chroma:
+  method: channel_relationship
+  alternate_method: distance
+  tolerance: 40                # L2 RGB distance tolerance for the `distance` alternate method
+  channel_rules:               # channel_relationship rule for teal in BGR(112,128,69)
+    b_min: 90
+    g_min: 90
+    g_minus_r_min: 30
+    b_minus_r_min: 20
+
+# Binarize thresholds along the polarity chain (D-05).
+thresholds:
+  seed_load: 127        # >127 when binarizing a loaded seed PNG (grayscale)
+  encode_binarize: 0.5  # >0.5 at encode (mask_encode.py channel-mean binarize)
+
+# D-05 — the polarity chain, pinned as canon (already true on disk, now spec law). Inverting any
+# link is catastrophic and silent until render.
+polarity:
+  chain:
+    - "paint_region=white_255"     # painted / SAM region is WHITE(255)
+    - "stage_negate"               # staging applies -vf negate (render_mask_video seam)
+    - "mask_mp4_region=black_0"    # mask mp4 region becomes BLACK(0)
+    - "encode_gt_0.5"              # encode binarize >0.5
+    - "tensor_keep=1.0"            # tensor 1.0 = KEEP / context
+    - "tensor_generate=0.0"        # tensor 0.0 = GENERATE
+
+# D-02 — coverage encoded as BEHAVIOR (auto-extend + QA gate), not a static number. Each subject
+# class carries a `target` coverage fraction, a soft `warn_below` band, and a `dilation` sub-block:
+# propagate.py (Plan 05) dilates exact-SAM masks by up to `max_margin_px` OR until coverage reaches
+# `target` (`grow_to_target`), whichever first. r1 finding: exact-SAM ~4.8% HURT likeness; extended
+# ~14% won on the hair-heavy classes. ALL of these are tunable per campaign — never hardcoded in code.
+coverage_bands:
+  face:
+    target: 0.08
+    warn_below: 0.04
+    dilation:
+      max_margin_px: 12
+      grow_to_target: true
+  face_hair:
+    target: 0.14
+    warn_below: 0.08
+    dilation:
+      max_margin_px: 28
+      grow_to_target: true
+  full_body:
+    target: 0.14
+    warn_below: 0.08
+    dilation:
+      max_margin_px: 32
+      grow_to_target: true
+
+# Inpaint dims rules (stricter than the general ÷32): ÷64 spatial + 8n+1 frames. Surfaced at prep
+# time by prep/preflight.py::check_inpaint_rules, which reads spatial_divisor + frame_rule FROM here
+# (never a hardcoded 64/8).
+dims:
+  spatial_divisor: 64
+  frame_rule: "8n+1"   # (frames - 1) % 8 == 0; trim, never pad

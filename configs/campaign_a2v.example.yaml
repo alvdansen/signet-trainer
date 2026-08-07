@@ -1,0 +1,122 @@
+# =============================================================================
+# Example AUDIO-TO-VIDEO plumbing proof.  LTX-2.3-22b.
+#
+# Genericized from a production campaign config. Phase-9 completion gate
+# (GATE-SPEC-inpaint-a2v.md rev 2, "A2V — build delta"): the FIRST a2v run is a PLUMBING
+# PROOF (GATE-SPEC settled decision 5: "first run = plumbing proof"), NOT a quality verdict.
+# VIDEO is generated; the driving AUDIO is FROZEN conditioning (audio tokens at timestep 0,
+# excluded from the loss). Likeness CONTINUATION from the validated r5 adapter (res-matched:
+# r5 trained this same 1280x704 family) so the overfit starts from a real likeness.
+#
+# ⚠ DATA-BLOCKED + GATED: a2v cannot run until the muxed corpus lands (real source audio
+# time-aligned to each clip). The muxed clips stage at _staging_campaign_a2v/muxed/ (a
+# staging/metadata step precedes the gated --mode preprocess encode, which writes latents/ +
+# conditions/ + audio_latents/ to .precomputed_campaign_a2v via with_audio=True). Zero GPU /
+# zero spend to author.
+#
+# DEV BASE (NOT fused, NOT distilled): a2v is a fresh capability on the plain dev transformer.
+# =============================================================================
+
+training_dims: [1280, 704, 81]  # heaviest bucket; %32-clean (a2v uses the video %32 rule, not ÷64)
+
+model:
+  # The plain dev base (filename lacks 'distilled' so base_variant_of classifies it dev). The audio
+  # dual-stream weights ride the full checkpoint — never stripped (BUGLOG#6 meta-device crash).
+  model_id: ltx-2.3-22b-dev.safetensors
+
+data:
+  preprocessed_data_root: /dataset/.precomputed_campaign_a2v
+  # muxed corpus contract: real source audio time-aligned to each clip (staging + metadata step
+  # precedes encode). {media_path, caption} rows (+ audio muxed into each clip for with_audio encode).
+  metadata_path: /dataset/campaign_a2v/metadata.jsonl
+  num_dataloader_workers: 2
+  batch_size: 1
+  resolution_buckets:  # the proven 1280x704 multi-F family (8n+1 frames), matching r5's res family
+    - 1280x704x17
+    - 1280x704x25
+    - 1280x704x33
+    - 1280x704x41
+    - 1280x704x49
+    - 1280x704x73   # the 2 staged proof clips trim to 73f (8*9+1) — full-span encode, no truncation
+    - 1280x704x81
+
+lora:
+  rank: 42   # continuation from r5 — MUST match r5's rank for a clean warm-start
+  alpha: 42  # alpha == rank
+  dropout: 0.0
+  target_modules:  # the video set PLUS the cross-modal audio->video attention (a2v-required; the #1
+    - attn1.to_q   #   silent a2v failure is omitting these — schema fail-fasts if absent)
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+    - audio_to_video_attn.to_q     # cross-modal: the audio->video attention the driving audio steers
+    - audio_to_video_attn.to_k
+    - audio_to_video_attn.to_v
+    - audio_to_video_attn.to_out.0
+
+training:
+  max_steps: 600  # PLUMBING PROOF overfit (1-2 clips) — NOT a quality run
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  optimizer: adamw8bit
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30
+  scheduler: cosine_with_min_lr  # min_lr_ratio 1.0 => CONSTANT LR
+  min_lr_ratio: 1.0
+  warmup_steps: 0
+  checkpoint_every: 200  # ckpt (+ potential render) cadence for the short overfit
+  keep_checkpoints: null  # KEEP ALL (operator HARD RULE — never prune)
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+  # LIKENESS CONTINUATION (res-matched per the audit): the trainable adapter warm-starts from r5's
+  # FINAL, fresh optimizer at step 0. Same dir the inpaint gate continues from (r5 COMPLETE).
+  init_adapter_path: outputs/campaign_r5/checkpoint-step-03000-loss-0.1318
+
+offload:
+  blocks_to_swap: 24  # active block-swap; r5-proven posture at this res. NOTE (GATE-SPEC top risk):
+                      # the offloader does NOT track audio_transformer_blocks — VRAM is UNPROVEN for
+                      # pure-dev-base a2v; confirm the envelope at the gated live proof.
+
+modal:
+  hourly_rate_usd: 1.64      # A100-80GB (single-A100 house rule)
+  cost_guardrail_usd: 20.0   # small overfit; session cap tracked separately
+  est_hours: 1.5             # 600-step overfit
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250
+  in_loop_sampling: false  # a2v test renders ride the SAMPLE config's validation.samples (driving
+                           # .wav conditions); in-loop run_sampler is plain video (no audio steer).
+  num_inference_steps: 40  # operator-locked eval spec
+  prompts:  # a small ethos set (drives the base-vs-LoRA video render path; the a2v audio-driven
+    - "the subject looks into the camera and breaks into a warm smile, soft daylight, shallow-focus close-up"
+    - "a cinematic film still of the subject in evening wear, classic key lighting"
+  frame_count: 81          # 8n+1
+  guidance_scale: 4.0
+  num_samples: 1
+  seed: 42
+  width: 1280              # %32-clean
+  height: 704
+  two_stage_upscale: false # dev base single-pass (distilled two-stage has no input-audio surface)
+
+conditioning:
+  mode: audio_to_video
+
+audio:
+  with_audio: true      # REQUIRED for a2v — the encode writes audio_latents/ (schema fail-fasts if false)
+  is_generated: false   # audio is the DRIVING input (frozen conditioning), never generated
+  generate_audio: false # a2v emits VIDEO only (no generated audio output)
+
+seed: 42
+output_dir: outputs/campaign_a2v_r1

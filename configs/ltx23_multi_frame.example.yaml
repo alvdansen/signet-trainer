@@ -1,0 +1,122 @@
+# Valid LTX-2.3 MULTI-FRAME reference-control SAMPLE config (Phase 6 / REF-02, D-6-*).
+#
+# Base-model multi-condition SAMPLE config: it exercises the Phase-6 multi-frame conditioning
+# surface (mode: multi_frame + an OBJECT-list conditioning_items with per-keyframe strengths) so
+# the gated sample run (Plan 06-09) can render a start/mid/end keyframe grid. Loading this file
+# returns a SignetConfig with no error and passes the zero-GPU gate:
+#   `python -m signet_trainer.dryrun configs/ltx23_multi_frame.example.yaml`.
+#
+# demo bucket — the four LTX-2.3 constraints all hold for [832, 480, 49]:
+#   (49 - 1) % 8 == 0    -> valid frame count (8k+1)
+#   480 % 32 == 0        -> valid height
+#   832 % 32 == 0        -> valid width
+#   data.batch_size == 1 -> single-bucket
+# NO Wan-tuned scheduler/step/guidance carry-forwards anywhere — those are Wan-arch-specific and do
+# NOT apply to LTX-2.3; re-validated per LTX (see CLAUDE.md "How LTX differs from Wan").
+training_dims: [832, 480, 49]
+
+data:
+  # A STRING path — NOT filesystem-validated locally; the real existence check happens Modal-side
+  # where the dataset Volume is mounted (Pitfall 1). Points at the encoded demo root that the
+  # canonical preprocess (Plan 06-10) writes from scripts/_stage_demo_dataset.py's metadata.
+  preprocessed_data_root: /dataset/.precomputed_demo
+  num_dataloader_workers: 2
+  batch_size: 1
+
+lora:
+  rank: 64                   # the operator's identity-capacity choice (house default).
+  alpha: 64                  # rank == alpha -> PEFT scale 1.0 -> clean PEFT->LTX key conversion.
+  dropout: 0.0
+  # HOUSE INVARIANT: ff.net.0.proj + ff.net.2 MUST be targeted — ff.net is ~2/3 of block params and
+  # where identity is encoded; attn-only silently under-fits (HANDOFF.md:19). Never drop these two.
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # The locked LTX-2.3 LoRA recipe (adamw8bit / 5e-5 / rank 64 / seed 42). max_steps is a REQUIRED
+  # field even for a sample-only run; a nominal 100 documents intent — the gated sample invocation
+  # renders from a trained/base adapter, it does not need to reach this budget.
+  max_steps: 100            # nominal; sample runs do not train to this budget (field is required).
+  learning_rate: 5.0e-5     # beat 1e-4 in the house A/B.
+  weight_decay: 0.01
+  optimizer: adamw8bit      # NEVER Prodigy (banned; breaks differential-LR).
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30        # sharper-detail choice (house default).
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01        # flimmer template.
+  warmup_steps: 0           # flimmer template.
+  checkpoint_every: 200     # ~200-step checkpoint + sample cadence.
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0         # baseline-first (D-OFF-1); harvested block_swap.py is UNVALIDATED on LTX.
+
+modal:
+  hourly_rate_usd: 1.64     # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing.
+  cost_guardrail_usd: 50.0
+  est_hours: 2.0
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250
+  # Prompts for the multi-frame keyframe sample grid. Unlike the Phase-5 single-frame config, the
+  # multi-frame reference frames are carried on conditioning.conditioning_items (below), NOT on
+  # validation.reference_images — the lean field-split forbids reference_images in multi_frame mode.
+  prompts:
+    - "a black sedan driving down a coastal road, cinematic daylight"   # demo caption (multi-key)
+    - "a black sedan parked on a city street, golden hour, motion blur"       # second demo caption
+    - "a close-up portrait, gentle expression, cinematic lighting"            # canonical yardstick (D-PROMPT-1)
+  frame_count: 49
+  guidance_scale: 3.0       # LTX guidance (NOT the Wan-tuned 5.0); re-validated per LTX (CLAUDE.md).
+  num_samples: 1
+  seed: 42
+  # Render geometry pinned EXPLICITLY to the demo 832x480 bucket (WR-08 / config-first): without
+  # these the sample path renders at the 768x352 schema defaults — a different resolution AND
+  # aspect ratio (1.73 vs 2.18), silently center-cropping the 832x480 keyframe references the grid
+  # is judged against. Both values are %32-valid (832 % 32 == 0, 480 % 32 == 0).
+  width: 832
+  height: 480
+
+conditioning:
+  mode: multi_frame
+  # D-6-MAXITEMS: 3 keyframes = real keyframe conditioning; bounded [1,8] so a runaway value can
+  # never reach a metered container.
+  max_conditioning_items: 3
+  # D-6-STRENGTH-DIST: (lo, hi) strength-sampling range for multi-frame conditioning; default range,
+  # validated 0 <= lo <= hi <= 1 at load.
+  conditioning_strength_range: [0.3, 1.0]
+  # D-6-CONDSOURCE: self-conditioning — keyframes are sampled from the clip itself (no paired-ref
+  # pre-encode this phase; paired ships in Phase 7). Phase-6 allowlist is Literal['self'] ONLY.
+  conditioning_source: self
+  # OBJECT-list keyframes (D-6-ITEMS — NOT parallel image/index/strength lists). start/mid/end on the
+  # %8-aligned temporal grid: frame_index 0/24/48 (all % 8 == 0, all in [0, F-1] = [0, 48]). The
+  # image paths are Volume-relative (resolved Modal-side, Pitfall 1) and match the PNGs that
+  # scripts/_stage_multi_frame_refs.py extracts to the checkpoints Volume `reference/` prefix.
+  conditioning_items:
+    - image: reference/demo_start.png   # first keyframe — hard-clean anchor.
+      frame_index: 0
+      strength: 1.0
+    - image: reference/demo_mid.png     # mid keyframe — softer anchor (partial-strength).
+      frame_index: 24
+      strength: 0.5
+    - image: reference/demo_end.png     # last keyframe — hard-clean anchor.
+      frame_index: 48
+      strength: 1.0
+
+seed: 42
+output_dir: outputs/ltx23_multi_frame_example

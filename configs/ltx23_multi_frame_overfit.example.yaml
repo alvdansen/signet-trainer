@@ -1,0 +1,100 @@
+# Tiny self-conditioning multi-frame OVERFIT config (Phase 6 / REF-02, D-6-CONDSOURCE / D-6-DEMO).
+#
+# A THROWAWAY correctness OVERFIT (the D-6-DEMO proof), NOT a real likeness LoRA. A handful of steps
+# on the encoded demo latents to prove the multi-frame SELF-conditioning training path is
+# non-corrupt: MultiFrameStrategy (Plan 06-02) samples its keyframes from the clip itself, so this
+# config carries NO conditioning_items — self-conditioning needs zero external reference store
+# (D-6-CONDSOURCE default). Mirrors ltx23_overfit.example.yaml (tiny step budget, ~$1, single bucket).
+#
+# training_dims = [width, height, frames] = the demo 832x480x49 bucket. The four LTX constraints:
+#   (49 - 1) % 8 == 0    -> valid frame count (8k+1)
+#   480 % 32 == 0        -> valid height
+#   832 % 32 == 0        -> valid width
+#   data.batch_size == 1 -> single-bucket
+# NO Wan-tuned scheduler/step/guidance carry-forwards (re-validated per LTX; see CLAUDE.md).
+training_dims: [832, 480, 49]
+
+data:
+  # The encoded demo root on the mounted signe-trainer-dataset Volume (/dataset at run time).
+  # scripts/_stage_demo_dataset.py stages the clips + metadata.jsonl; the canonical preprocess
+  # (Plan 06-10) encodes them to this root. A STRING — existence checked Modal-side (Pitfall 1).
+  preprocessed_data_root: /dataset/.precomputed_demo
+  num_dataloader_workers: 2
+  batch_size: 1
+  # Narrow to the single demo 49-frame bucket (832x480x49 — WxHxF). LTX-valid: (49-1)%8==0,
+  # 480%32==0, 832%32==0.
+  resolution_buckets:
+    - 832x480x49
+
+lora:
+  rank: 64                   # the operator's identity-capacity choice (house default).
+  alpha: 64                  # rank == alpha -> PEFT scale 1.0 -> clean PEFT->LTX key conversion.
+  dropout: 0.0
+  # HOUSE INVARIANT: ff.net.0.proj + ff.net.2 MUST be targeted (ff.net is ~2/3 of block params and
+  # where identity is encoded; attn-only silently under-fits). Never drop these two.
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # OVERFIT step budget — a handful of steps, enough to prove a non-corrupt multi-frame adapter,
+  # NOT a real LoRA. checkpoint_every < max_steps so a committed checkpoint exists mid-run.
+  max_steps: 50
+  checkpoint_every: 10
+  learning_rate: 5.0e-5      # beat 1e-4 in the house A/B.
+  weight_decay: 0.01
+  optimizer: adamw8bit       # NEVER Prodigy (banned; breaks differential-LR).
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30         # sharper-detail choice (house default).
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01         # flimmer template.
+  warmup_steps: 0            # flimmer template.
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0          # baseline-first (D-OFF-1) — the no-block-swap baseline-clean run.
+
+modal:
+  hourly_rate_usd: 1.64      # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing.
+  cost_guardrail_usd: 50.0
+  # Overfit is ~$1: 1.64 * 0.6 = ~$0.98. The cost print reflects this cheap run before the gate.
+  est_hours: 0.6
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  # interval > max_steps so NO sampling fires during the overfit (structural; not exercised here).
+  interval: 250
+  prompts:
+    - "a black sedan, cinematic lighting"
+  frame_count: 49            # match the 49-frame demo latents (consistency; not exercised this run).
+  guidance_scale: 3.0        # LTX guidance (NOT the Wan-tuned 5.0).
+  num_samples: 1
+  seed: 42
+
+conditioning:
+  mode: multi_frame
+  # D-6-CONDSOURCE: self-conditioning — MultiFrameStrategy samples keyframe positions FROM the clip,
+  # so NO conditioning_items object-list is set here (self needs no external reference store). The
+  # lean field-split allows an empty conditioning_items in multi_frame mode.
+  conditioning_source: self
+  # D-6-MAXITEMS: up to 3 keyframes sampled per step; bounded [1,8].
+  max_conditioning_items: 3
+  # D-6-STRENGTH-DIST: (lo, hi) strength-sampling range; default, validated 0 <= lo <= hi <= 1.
+  conditioning_strength_range: [0.3, 1.0]
+
+seed: 42
+output_dir: outputs/ltx23_multi_frame_overfit

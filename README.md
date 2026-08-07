@@ -1,0 +1,310 @@
+# signet-trainer
+
+> **Private beta.** Interfaces, config schema, and CLI surface may change without notice.
+> See [Beta status](#beta-status) before you build anything on this.
+
+A video LoRA trainer built around **reference control as a first-class feature** rather than an
+afterthought — single-frame conditioning, multi-frame / keyframe conditioning, and IC-LoRA-style
+in-context (video-to-video) conditioning are configuration modes, not forks. It runs on
+[Modal](https://modal.com) serverless GPU, and supports two model families: **LTX-2.3 (22B)** and
+**MiniMax-H3** (Ref2VA).
+
+Every metered run passes through exactly one gate that prints a cost estimate and blocks for
+approval before it dispatches. There is no code path that starts a paid GPU without that print.
+
+---
+
+## Quickstart
+
+Everything — training, sampling, pre-encoding, adapter fusion, checkpoint backup and restore —
+goes through a single entrypoint:
+
+```bash
+PYTHONPATH=src PYTHONUTF8=1 \
+  modal run --detach -m signet_trainer.modal.entrypoint \
+  --config configs/ltx23_single_frame.example.yaml \
+  --mode train \
+  --approve
+```
+
+**Drop `--approve` to do a free dry run.** Without it the entrypoint loads and validates the
+config, runs the CPU shape gate, prints the cost line, and then stops at the approval pause. No GPU
+is provisioned and nothing is billed. That is the intended way to check a config before spending.
+
+### The three things about this command that are not optional
+
+1. **`--detach` is REQUIRED for any metered dispatch.** Without it, Modal tears the app shell down
+   with your local client — close the laptop, lose the run. `--detach` keeps the *app* alive past
+   the client.
+2. **Dispatch is asynchronous (`.spawn()`, not `.remote()`).** A synchronous input is cancelled by
+   the server when its client dies, so the entrypoint spawns, prints the `FunctionCall` id, watches
+   for a short bounded window so cheap early failures still surface, and then disengages *without
+   cancelling anything*. Re-attach later with `modal.FunctionCall.from_id("<id>")`.
+   `--detach` alone is necessary but **not** sufficient; both pieces are needed.
+3. **Never call a Modal function directly.** `modal run -m signet_trainer.modal.fns::train` (or any
+   `.spawn()` / `.remote()` on a function handle) boots a paid GPU with **no cost print and no
+   approval pause**. Always drive `signet_trainer.modal.entrypoint`.
+
+### Modes
+
+| `--mode` | GPU? | What it does |
+| --- | --- | --- |
+| `preprocess` | yes | Pre-encode the dataset to latents + text embeddings on the dataset Volume, so training never re-encodes |
+| `train` | yes | The LoRA training loop; checkpoints committed to the checkpoints Volume |
+| `sample` | yes | Base-vs-adapter inference at a fixed seed, for side-by-side comparison |
+| `fuse` | no (CPU) | Fuse a gated upstream adapter into a base checkpoint (needed once before inpaint training) |
+| `backup` | no (CPU) | Copy checkpoints off the Volume to a backup destination |
+| `restore` | no (CPU) | Restore checkpoints back onto the Volume |
+
+The mode set does **not** change per model family or per reference-control mode. A config carrying
+`model.family: h3` makes `train` / `sample` / `preprocess` dispatch the H3 arm of that same mode;
+the reference-control mode comes from `conditioning.mode` in the YAML
+(`none`, `single_frame`, `multi_frame`, `ic_lora`, `inpaint`, `audio_to_video`).
+
+### Local, free checks
+
+```bash
+pip install -e ".[dev]"          # or: uv pip install -e ".[dev]"
+python -m pytest                 # CPU-only; no GPU, no Modal, no spend
+signet-dryrun configs/ltx23_single_frame.example.yaml
+# equivalently, without installing:
+PYTHONPATH=src python -m signet_trainer.dryrun configs/ltx23_single_frame.example.yaml
+```
+
+`signet-dryrun` loads a real run config, builds a synthetic batch through the configured strategy,
+asserts shapes and masks, and exits non-zero on any violation — before a GPU is touched. The
+`config/`, `conditioning/`, and `dryrun/` packages import neither `modal` nor `ltx_core`, so this
+runs on a laptop (including Windows) with zero cost.
+
+> See [Known beta gaps](#known-beta-gaps) for the parts of the test suite that need extra setup.
+
+---
+
+## Requirements
+
+| | |
+| --- | --- |
+| **GPU** | A single **A100-80GB**. That is the target, not a floor to beat — the 22B LoRA path fits one A100-80GB using sequential model loading plus the block-swap offloader. H100/H200 is an optional speedup, never a requirement. Multi-GPU is not supported. |
+| **Python** | **3.11+** (see `requires-python` in `pyproject.toml`) |
+| **Modal** | Your own [Modal](https://modal.com) account, with the CLI authenticated (`modal setup`). Confirm the active profile is yours before running anything — `modal profile current`. |
+| **Hugging Face** | An HF account with **accepted licenses** for every gated checkpoint you intend to load. Access is per-account and is not conveyed by this repo. |
+
+### Modal secrets — create these on YOUR account
+
+The Modal app graph resolves secrets **by name at import time**, so these must exist on the account
+you are running under or every command fails immediately:
+
+| Secret name | Contents | Needed for |
+| --- | --- | --- |
+| `my-huggingface-secret` | `HF_TOKEN` | Downloading base weights and the text encoder |
+| `my-wandb-secret` | `WANDB_API_KEY` | Run logging (only if you enable `wandb`) |
+| `hf-gated-secret` | `HF_TOKEN` for an account that accepted the *gated* adapter's terms | `--mode fuse` only |
+
+The names are configurable — set `modal.huggingface_secret_name` / `modal.wandb_secret_name` in
+your YAML, or export `SIGNET_HUGGINGFACE_SECRET_NAME` / `SIGNET_WANDB_SECRET_NAME` /
+`SIGNET_HF_GATED_SECRET_NAME`. Configs carry secret **names** only; token values are injected into
+the container at run time and are never logged or baked into the image.
+
+### Modal Volumes
+
+Three separate Volumes are provisioned on first use (`create_if_missing=True`) — weights, dataset,
+and checkpoints never share one:
+
+```
+signe-trainer-weights       ->  /weights       base checkpoints + text encoder, downloaded once
+signe-trainer-dataset       ->  /dataset       clips + pre-encoded latents/embeddings
+signe-trainer-checkpoints   ->  /checkpoints   LoRA checkpoints + rendered samples
+```
+
+> **Why do the defaults say `signe-` and not `signet-`?**
+> The project was renamed to **Signet**, but these four strings (the three Volumes plus the Modal
+> **App** name, default `signe-trainer`) are *not* branding — they name Modal resources that already
+> hold the maintainer's live data. They are kept at their pre-rename spelling on purpose. Note that
+> `Volume.from_name(..., create_if_missing=True)` does **not** error on an unknown name: it silently
+> provisions a new, *empty* Volume. A "tidy-up" rename would therefore fail **silently** — training
+> against empty storage — rather than loudly. Leave the defaults alone; override them instead.
+
+#### Pointing the trainer at your own Modal account
+
+The App name and all three Volume names are config fields, not literals. Set them in your run YAML:
+
+```yaml
+modal:
+  app_name: my-trainer
+  weights_volume_name: my-trainer-weights
+  dataset_volume_name: my-trainer-dataset
+  checkpoints_volume_name: my-trainer-checkpoints
+```
+
+⚠ `signet_trainer/modal/app.py` builds the Modal app graph at **module-import time**, before the
+entrypoint's `main()` runs, so a YAML-only override cannot re-bind an already-built graph. Export
+the matching env vars **in the shell before `modal run`**:
+
+```bash
+export SIGNET_APP_NAME=my-trainer
+export SIGNET_WEIGHTS_VOLUME_NAME=my-trainer-weights
+export SIGNET_DATASET_VOLUME_NAME=my-trainer-dataset
+export SIGNET_CHECKPOINTS_VOLUME_NAME=my-trainer-checkpoints
+```
+
+The entrypoint compares what the graph captured against your config and **aborts pre-approval** on
+any mismatch, so a half-applied override can never reach a metered dispatch.
+
+Base weights are deliberately **not** baked into the container image. Download them once into the
+weights Volume and every subsequent run reuses them.
+
+---
+
+## Layout
+
+`src/`-layout, importable as `signet_trainer.*`:
+
+```
+src/signet_trainer/
+├── config/          # Pydantic config schema, fail-fast validators, YAML load
+├── conditioning/    # reference-control strategies: single-frame, multi-frame,
+│                    #   IC-LoRA, inpaint, audio-to-video, + H3 packing/geometry
+├── data/            # dataset files, pre-encoded latent reads, mask encoding
+├── models/          # LTX-2.3 and MiniMax-H3 loaders
+├── lora/            # PEFT LoRA mechanics (inject / freeze / save / load)
+├── offload/         # PEFT-aware block-swap CPU<->GPU offloader
+├── train/           # flow-matching training loop, checkpointing, validation gate
+├── prep/            # dataset staging, pre-encode, masking, propagation, QA
+├── inference/       # sampling, reference handling, grids, upscale
+├── backup/          # checkpoint backup/restore planning
+├── modal/           # the ONLY package that imports `modal` — app, image,
+│                    #   Volumes, secrets, cost gate, session cap, entrypoint
+└── dryrun/          # CPU-only shape gate
+```
+
+`config/`, `conditioning/`, and `dryrun/` are transport-agnostic on purpose: they import nothing
+from `modal` or `ltx_core`, which is what makes the local dry run an honest, GPU-free, zero-spend
+check.
+
+---
+
+## Cost discipline
+
+Three independent mechanisms, all implemented in shipped code and all driven from your config —
+none of them are house-specific and none carry anyone else's account limits:
+
+- **Per-run guardrail** (`modal/cost.py`) — estimates `hourly_rate * est_hours` and prints it before
+  the approval pause. Rates come from `modal.hourly_rate_usd` in your config, never from a literal
+  in the code.
+- **Cumulative session cap** (`modal/session_cap.py`) — an append-only spend ledger with a
+  cumulative ceiling. `DEFAULT_SESSION_CAP_USD` is a conservative default you are expected to set
+  for yourself.
+- **The approval pause** (`modal/entrypoint.py`) — `.spawn()` sits strictly after it. A metered run
+  cannot auto-launch.
+
+`.claude/skills/` ships the operating playbooks that wrap these (session setup, prep, run, review).
+They are the in-house methodology, shipped as-is; each one carries a beta note about the companion
+tooling and private run history that are **not** part of this release.
+
+---
+
+## Beta status
+
+This is a **private beta** cut with fresh history.
+
+- The config schema, YAML field names, and CLI flags **will** change. Pin a commit if you need
+  stability.
+- The LTX-2.3 and MiniMax-H3 legs have both been exercised on real A100 hardware, but coverage is
+  uneven across reference-control modes. `single_frame`, `multi_frame`, and `ic_lora` are the
+  best-trodden; `inpaint` and `audio_to_video` are newer.
+- The block-swap offloader was made PEFT-LoRA-aware and re-validated for **freeze mechanics**
+  (two-adapter forward/backward/optimizer-step, frozen-adapter exclusion) on LTX-2.3 at
+  `blocks_to_swap: 16`. Long-run adapter **quality** under swapping has not been A/B'd. Treat it as
+  a scoped result, not a blanket guarantee.
+- Please report what breaks. Reproduction beats description: the config, the mode, and the failing
+  output.
+
+### Known beta gaps
+
+`python -m pytest` is **not** green out of the box, for reasons that are known rather than
+mysterious. Expect roughly **48 failed, ~1890 passed, 27 skipped**, in three groups:
+
+- **~31 — the H3 parity suites.** They deliberately refuse to skip: they must execute against
+  `transformers`/`diffusers` at the exact pinned version, in a separate overlay interpreter, or the
+  check would pass while the real dispatch failed. Bootstrap it once with the two commands the
+  failure message prints, or leave them red. A few in this group are regression checks pinned to
+  in-house run configs that are not published.
+- **~17 — the watcher-hardening suite.** It reads a long-running campaign watcher script that is
+  operational tooling rather than library code and is not published.
+- **27 skipped (not failed) — the house-memory scaffold lints.** Some tests lint a project-private
+  memory scaffold under `.planning/harness/` (`DECISION-LOG.md`, `KNOWLEDGE.md`, `SESSION-STATE.json`,
+  campaign cards). That directory holds live per-project run history and is deliberately not
+  published, so those tests skip with a reason instead of failing.
+
+**Runtime defaults are self-contained.** The five SPEC/TEMPLATE files the runtime needs
+(`MASK-SPEC.yaml`, `MASK-SPEC-segmentation.yaml`, `TIER-TAXONOMY.yaml`, `HOUSE-SPEC.yaml`,
+`SESSION-STATE.template.json`) ship **inside the package** at `signet_trainer/harness_data/` and are
+resolved with `importlib.resources`, so they work from an installed wheel with no `.planning/`
+present. Point them somewhere else with `SIGNET_HARNESS_DATA_DIR=/path/to/dir`, or per call with
+`--spec`. The only project-relative defaults left are genuinely per-project **live state** — the
+spend ledger (`session_spend_ledger_path`) and the decision log — and each fails with an actionable
+message naming `SIGNET_PROJECT_ROOT` rather than a stack trace.
+
+`CONTRIBUTING.md` lists these precisely.
+
+---
+
+## License
+
+**signet-trainer is source-available, not open source.** It ships under the **Signet Trainer License
+1.0.0** (a PolyForm Small Business 1.0.0 derivative with a modified eligibility threshold).
+
+**Free, with no need to ask, for:**
+
+- individuals — personal, creative, freelance, or educational use, at any income;
+- researchers and educational institutions;
+- nonprofits and charities;
+- organizations that, with their affiliates, had **under USD 2,000,000** in gross revenue last
+  fiscal year **and** have raised **under USD 2,000,000** in total capital.
+
+Cross either threshold and you need a commercial license (with a 90-day grace period; past use is
+not retroactively a violation). Contact **minta@promptcrafted.com**.
+
+Read [`LICENSE`](LICENSE) for the binding text and [`NOTICE`](NOTICE) for the third-party
+attribution inventory — including Apache-2.0 obligations for musubi-tuner-derived and
+diffusers-derived code, MIT-licensed upstreams, and ported Lightricks/LTX-2 code. Both files must
+travel with any copy you distribute.
+
+> ⚠ The license text is not legal advice. Have counsel review it before relying on it.
+
+---
+
+## Model weights
+
+**This project conveys no rights in any model's weights.** You must obtain and comply with the
+license of every checkpoint you load — LTX-2.3, Gemma 3, MiniMax-H3, SAM, and anything else. Some of
+those terms survive training and attach to the outputs you generate.
+
+**MiniMax-H3, specifically**, because it is easy to get wrong:
+
+- **Excluded Territories.** The H3 license carves out Excluded Territories, which include the
+  **European Union, the United Kingdom, the Republic of Korea, and the United States**. If you or
+  your use falls within one, the standard grant does not reach you.
+- **You need your own grant.** Any access or approval this project's authors hold is personal to
+  them and **does not transfer**. Obtain your own before touching H3 weights.
+- **No cross-model training (§V.3).** H3 outputs must not be used to train or improve another AI
+  model — including as synthetic training data for an LTX or Wan LoRA.
+- **Attribution on commercial products (§IV.2).** Commercial products or services built on H3 must
+  prominently display "MiniMax H3".
+- **Revenue-triggered authorization (§IV.1).** Above USD 20M/yr you need separate authorization from
+  MiniMax. This is independent of the Signet Trainer License threshold; you may be subject to both.
+
+Section numbers are pointers to help you find the clauses, not restatements. The current MiniMax-H3
+license governs. See [`NOTICE`](NOTICE) for the full inventory.
+
+---
+
+## Credits
+
+Training and inference for this project run on **Modal**, whose sponsored GPU credits made its
+development and validation possible.
+
+signet-trainer harvests and ports a validated foundation from `enochiatron` and `flimmer-trainer`,
+whose block-swap offloader descends from **musubi-tuner** (kohya-ss). It contains ported code from
+**Lightricks/LTX-2** and transcribed code from **huggingface/diffusers**. Full attribution, change
+notices, and license texts are in [`NOTICE`](NOTICE) and [`LICENSES/`](LICENSES).

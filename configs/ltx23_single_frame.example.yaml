@@ -1,0 +1,92 @@
+# Valid LTX-2.3 SINGLE-FRAME reference-control run config (Phase 5 / REF-01, D-CONDP / D-STRENGTH).
+#
+# Same validated LTX-2.3 LoRA substrate as ltx23_lora.example.yaml (the four constraints still hold:
+#   (49 - 1) % 8 == 0, 512 % 32 == 0, 768 % 32 == 0, batch_size == 1), with the conditioning block
+# switched to single-frame reference control. Loading this file returns a SignetConfig with no error;
+# `python -m signet_trainer.dryrun configs/ltx23_single_frame.example.yaml` passes the zero-GPU gate.
+training_dims: [768, 512, 49]
+
+data:
+  # A STRING path — NOT filesystem-validated locally; the real existence check happens
+  # Modal-side where the dataset Volume is mounted (Pitfall 1).
+  preprocessed_data_root: /data/preprocessed/demo
+  num_dataloader_workers: 2
+  batch_size: 1
+
+lora:
+  rank: 64                   # the operator's choice for identity capacity; the precedent likeness value was 42.
+  alpha: 64                  # rank == alpha -> PEFT scale 1.0 -> clean PEFT->LTX key conversion.
+  dropout: 0.0
+  # SCAFFOLD-BUG FIX: attn-only [to_k,to_q,to_v,to_out.0] silently under-fit identity (HANDOFF.md:19).
+  # ff.net is ~2/3 of block params and where identity is encoded -> it MUST be targeted.
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # The locked LTX-2.3 LoRA recipe (the precedent-validated recipe + the operator's cosine + rank-64 deviations).
+  max_steps: 100             # Run-specific; the first metered run is a tiny correctness overfit (D-RUN-1).
+  learning_rate: 5.0e-5      # beat 1e-4 in the precedent A/B
+  weight_decay: 0.01
+  optimizer: adamw8bit       # NEVER Prodigy (banned; breaks differential-LR)
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30         # the precedent sharper-detail choice (0.10 less preferred)
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01         # flimmer template
+  warmup_steps: 0            # flimmer template
+  checkpoint_every: 200      # ~200-step checkpoint + sample cadence
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0          # baseline-first (D-OFF-1); harvested block_swap.py is UNVALIDATED on LTX
+
+modal:
+  hourly_rate_usd: 1.64      # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing
+  cost_guardrail_usd: 50.0
+  est_hours: 2.0
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250
+  # Prompts are paired POSITIONALLY with conditioning.reference_images for the single-frame grid
+  # (D-GRID): prompt[i] renders ref-ON against reference_images[i] and ref-OFF (condition_image=None)
+  # as the no-reference control, same seed 42. The trailing canonical prompt has no paired reference
+  # (ref-OFF-only baseline yardstick, reused across Phases 5-7 per D-PROMPT-1).
+  prompts:
+    - "a black sedan parked on a city street, cinematic daylight"     # demo clip A caption (ref-ON vs ref-OFF)
+    - "a black sedan driving down a coastal road, motion blur, golden hour" # demo clip B caption (ref-ON vs ref-OFF)
+    - "a silver sports car on a mountain switchback, dramatic sky"          # external held-out image prompt (generalization)
+    - "a close-up portrait, gentle expression, cinematic lighting"          # Phase-4 canonical prompt (stable yardstick, D-PROMPT-1)
+  frame_count: 49
+  guidance_scale: 3.0
+  num_samples: 1
+  seed: 42
+
+conditioning:
+  mode: single_frame
+  first_frame_conditioning_p: 1.0            # always-condition (D-CONDP); canonical LTX default is 0.1
+  first_frame_conditioning_strength: 1.0     # full strength / hard-clean; reserved for Phase 6 (D-STRENGTH)
+  # Volume-relative reference-image paths, paired positionally with validation.prompts above.
+  # Plan 05-05 stages these: two demo dataset-clip frame-0 PNGs (ground-truth refs) + one external
+  # held-out image (unseen-reference generalization). Carried as DATA — resolved Modal-side (Pitfall 1).
+  reference_images:
+    - reference/demo_clipA_frame0.png
+    - reference/demo_clipB_frame0.png
+    - reference/external_heldout.png
+
+seed: 42
+output_dir: outputs/ltx23_single_frame_example

@@ -1,0 +1,81 @@
+# Valid LTX-2.3 LoRA run config (CONF-01 / D-05).
+#
+# training_dims = [width, height, frames]. The four LTX constraints hold:
+#   (49 - 1) % 8 == 0   ->  valid frame count
+#   512 % 32 == 0       ->  valid height
+#   768 % 32 == 0       ->  valid width
+#   data.batch_size = 1 ->  single-bucket
+# Loading this file returns a SignetConfig with no error.
+training_dims: [768, 512, 49]
+
+data:
+  # A STRING path — NOT filesystem-validated locally; the real existence check happens
+  # Modal-side where the dataset Volume is mounted (Pitfall 1).
+  preprocessed_data_root: /data/preprocessed/my_subject
+  num_dataloader_workers: 2
+  batch_size: 1
+
+lora:
+  rank: 64                   # the operator's choice for identity capacity; the precedent likeness value was 42.
+  alpha: 64                  # rank == alpha -> PEFT scale 1.0 -> clean PEFT->LTX key conversion.
+  dropout: 0.0
+  # SCAFFOLD-BUG FIX: attn-only [to_k,to_q,to_v,to_out.0] silently under-fit identity (HANDOFF.md:19).
+  # ff.net is ~2/3 of block params and where identity is encoded -> it MUST be targeted.
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  # The locked LTX-2.3 LoRA recipe (the precedent-validated recipe + the operator's cosine + rank-64 deviations).
+  max_steps: 100             # Run-specific; the first metered run is a tiny correctness overfit (D-RUN-1).
+  learning_rate: 5.0e-5      # beat 1e-4 in the precedent A/B
+  weight_decay: 0.01
+  optimizer: adamw8bit       # NEVER Prodigy (banned; breaks differential-LR)
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30         # the precedent sharper-detail choice (0.10 less preferred)
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01         # flimmer template
+  warmup_steps: 0            # flimmer template
+  checkpoint_every: 200      # ~200-step checkpoint + sample cadence
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0          # baseline-first (D-OFF-1); harvested block_swap.py is UNVALIDATED on LTX
+
+modal:
+  hourly_rate_usd: 1.64      # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing
+  cost_guardrail_usd: 50.0
+  est_hours: 2.0
+  # Modal secret NAMES — config-driven so each account uses its own. Defaults match the
+  # maintainer account; the app graph reads the same names via env overrides
+  # (SIGNET_HUGGINGFACE_SECRET_NAME / SIGNET_WANDB_SECRET_NAME) at import time. Override per-account.
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250
+  prompts:
+    - "a portrait of my subject, cinematic lighting"
+  frame_count: 49
+  guidance_scale: 3.0
+  num_samples: 1
+  seed: 42
+
+conditioning:
+  mode: none                 # reserved for Phases 5-7 reference control
+
+seed: 42
+output_dir: outputs/ltx23_lora_example
