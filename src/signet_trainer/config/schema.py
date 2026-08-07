@@ -479,15 +479,32 @@ class H3Config(_Base):
     @field_validator("references_per_sample")
     @classmethod
     def _check_references_per_sample(cls, v: int) -> int:
-        if v != H3_PHASE10_REFERENCES_PER_SAMPLE:
+        # 1 or 2. Operator ruling WIDENED 2026-08-07 for single-control tasks (the hero
+        # keyframe model: one start extreme in, one end extreme out). The original ruling
+        # fixed the count at 2 because Phase 10's corpus is Ref2VA, where a variable count
+        # would have meant an unpriced pairing domain — it was never a claim that the
+        # architecture requires two.
+        #
+        # Everything downstream already handled 1: `resolve_reference_slots` guards
+        # `references_per_sample < 1` and routes 1 to `assign_character_ref`; the preprocess
+        # path uses `reference_paths` verbatim and only checks `len(picks) ==
+        # references_per_sample`; and 1 reference is strictly CHEAPER (a 16:9 keyframe
+        # sample prices at 5,040 packed rows against 7,848 for two), so no budget re-pricing
+        # is implied.
+        #
+        # 3 remains refused, and that bound is the one carrying real weight: three slots
+        # were never priced, and an environment reference SUBSTITUTES for the last character
+        # slot rather than being appended.
+        if v not in (1, H3_PHASE10_REFERENCES_PER_SAMPLE):
             raise ValueError(
-                f"invalid references_per_sample {v}: Phase 10 fixes the reference slot count at "
-                f"{H3_PHASE10_REFERENCES_PER_SAMPLE} for EVERY sample (operator ruling). A "
-                f"non-environment segment gets two rotating character refs; an environment segment "
-                f"gets one rotating character ref plus the environment ref, which SUBSTITUTES for "
-                f"the second character slot — it is never appended, so there is no 3-reference "
-                f"case. Feeding all three character refs every time would make conditioning "
-                f"CONSTANT across the corpus and invite copy-collapse."
+                f"invalid references_per_sample {v}: the reference slot count is 1 or "
+                f"{H3_PHASE10_REFERENCES_PER_SAMPLE} (operator ruling). Use 1 for a "
+                f"single-control task; use {H3_PHASE10_REFERENCES_PER_SAMPLE} for Ref2VA, "
+                f"where a non-environment segment gets two rotating character refs and an "
+                f"environment segment gets one rotating character ref plus the environment "
+                f"ref, which SUBSTITUTES for the second character slot. It is never "
+                f"appended, so there is no 3-reference case: three slots were never priced "
+                f"by the packed-sequence budget and would OOM a metered container."
             )
         return v
 
