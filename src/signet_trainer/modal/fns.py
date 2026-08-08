@@ -2139,6 +2139,77 @@ def download_weights(two_stage: bool = False) -> str:
     )
 
 
+@app.function(
+    image=download_image,  # code-only image + huggingface_hub, same as download_weights.
+    volumes={**WEIGHTS_MOUNT},  # CPU only — a pure HF download, never a GPU.
+    secrets=[huggingface_secret],
+    timeout=TWENTY_FOUR_HOURS,  # ~54 GB across three components.
+)
+def download_qwen_edit_weights(repo_id: str = "Qwen/Qwen-Image-Edit-2511") -> str:
+    """One-time download of the Qwen-Image-Edit-2511 diffusers snapshot into the weights Volume.
+
+    The ``qwen_edit`` family sibling of :func:`download_weights`. It fetches the DIFFUSERS
+    DIRECTORY layout rather than the single ComfyUI-style ``.safetensors`` files, because that is
+    the shape the loader can consume without a hand-supplied config:
+    ``load_qwen_edit_transformer`` sniffs the path the way ai-toolkit does (``qwen_image.py:96``),
+    and on the single-file branch ``from_single_file`` calls ``fetch_diffusers_config`` ->
+    ``infer_diffusers_model_type``, **which has no Qwen branch on the pinned diffusers** — so a
+    bare ``.safetensors`` REQUIRES an explicit ``config_source``. A snapshot ships its own
+    ``config.json`` beside each component, which removes that failure mode entirely.
+
+    Layout written (the three ``model.*_id`` fields address these as subdirectories of
+    ``WEIGHTS_DIR``, since ``WEIGHTS_DIR / model_id`` is how every family resolves its weights)::
+
+        <WEIGHTS_DIR>/qwen-image-edit-2511/transformer     -> model.model_id
+        <WEIGHTS_DIR>/qwen-image-edit-2511/vae             -> model.vae_id
+        <WEIGHTS_DIR>/qwen-image-edit-2511/text_encoder    -> model.text_encoder_id
+
+    The text encoder is **Qwen2.5-VL, and the vision half is load-bearing**. A text-only encoder of
+    the same family loads clean, embeds at the right rank, and dies deep in the forward with an
+    unattributed matmul shape error. ``assert_qwen_edit_text_encoder_vision`` is the gate for that;
+    this function is only its supplier. Do not substitute a text-only Qwen checkpoint here.
+
+    Allowing ``repo_id`` to be overridden is deliberate: ``Qwen/Qwen-Image`` (the T2I base) is the
+    PRIME stage of a chained edit run and is fetched by the same code path.
+    """
+    from huggingface_hub import snapshot_download
+
+    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    local_name = repo_id.rsplit("/", 1)[-1].lower()
+    root = WEIGHTS_DIR / local_name
+
+    # allow_patterns keeps the .safetensors + configs and skips the duplicate .bin / .gguf mirrors
+    # some Qwen repos carry — those would roughly double the transfer for nothing.
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=str(root),
+        allow_patterns=["*.json", "*.txt", "*.safetensors", "*.safetensors.index.json", "*.py"],
+        ignore_patterns=["*.bin", "*.gguf", "*.onnx", "*.msgpack", "*.h5"],
+    )
+
+    weights_vol.commit()  # Pitfall 3 commit-or-vanish, same as download_weights.
+
+    import os
+
+    sizes: dict[str, float] = {}
+    for component in ("transformer", "vae", "text_encoder"):
+        comp_dir = root / component
+        if comp_dir.is_dir():
+            total = sum(
+                os.path.getsize(os.path.join(dirpath, f))
+                for dirpath, _, files in os.walk(comp_dir)
+                for f in files
+            )
+            sizes[component] = total / (1024**3)
+
+    summary = ", ".join(f"{k} {v:.1f} GB" for k, v in sizes.items()) or "NO COMPONENT DIRS FOUND"
+    return (
+        f"[download_qwen_edit_weights] {repo_id} -> {root} ({summary}); "
+        f"committed. Set model_id/vae_id/text_encoder_id to "
+        f"'{local_name}/transformer', '{local_name}/vae', '{local_name}/text_encoder'."
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # Phase-2 GPU loader smoke (SC#1 / D-04). Loads the LTX-2.3 components via the ported
 # load_ltxv_components, prints the transformer/VAE/Gemma/scheduler shapes, ASSERTS them against the

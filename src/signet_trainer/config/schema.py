@@ -564,6 +564,25 @@ class QwenEditConfig(_Base):
         "A variable-length sequence would make the row budget a distribution instead of a number, "
         "and the entire point of pricing at config load is that the answer is one integer.",
     )
+    control_dirs: tuple[str, ...] = Field(
+        default=(),
+        description="The ORDERED control-image directories, one per slot, relative to the "
+        "manifest's parent. POSITIONAL and never inferred: directory i fills slot i, which is "
+        "exactly what a caption's `ctrl_img_{i+1}` refers to. A guessed convention (alphabetical, "
+        "say) would re-point every caption's references and train each sample against a request "
+        "nobody wrote — silently, and at an ordinary-looking loss. So there is no default order; "
+        "`modal/entrypoint.py::_qwen_edit_config_gaps` refuses the dispatch when this is empty. "
+        "For the embe dataset the two entries are ('refs_a', 'refs_b'), matching the two "
+        "`control_path` entries of the production ai-toolkit config that trained it.",
+    )
+    blank_slots: tuple[int, ...] = Field(
+        default=(),
+        description="Zero-based slot indices that carry NO source directory and are blank-filled "
+        "on every sample (see blank_slot_fill). Declared rather than derived so that 'this slot is "
+        "deliberately empty' is distinguishable from 'a directory is missing', which is the "
+        "difference between a designed dataset and a broken one. Must not overlap the positions "
+        "covered by control_dirs, and the two together must account for exactly control_slots.",
+    )
     blank_slot_fill: Literal["black", "white", "gray"] = Field(
         default="black",
         description="Which synthetic image fills a control slot that has no real image for this "
@@ -656,6 +675,60 @@ class QwenEditConfig(_Base):
         "workflow this family is for. 'content' (the default) hashes the file BYTES and is correct "
         "for any chain; choose 'path' only when bug-compatibility with ai-toolkit is the goal.",
     )
+
+    @model_validator(mode="after")
+    def _check_control_slot_coverage(self) -> "QwenEditConfig":
+        """``control_dirs`` + ``blank_slots`` must account for EXACTLY ``control_slots``, disjointly.
+
+        Refused at config load rather than in the container, because every failure mode here is
+        silent-and-plausible rather than loud. Too few directories and slot N is filled by whatever
+        the resolver reaches for next; an overlap and one directory's images are discarded in favour
+        of a blank fill; a duplicate index and a slot is written twice. All three produce a run that
+        trains happily against control images the captions do not describe, at an ordinary loss, and
+        the adapter is wrong in a way no metric shows.
+
+        Empty ``control_dirs`` is allowed HERE — ``modal/entrypoint.py::_qwen_edit_config_gaps``
+        owns that refusal, and it is per-MODE (a ``sample`` run needs no manifest-relative control
+        directories). Splitting it this way keeps a dry-run honest for configs that are legal for
+        one mode and not another.
+        """
+        if not self.control_dirs and not self.blank_slots:
+            return self  # nothing declared yet; the per-mode gap check owns this case.
+
+        overlap = sorted(set(self.blank_slots) & set(range(len(self.control_dirs))))
+        if overlap:
+            raise ValueError(
+                f"qwen_edit.blank_slots {list(self.blank_slots)} overlaps the positions covered by "
+                f"control_dirs (0..{len(self.control_dirs) - 1}) at {overlap}: slot(s) {overlap} "
+                f"are declared BOTH as a real control directory and as deliberately blank. The "
+                f"mapping is positional — directory i fills slot i — so this is ambiguous rather "
+                f"than merely redundant."
+            )
+
+        if len(set(self.blank_slots)) != len(self.blank_slots):
+            raise ValueError(
+                f"qwen_edit.blank_slots {list(self.blank_slots)} contains a duplicate index. Each "
+                f"slot is filled exactly once."
+            )
+
+        out_of_range = sorted(i for i in self.blank_slots if not 0 <= i < self.control_slots)
+        if out_of_range:
+            raise ValueError(
+                f"qwen_edit.blank_slots {list(self.blank_slots)} carries index(es) {out_of_range} "
+                f"outside 0..{self.control_slots - 1} (control_slots={self.control_slots})."
+            )
+
+        covered = len(self.control_dirs) + len(self.blank_slots)
+        if covered != self.control_slots:
+            raise ValueError(
+                f"qwen_edit control slots are under/over-declared: {len(self.control_dirs)} "
+                f"control_dirs + {len(self.blank_slots)} blank_slots = {covered}, but "
+                f"control_slots is {self.control_slots}. Every slot must be accounted for exactly "
+                f"once — the packed sequence length is a constant of the config "
+                f"({self.control_slots} slots x its per-slot rows), so an unaccounted slot changes "
+                f"the priced row budget without changing the price."
+            )
+        return self
 
 
 # --------------------------------------------------------------------------------------------------
