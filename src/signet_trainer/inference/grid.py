@@ -28,6 +28,7 @@ __all__ = [
     "slug",
     "write_comparison_gallery",
     "write_multi_frame_gallery",
+    "write_qwen_edit_gallery",
     "write_reference_gallery",
     "write_reskin_gallery",
 ]
@@ -70,6 +71,50 @@ def _image_cell(label: str, img: str) -> str:
     else:
         media = '<div class="failed">no reference</div>'
     return f'<div class="cell"><div class="col-label">{safe_label}</div>{media}</div>'
+
+
+def _image_tile(
+    label: str,
+    img: str,
+    *,
+    control: bool = False,
+    fallback: str = "generation failed",
+) -> str:
+    """One IMAGE column with a caller-chosen fallback label and an optional ``.control`` marker.
+
+    The image-family analog of ``_reskin_video_cell``, and a SEPARATE function from ``_image_cell``
+    for the same reason ``_reskin_video_cell`` is separate from ``_video_cell``: the two differ in
+    ways that are not cosmetic, and the shipped Phase 4-7 galleries must keep their exact markup.
+
+    Two concrete differences from ``_image_cell``:
+
+      * **The fallback is a parameter, not the literal 'no reference'.** ``_image_cell`` renders
+        REFERENCE thumbnails, where a missing file honestly means "no reference was supplied". On an
+        OUTPUT column a missing file means the render did not happen, and labelling that "no
+        reference" would send an operator hunting for a dataset problem that does not exist — the
+        same distinction that made the re-skin gallery's ``original not staged`` fallback worth
+        having (see ``_reskin_block``).
+      * **No ``loop`` attribute.** ``_image_cell`` emits ``<img loop …>``; ``loop`` is not a valid
+        ``<img>`` attribute and is a carry-over from the video cell it was adapted from. It is left
+        untouched there — three shipped galleries' HTML is pinned by test — and simply not
+        reproduced here.
+
+    ``control=True`` carries the ``.control`` divergence marker class and the accent badge, so a
+    baseline column can never be read as a result. Every ``label`` / ``src`` / ``fallback`` flows
+    through ``html.escape`` (T-04-03 output encoding), identically to the other cell builders.
+    """
+    safe_label = html.escape(label)
+    cell_class = "cell control" if control else "cell"
+    badge = '<span class="badge-control">CONTROL — no adapter</span>' if control else ""
+    if img:
+        safe_src = html.escape(img, quote=True)
+        media = f'<img src="{safe_src}" alt="{safe_label}">'
+    else:
+        media = f'<div class="failed">{html.escape(fallback)}</div>'
+    return (
+        f'<div class="{cell_class}">'
+        f'<div class="col-label">{safe_label}{badge}</div>{media}</div>'
+    )
 
 
 def _reskin_video_cell(
@@ -241,6 +286,107 @@ def _reskin_block(row: dict) -> str:
     )
 
 
+# The qwen_edit "what to look for" block. Both halves are §8 of QWEN-CHAINED-EDIT-METHOD.md, not
+# house invention: the divergence half is the convergence check (*"base-vs-LoRA divergence at ~200–250
+# steps, not a step threshold and not loss. If the sample is essentially the base render, it isn't
+# converging — intervene"*), and the A/B half is what the two prompt modes exist to expose (*"this is
+# how the trace-vs-reinterpret behavior gets read"*). The literal ``&`` is emitted as ``&amp;`` since
+# this is authored HTML, not user input.
+_QWEN_EDIT_CRITERIA_PASS = (
+    "every adapter column visibly diverges from its BASE control at the same prompt, "
+    "&amp; the A (style-only) and B (content-named) columns of one checkpoint read differently — "
+    "that A/B delta is the trace-vs-reinterpret signal."
+)
+_QWEN_EDIT_CRITERIA_FAIL = (
+    "an adapter column is essentially its BASE render (not converging — intervene, do not wait for "
+    "a step threshold), or A and B are indistinguishable (the adapter is tracing the control image "
+    "rather than reinterpreting it)."
+)
+#: Per-row PASS condition default. Overridable per row via ``criteria_line``.
+_QWEN_EDIT_ROW_PASS_LINE = (
+    "the adapter cells depart from BASE at the same prompt, and A differs from B within a checkpoint."
+)
+
+
+def _qwen_edit_block(row: dict, columns: "list") -> str:
+    """One ``.comparison`` block for the qwen_edit A/B x checkpoint-BAND grid (§8).
+
+    Renders, top-to-bottom: ``.row-label`` (the held-out input's name) → one ``.reskin-prompt`` line
+    per §8 prompt mode, each printing the EXACT prompt that mode's columns were rendered under →
+    ``.seed`` → ``.criteria-line`` → ``.row`` containing, left-to-right:
+
+        [ control slot thumbnails ] [ BASE · A | BASE · B ] [ ckpt1 · A | ckpt1 · B ] ...
+
+    The control thumbnails come from ``row["control_imgs"]`` (the held-out control image per slot —
+    up to ``QWEN_EDIT_MAX_CONTROL_SLOTS``); the output cells come from ``columns``, which is the
+    caller's ``plan_qwen_edit_columns`` result. The column list is PASSED, never derived from the
+    row's keys: a band is a declaration, and deriving columns from whichever keys happen to be
+    present would let a band member whose renders all failed vanish from the grid entirely instead of
+    showing a row of honest 'generation failed' tiles.
+
+    Both prompt lines are printed even when a mode's prompt is missing (rendered as ``—``): §8's read
+    is a comparison between two prompts, and a row that silently shows one of them invites the delta
+    to be attributed to the model rather than to the missing prompt.
+
+    EVERY cell is an ``<img>``. This family renders images — a ``<video>`` element anywhere in this
+    block is a bug, and ``tests/test_qwen_edit_render_surface.py`` asserts its absence.
+    """
+    input_label = html.escape(str(row.get("input_label", row.get("input_name", ""))))
+    seed = html.escape(str(row.get("seed", "")))
+    criteria_line = html.escape(str(row.get("criteria_line", _QWEN_EDIT_ROW_PASS_LINE)))
+
+    prompt_lines = "".join(
+        '<div class="reskin-prompt">'
+        f"{html.escape(col_mode_label)}: {html.escape(str(row.get(prompt_key) or '—'))}"
+        "</div>"
+        for col_mode_label, prompt_key in _row_prompt_lines(columns)
+    )
+
+    control_cells = "".join(
+        _image_tile(f"control {i}", img, fallback="control image missing")
+        for i, img in enumerate(row.get("control_imgs", []), start=1)
+    )
+    output_cells = "".join(
+        _image_tile(
+            column.label,
+            str(row.get(column.row_key, "") or ""),
+            control=bool(column.control),
+            fallback="generation failed",
+        )
+        for column in columns
+    )
+
+    return (
+        '<section class="comparison">'
+        f'<div class="row-label">{input_label}</div>'
+        f"{prompt_lines}"
+        f'<div class="seed">seed {seed}</div>'
+        f'<div class="criteria-line"><b>PASS if:</b> {criteria_line}</div>'
+        f'<div class="row">{control_cells}{output_cells}</div>'
+        "</section>"
+    )
+
+
+def _row_prompt_lines(columns: "list") -> list[tuple[str, str]]:
+    """The ordered ``(mode label, row prompt key)`` pairs to print above one qwen_edit row.
+
+    Derived from the COLUMNS rather than from a hardcoded A/B pair, so the header lines can never
+    describe a mode set the columns do not contain. De-duplicated in first-appearance order because
+    each mode owns several columns (one per band member) but only one prompt.
+    """
+    seen: list[tuple[str, str]] = []
+    keys: set[str] = set()
+    for column in columns:
+        mode = getattr(column, "mode", None)
+        if mode is None:
+            continue
+        key = str(getattr(mode, "row_prompt_key", ""))
+        if key and key not in keys:
+            keys.add(key)
+            seen.append((str(getattr(mode, "label", key)), key))
+    return seen
+
+
 def _comparison_block(row: dict) -> str:
     """One ``.comparison`` block: caption + seed banner + BASE / LoRA columns."""
     prompt = html.escape(str(row.get("prompt", "")))
@@ -292,6 +438,104 @@ def _params_banner(params: dict) -> str:
     )
 
 
+#: Banner fields ``_qwen_edit_params_banner`` knows how to render. An allowlist rather than a
+#: ``.get()`` free-for-all: an unrecognised key is REFUSED, so plumbing a §8 sampling setting that
+#: this banner cannot render fails loudly at the call site instead of disappearing from the page.
+#: ⛔ One §8 field is deliberately ABSENT — the static scheduler-reparameterisation value (3.0). It
+#: is blocked by ``tests/test_no_wan_params.py``'s ``_WAN_TOKENS`` ban on the bare token ``shift``
+#: across every ``*.py`` under ``inference/``, a guard written for LTX paths whose scope now also
+#: covers a family where that setting is mandatory. Resolving that is a ruling; see the function's
+#: docstring for the full statement of the conflict and why omission is the reversible side.
+_QWEN_EDIT_BANNER_FIELDS = (
+    "steps",
+    "true_cfg",
+    "cfg_norm",
+    "width",
+    "height",
+    "lora_scale",
+    "checkpoint_band",
+)
+
+
+def _qwen_edit_params_banner(params: dict) -> str:
+    """The qwen_edit params banner — §8's inference settings + the checkpoint BAND.
+
+    A SEPARATE function from ``_params_banner``, not an extension of it, because the two describe
+    different instruments and the shipped four galleries' banners are pinned by test:
+
+      * ``stg`` is an LTX-only concept (spatiotemporal guidance). Emitting ``stg=?`` on a Qwen grid
+        would put a knob on the page that does not exist on this model, which is worse than omitting
+        it — an operator diagnosing a bad render would reach for it.
+      * The dims are ``WxH``, not ``WxHxF``. ``QWEN_EDIT_FRAMES`` is pinned to exactly 1
+        (``conditioning/qwen_edit_geometry.py:141``); printing ``x1`` would present a constant as a
+        setting.
+      * ``true_cfg`` / ``cfg_norm`` are on the banner because §8 names its inference settings as a
+        DOCUMENTED TRAP with an explicit diagnosis tell: *"training samples look fine but renders are
+        muddy → it's inference settings, not the model."* The settings that produced a grid have to
+        be readable off the grid, or that diagnosis cannot be made from the artifact.
+      * ``checkpoint_band`` names every member of the rendered band (``CheckpointBand.describe()``),
+        so the page says which three checkpoints it is showing rather than implying a winner.
+
+    ⛔ ONE §8 SETTING IS MISSING FROM THIS BANNER, AND IT IS A CONTRACT CONFLICT, NOT AN OVERSIGHT.
+    -----------------------------------------------------------------------------------------------
+    §8's inference table for Qwen-Image-Edit-2511 reads: steps 30 · true_cfg 4.0 with CFGNorm on ·
+    **static shift 3.0** (``use_dynamic_shifting=False``) · LoRA strength 1.0. That shift value is
+    the single most trap-prone number in the table — §8 warns that
+    ``QwenImageEditPlusModel.get_generation_pipeline()`` rebuilds a fresh default-shift scheduler, so
+    it must be overridden onto ``pipeline.scheduler`` AFTER the pipeline is built, and that
+    ai-toolkit's default dynamic shift (~1.6–2.5) is far weaker than the shipped ComfyUI
+    ``ModelSamplingAuraFlow`` value.
+
+    ``tests/test_no_wan_params.py:31`` bans the bare token ``shift`` from **executable code in every
+    ``*.py`` under ``inference/``** (``_WAN_TOKENS``, scanned by ``test_no_wan_params_in_inference_code``
+    over ``_INFERENCE_DIR.glob("*.py")``). That guard's stated purpose (:6-8) is to keep the
+    Wan-tuned sampling set out of **LTX** code paths — its scope has simply outgrown its rationale
+    now that a non-LTX family lives in this directory, where the same token names a MANDATORY
+    setting rather than a forbidden one.
+
+    Both cannot hold. This writer takes the reversible side: the field is OMITTED rather than the
+    guard weakened, because narrowing a shipped money-safe guard is a ruling and quietly renaming the
+    field to slip past a scanner would be worse than either — it would leave the guard falsely green
+    while stripping §8's most trap-prone number out of the artifact an operator diagnoses from.
+    Nothing is lost today: ``qwen_edit_layout.render_qwen_edit_sample`` raises, so no real render
+    exists whose scheduler setting needs reporting. The field becomes necessary on exactly the day
+    the sampler lands, which is the day the ruling is needed. See that stub's docstring.
+
+    Missing keys render ``?`` — the same honest-placeholder convention ``_params_banner`` uses. This
+    writer never invents a sampling value. An UNRECOGNISED key is REFUSED rather than dropped, so a
+    caller plumbing the blocked §8 setting through gets a loud, actionable error at the exact point
+    of the conflict instead of watching its value vanish from the page.
+    """
+    unknown = sorted(k for k in params if k not in _QWEN_EDIT_BANNER_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"unrecognised qwen_edit banner field(s) {unknown}. Known fields: "
+            f"{list(_QWEN_EDIT_BANNER_FIELDS)}. An unknown key is refused rather than silently "
+            "dropped, because a dropped SAMPLING setting is invisible on the artifact an operator "
+            "diagnoses from. If this is the static scheduler-reparameterisation value from METHOD "
+            "§8's inference table (the 3.0 one, the setting §8 says must be overridden onto "
+            "pipeline.scheduler AFTER get_generation_pipeline rebuilds it): it is BLOCKED, not "
+            "forgotten — tests/test_no_wan_params.py bans that token from executable code anywhere "
+            "under inference/, and un-banning it for the non-LTX family is a ruling, not an edit. "
+            "See _qwen_edit_params_banner's docstring."
+        )
+    width = params.get("width", "?")
+    height = params.get("height", "?")
+    dims = html.escape(f"{width}x{height}")
+    steps = html.escape(str(params.get("steps", "?")))
+    true_cfg = html.escape(str(params.get("true_cfg", "?")))
+    cfg_norm = html.escape(str(params.get("cfg_norm", "?")))
+    lora_scale = html.escape(str(params.get("lora_scale", "?")))
+    band = html.escape(str(params.get("checkpoint_band", "?")))
+    return (
+        '<div class="params">'
+        f"steps={steps} &middot; true_cfg={true_cfg} &middot; cfg_norm={cfg_norm} "
+        f"&middot; {dims} &middot; lora_scale={lora_scale}"
+        f" &middot; {band}"
+        "</div>"
+    )
+
+
 _STYLE = (
     "body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:24px}"
     ".params{background:#222;padding:8px 12px;border-radius:6px;margin-bottom:24px;font-size:14px}"
@@ -314,6 +558,15 @@ _STYLE = (
     ".badge-control{display:inline-block;color:#d9a441;border:1px solid #d9a441;"
     "border-radius:4px;padding:0 8px;font-size:12px;margin-left:8px}"
     ".cell.control{border-left:1px dashed #444;padding-left:16px}"
+    # qwen_edit (family #3) image-grid additions — appended, and SCOPED under `.qwen-edit-grid` so
+    # the four shipped video galleries render byte-identically. A bare `img{width:100%}` here would
+    # resize the reference thumbnails in the Phase-5/6/7 galleries, which is a visual change to
+    # already-delivered artifacts. The row also scrolls rather than squeezing: a band grid is
+    # 2 x (band + 1) output cells wide, and flex-shrinking 8 images to fit a laptop makes the
+    # base-vs-LoRA divergence judgment §8 asks for impossible to make.
+    ".qwen-edit-grid img{width:100%;background:#000;border-radius:4px;display:block}"
+    ".qwen-edit-grid .row{overflow-x:auto;flex-wrap:nowrap}"
+    ".qwen-edit-grid .cell{flex:0 0 220px}"
 )
 
 
@@ -429,6 +682,88 @@ def write_reference_gallery(
         f"<style>{_STYLE}</style></head><body>"
         f"{_params_banner(params)}"
         f"{blocks}"
+        "</body></html>"
+    )
+
+    with out.open("w", encoding="utf-8") as f:  # utf-8 explicit (Phase-1 carry-forward)
+        f.write(doc)
+    return out
+
+
+def write_qwen_edit_gallery(
+    rows: list[dict],
+    out_path: str | Path,
+    params: dict,
+    *,
+    columns: list,
+) -> Path:
+    """Write the qwen_edit A/B x checkpoint-BAND montage ``index.html`` and return its ``Path``.
+
+    **The first IMAGE-output gallery in this module.** The four writers above render generated
+    outputs as ``<video>``; family #3 is an image family (``QWEN_EDIT_FRAMES == 1``) and every
+    OUTPUT cell here is an ``<img>``, via ``_image_tile``. Reusing ``write_comparison_gallery`` with
+    ``.png`` paths would have emitted ``<video src="…png">`` — a page that renders as a row of black
+    rectangles with playback controls, i.e. an artifact that looks broken rather than one that
+    reports a broken render.
+
+    Per row, left-to-right (§8 of ``QWEN-CHAINED-EDIT-METHOD.md``)::
+
+        [ control 1..N ] [ BASE · A | BASE · B ] [ ckpt1 · A | ckpt1 · B ] [ ckpt2 · A | ... ] ...
+
+    ``columns`` is REQUIRED and keyword-only — it is ``plan_qwen_edit_columns(band)``'s result. It is
+    not derived from the rows and it is not defaulted, because the band is a DECLARATION: §8 ships a
+    band of checkpoints rather than a winner, and a gallery that inferred its columns from whichever
+    row keys were present would drop a band member whose renders all failed instead of showing it as
+    a column of honest 'generation failed' tiles. A silently 2-wide band under a 3-checkpoint label
+    is the grid-layer version of a coarse render key.
+
+    Reuses ``_image_tile`` / ``_qwen_edit_params_banner`` / ``_STYLE`` — every input label, prompt,
+    seed and image ``src`` flows through ``html.escape`` (T-04-03). Stdlib-only, torch-free,
+    CPU/Windows-testable (mirrors ``write_reskin_gallery``). The generate call that populates it is a
+    declared stub — ``inference/qwen_edit_layout.render_qwen_edit_sample``.
+
+    Args:
+        rows: one dict per HELD-OUT INPUT with ``input_label`` (or ``input_name``), ``seed``,
+            ``control_imgs`` (list of relative control-slot thumbnail paths; a falsy entry →
+            'control image missing'), one prompt per §8 mode under that mode's ``row_prompt_key``
+            (``prompt_a`` / ``prompt_b``; absent → printed as ``—``), an optional per-row
+            ``criteria_line`` override, and one image path per column keyed by the column's
+            ``row_key`` (relative to ``out_path``'s parent; a falsy path → 'generation failed').
+        out_path: destination ``index.html`` path (parent dirs are created).
+        params: banner values — ``steps``, ``true_cfg``, ``cfg_norm``, ``shift``, ``width``,
+            ``height``, ``lora_scale``, ``checkpoint_band`` (``CheckpointBand.describe()``).
+        columns: the ordered ``QwenEditColumn`` list from ``plan_qwen_edit_columns``.
+
+    Returns:
+        The resolved ``Path`` written.
+    """
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if not columns:
+        raise ValueError(
+            "write_qwen_edit_gallery got an EMPTY column list. The columns are "
+            "plan_qwen_edit_columns(band)'s result and a band is 1..N checkpoints (§8 ships three); "
+            "with no columns the page renders control thumbnails and nothing to judge them against "
+            "— a complete-looking artifact that answers nothing. Pass the planner's output."
+        )
+
+    criteria = (
+        '<div class="criteria">'
+        f"<b>PASS =</b> {_QWEN_EDIT_CRITERIA_PASS} <b>FAIL =</b> {_QWEN_EDIT_CRITERIA_FAIL}"
+        "</div>"
+    )
+    blocks = "".join(_qwen_edit_block(row, columns) for row in rows)
+    doc = (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        "<title>qwen_edit: A/B prompt modes across the checkpoint band</title>"
+        f"<style>{_STYLE}</style></head><body>"
+        '<div class="qwen-edit-grid">'
+        '<h1 class="grid-title">qwen_edit — A/B prompt modes across the checkpoint band</h1>'
+        f"{criteria}"
+        f"{_qwen_edit_params_banner(params)}"
+        f"{blocks}"
+        "</div>"
         "</body></html>"
     )
 

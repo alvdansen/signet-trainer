@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["h3_render_key"]
+__all__ = ["h3_render_key", "qwen_edit_render_key"]
 
 #: Characters allowed through into a directory name. Everything else becomes ``_`` — a checkpoint
 #: name is derived from a Volume path, and a separator or a ``..`` in it would escape the samples
@@ -60,6 +60,57 @@ def h3_render_key(
     """
     ids = "-".join(_sanitize(str(s)) for s in subject_ids) or "noref"
     return f"{_sanitize(str(checkpoint))}_s{int(seed)}_f{int(frame_count)}_{ids}"
+
+
+def qwen_edit_render_key(*, checkpoint: str, seed: int, control_ids: Any) -> str:
+    """The ``qwen_edit`` render's identity as ONE directory name: ``<checkpoint>_s<seed>_c<ids>``.
+
+    Family #3's answer to the same question ``h3_render_key`` answers, with a DIFFERENT axis set —
+    which is the whole reason this is a second function rather than a reused one.
+
+    **``_f<frames>`` is deliberately absent.** Qwen-Image-Edit is an image family;
+    ``QWEN_EDIT_FRAMES`` is pinned to EXACTLY 1 (``conditioning/qwen_edit_geometry.py:141``), so a
+    frame-count segment would be a constant masquerading as an identity axis — it would make every
+    key one token longer while distinguishing nothing, and it would invite a reader to believe the
+    length axis is live here. The axes that DO vary are:
+
+      * ``checkpoint`` — and on this family that is not "the winner", it is a BAND member. §8 of the
+        house method ships THREE checkpoints (JPM: 4k / 4.2k / 5k) because eval showed only nuance
+        differences with no single best. Every band member renders the same held-out set at the same
+        seed, so without the checkpoint in the key the band collapses into one directory and the
+        second member's renders are skipped as "already done" — a grid labelled for a band that
+        contains one checkpoint's pixels three times.
+      * ``seed`` — both the base and the adapter column use it, so it identifies the pair.
+      * ``control_ids`` — WHICH control images were fed, in slot order. This is the qwen analog of
+        H3's ``subject_ids``, and it is positional for a stronger reason: slot index IS the caption's
+        ``ctrl_img_N`` addressing (``conditioning/qwen_edit.py:175-177``), so a reordered control set
+        is a genuinely different request, exactly as D-10-REFORDER holds for H3 references. Order is
+        PRESERVED, never sorted.
+
+    **The A/B prompt mode is deliberately NOT in the key**, and this is the half of
+    ``expected_qwen_edit_render_key``'s two-part warning that is easiest to get backwards. §8
+    requires the SAME held-out input rendered under (A) a style-only prompt and (B) a content-named
+    prompt **side by side** — they are one comparison, not two requests, and they are produced by one
+    pass over the held-out set rather than by two sibling sample configs. So they live as SUBDIRS of
+    a single render dir, exactly the way ``h3_sample`` puts ``base/`` and ``lora/`` under one key
+    (``modal/fns.py:4693``). Promoting the mode into the directory name would split one grid row
+    across two render dirs, and the watcher would then treat a row whose A half landed as a fully
+    landed render.
+
+    Deliberately human-readable rather than a hash, for the same reason as the H3 key: this is what
+    an operator reads off a ``modal volume ls``.
+
+    Args:
+        checkpoint: The resolved checkpoint directory NAME — one BAND member, not "the best".
+        seed: The render seed.
+        control_ids: The control-image condition in slot order; the CONDITIONING axis. May be empty
+            (an unconditioned probe), which keys as ``noctrl``.
+
+    Returns:
+        A filesystem-safe directory name containing no path separator.
+    """
+    ids = "-".join(_sanitize(str(s)) for s in control_ids) or "noctrl"
+    return f"{_sanitize(str(checkpoint))}_s{int(seed)}_c{ids}"
 
 
 def _sanitize(value: str) -> str:

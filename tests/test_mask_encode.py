@@ -59,13 +59,33 @@ _EXPECTED = torch.tensor(
 
 
 def test_import_confinement_no_heavy_or_decode_modules() -> None:
-    """Module import pulls NO modal/ltx/decode stack (the seg_palette.py discipline)."""
-    for mod in ("modal", "ltx_core", "ltx_trainer", "av", "cv2", "PIL", "imageio"):
-        sys.modules.pop(mod, None)
-    import signet_trainer.data.mask_encode  # noqa: F401
+    """Module import pulls NO modal/ltx/decode stack (the seg_palette.py discipline).
 
-    for mod in ("modal", "ltx_core", "ltx_trainer", "av", "cv2", "PIL", "imageio"):
-        assert mod not in sys.modules, f"import confinement violation: mask_encode imported {mod}"
+    Snapshot before popping so we can RESTORE afterwards, matching
+    ``test_grid_html.py:80-92``. Popping without restoring poisons every LATER test in the
+    session, and ``PIL`` is the sharpest case: evicting the ``"PIL"`` key alone leaves
+    ``sys.modules["PIL.Image"]`` cached, so a subsequent ``import PIL.Image`` re-executes
+    ``PIL/__init__`` into a NEW module object while the submodule import short-circuits — the
+    ``Image`` attribute is never rebound. Anything later that evaluates the annotation
+    ``list[PIL.Image.Image]`` at import time then dies with ``AttributeError: module 'PIL' has
+    no attribute 'Image'`` — which is what ``diffusers/utils/export_utils.py:27`` does, so
+    ``pytest.importorskip("diffusers")`` FAILS instead of skipping (importorskip catches
+    ImportError, not AttributeError). Restoring keeps the confinement assertion exactly as
+    strict while making it hermetic.
+    """
+    forbidden = ("modal", "ltx_core", "ltx_trainer", "av", "cv2", "PIL", "imageio")
+    saved = {mod: sys.modules.pop(mod, None) for mod in forbidden}
+    try:
+        import signet_trainer.data.mask_encode  # noqa: F401
+
+        for mod in forbidden:
+            assert mod not in sys.modules, (
+                f"import confinement violation: mask_encode imported {mod}"
+            )
+    finally:
+        for mod, value in saved.items():
+            if value is not None:
+                sys.modules[mod] = value
 
 
 def test_latent_grid_for_pixels_contract_dims() -> None:

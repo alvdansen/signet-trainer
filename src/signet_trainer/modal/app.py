@@ -321,6 +321,127 @@ h3_gpu_image = (
 )
 
 # --------------------------------------------------------------------------------------------------
+# Qwen-Image-Edit GPU-stage image (Phase 11 — family #3) — the Qwen-Image-Edit-2511 chained-edit
+# image. A THIRD image, and the decision to make it a third rather than widen ``h3_gpu_image`` is the
+# load-bearing part of this block, so it is recorded rather than assumed.
+#
+# ⛔ WHY NOT REUSE ``h3_gpu_image``. The task that produced this block asked exactly that question of
+# the ``transformers==5.14.1`` pin. The answer is that the transformers pin is not even the binding
+# constraint — **``diffusers`` is**, and it is binding by construction:
+#
+#   * ``h3_gpu_image`` git-pins diffusers at ``DIFFUSERS_SHA`` (9f169d98…), the SHA the MiniMax-H3
+#     arch was read and probed at, and its banner says to bump it DELIBERATELY.
+#   * EVERY line-numbered fact family #3 is built on was measured against a DIFFERENT SHA —
+#     ``072d15ee4289ffdc3aa9d65f8b94bc9271319d21`` (self-reporting ``0.36.0``). That is the SHA
+#     ``ai-toolkit/requirements.txt:3`` pins, and it is the install every ``pipeline_qwenimage_edit_
+#     plus.py:66-67`` / ``transformer_qwenimage.py:525-535`` / ``single_file_utils.py:160,566``
+#     citation in ``conditioning/qwen_edit_geometry.py``, ``models/qwen_edit_loader.py`` and
+#     ``prep/qwen_edit_encode.py`` was read from.
+#
+# One image cannot carry two diffusers SHAs. Re-pinning h3's to serve qwen would silently re-resolve
+# ``MiniMaxH3Transformer3DModel`` — a surface its own banner records as "still moving" — and the
+# working H3 path is not a thing to risk for image-build convenience. So the fork is forced, and the
+# transformers question then resolves for free rather than being traded off.
+#
+# ⚠ ON THE ``transformers`` PIN, and what is and is not verified here. MEASURED on this box:
+# ``Qwen2_5_VLProcessor`` and ``Qwen2_5_VLForConditionalGeneration`` both import at **4.57.3** AND at
+# **5.1.0**, and ``Qwen2_5_VLProcessorKwargs._defaults["text_kwargs"]["return_mm_token_type_ids"]``
+# is ``False`` in BOTH — so the specific hazard that forced h3's pin (the flag defaulting True at
+# 5.14.1 on ``Qwen3VLProcessor``) is not visibly reproduced on the 2.5-VL processor at 5.1.0.
+# [UNVERIFIED] It was NOT tested at 5.14.1: that version is installed nowhere on this machine, and a
+# compatibility claim about a version nobody ran is the kind of number this repo refuses to write.
+# What IS visible across the major boundary is a real surface change — at 4.57.3 the processor
+# declares family-SPECIFIC ``Qwen2_5_VLImagesKwargs`` / ``Qwen2_5_VLVideosProcessorKwargs``, at 5.1.0
+# those collapse into the generic ``ImagesKwargs`` / ``VideosKwargs``. ``prep/qwen_edit_encode.py``
+# transcribes the diffusers-0.36 ``processor(text=[...], images=[...])`` call literally, so the
+# defensible pin is the one the MEASURED house chain ran under: ``ai-toolkit/requirements.txt:4``,
+# ``transformers==4.57.3``. Bump it DELIBERATELY and only with a parity run, never by drift.
+#
+# Supply chain (the ``LTX2_COMMIT_SHA`` / ``DIFFUSERS_SHA`` discipline, applied a third time):
+#   * ``diffusers`` — git+https at a LITERAL 40-hex SHA, never ``main``. Same route
+#     ``tests/test_pyproject_supply_chain.py`` sanctions; ``diffusers>=0.32`` is already a declared
+#     ``[modal-runtime]`` dep, so this is a git PIN of an existing dependency, not a new package.
+#   * ``optimum-quanto==0.2.4`` is the ONE distribution new to this project, and it is new because
+#     the house recipe locks ``qfloat8`` on both the transformer and the text encoder — there is no
+#     way to run this family's recipe without it. Legitimacy, read off the installed distribution's
+#     own metadata in the ``falco`` env on this box (``importlib.metadata``): Name
+#     ``optimum-quanto``, Version ``0.2.4``, License ``Apache-2.0``, Project-URL
+#     ``homepage, https://github.com/huggingface/optimum-quanto`` — the same Hugging Face org that
+#     publishes ``diffusers`` / ``transformers`` / ``peft`` / ``accelerate``, all four of which this
+#     project already trusts. The version is EXACT and matches ``ai-toolkit/requirements.txt:29``,
+#     which is not a preference: ``models/qwen_edit_loader.quantize_qwen_edit`` documents a live
+#     ``include=``/``exclude=`` swap bug in this exact release and is written to keep it unreachable
+#     by passing neither filter. A floating range could resolve past that reasoning.
+#   * ``peft`` / ``accelerate`` / ``safetensors`` / ``bitsandbytes`` / ``huggingface_hub`` are
+#     mirrored from ``h3_gpu_image`` at their existing floors — DELIBERATELY not re-pinned to
+#     ai-toolkit's versions. signet writes its adapters through its OWN ``lora/peft.py``, shared with
+#     the LTX and H3 legs; forking the adapter-writing surface per family for no measured reason is
+#     how two families' checkpoints stop being comparable.
+#   * ``pydantic`` + ``pyyaml`` are the CONFIG-LOADER closure — the defect this repo has now paid for
+#     TWICE (see ``download_image``'s INVARIANT banner and ``h3_gpu_image``'s copy of the same note).
+#     ``qwen_edit_train`` and ``qwen_edit_sample`` both call ``load_config_from_text`` in-container.
+#   * NO ``ffmpeg``, NO ``av``. Family #3 is an IMAGE family — ``QWEN_EDIT_FRAMES`` is pinned to
+#     exactly 1 (``conditioning/qwen_edit_geometry.py``) — so nothing on this path demuxes or muxes
+#     anything. ``Pillow`` is what opens a control image (``prep/qwen_edit_encode.py`` and
+#     ``prepare_qwen_edit_image`` both import ``PIL.Image`` function-locally); it arrives as a
+#     ``torchvision`` transitive exactly as it does on ``gpu_image``, and is DECLARED here anyway for
+#     the ``av`` reason 10-04 recorded: an import that shipped code performs must not depend on
+#     somebody else's dependency graph. The day a Qwen leg needs a video container, THAT is the
+#     change that re-opens the ffmpeg question.
+#   * NO ``*.safetensors`` baked into the image (MODL-01). The three components live on the
+#     ``signe-trainer-weights`` Volume and mount at ``WEIGHTS_DIR`` at run time — the transformer as
+#     ``cfg.model.model_id``, the text encoder as ``cfg.model.text_encoder_id``, the VAE as
+#     ``cfg.model.vae_id``. The CALLER composes every one of those paths (D-NOHARDCODE).
+# --------------------------------------------------------------------------------------------------
+
+# diffusers at the SHA every Qwen-Image-Edit line citation in this repo was measured against. A
+# LITERAL SHA, never ``main``. Source: ``ai-toolkit/requirements.txt:3``. Bump DELIBERATELY — a
+# different SHA invalidates the transcribed constants, not merely the build.
+QWEN_DIFFUSERS_SHA = "072d15ee4289ffdc3aa9d65f8b94bc9271319d21"
+
+# ⛔ DELIBERATELY NOT ``TRANSFORMERS_VERSION`` (h3's 5.14.1). See the ⚠ note above: the two families
+# pin different majors, and the reason is recorded rather than resolved by picking the newer one.
+# Source: ``ai-toolkit/requirements.txt:4``.
+QWEN_TRANSFORMERS_VERSION = "4.57.3"
+
+# The qfloat8 backend. EXACT, not a floor — ``quantize_qwen_edit``'s reasoning is written against
+# this release's known ``include=``/``exclude=`` bug. Source: ``ai-toolkit/requirements.txt:29``.
+QWEN_OPTIMUM_QUANTO_VERSION = "0.2.4"
+
+# Build fresh (NOT chained off any image above): Modal forbids build steps after ``add_local_*``, and
+# every image above ends with ``add_local_python_source``. Installs FIRST, local source LAST.
+qwen_gpu_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    # git: needed for the git+https diffusers install below. Nothing else — see the NO ffmpeg note.
+    .apt_install("git")
+    .pip_install("uv")
+    # torch~=2.7 on the CUDA 12.9 wheel index — the SAME line as ``gpu_image`` and ``h3_gpu_image``,
+    # so no family carries a torch-version confound relative to the others. ``torchvision`` is the
+    # matched pair (and is what drags ``Pillow`` in, which is declared explicitly below regardless).
+    .run_commands(
+        "uv pip install --system --index-strategy unsafe-best-match "
+        "--extra-index-url https://download.pytorch.org/whl/cu129 'torch~=2.7' 'torchvision~=0.22'"
+    )
+    .run_commands(
+        f"uv pip install --system 'diffusers @ git+https://github.com/huggingface/diffusers@{QWEN_DIFFUSERS_SHA}'",
+        "uv pip install --system "
+        f"'transformers=={QWEN_TRANSFORMERS_VERSION}' "
+        f"'optimum-quanto=={QWEN_OPTIMUM_QUANTO_VERSION}' "
+        "'peft>=0.14' 'accelerate>=1.2' 'safetensors' 'bitsandbytes' 'huggingface_hub>=0.27' "
+        "'pillow' "
+        # The config-loader closure (pydantic <- config/schema.py, yaml <- config/load.py; torch
+        # arrives transitively through config/validators.py's re-export of compute_seq_len). Floors
+        # MIRRORED from pyproject's [project.dependencies], never invented.
+        "'pydantic>=2.10.4' 'pyyaml>=6'",
+    )
+    # Same VRAM-fragmentation mitigation as the other two GPU images — a process env var that must be
+    # set BEFORE torch's CUDA allocator initializes, so it lives on the image, not in code.
+    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+    # CODE ONLY: copy the local signet_trainer package in. NO WEIGHTS (MODL-01).
+    .add_local_python_source("signet_trainer")
+)
+
+# --------------------------------------------------------------------------------------------------
 # CPU download image (Phase 2) — the light, non-GPU image. Kept SEPARATE from the heavy ``gpu_image``:
 # none of its users need ltx-core / ltx-trainer / CUDA, so it stays a fast CPU image. NO weights baked
 # in (MODL-01) — files land on the mounted Volumes at runtime. (The bare code-only ``image`` has no
