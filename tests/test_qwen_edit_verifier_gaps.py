@@ -411,24 +411,54 @@ def test_the_declared_render_stub_is_still_the_only_unlanded_qwen_entry_point() 
         assert landing in message, f"the stub message does not name {landing}"
 
 
-def test_the_train_arm_refuses_at_zero_dollars_on_the_unlanded_packing_module() -> None:
-    """``conditioning/qwen_edit_packing`` has no producer, and the train arm knows it.
+def test_the_packing_module_is_landed_and_is_the_single_transcription() -> None:
+    """RETIRED-AND-REPLACED 2026-08-08. The predecessor asserted ``qwen_edit_packing`` did NOT
+    exist and told its reader to delete it once the module landed; it has landed, so this is the
+    inverted form that keeps the property it was really protecting.
 
-    ``QwenEditStrategy`` takes ``pack_fn`` as an injected callable and names
-    ``conditioning.qwen_edit_packing.qwen_edit_image_rows`` as the real one
-    (``conditioning/qwen_edit.py:505``). That module does not exist in this tree. The Modal train
-    arm's readiness probe must therefore refuse — after the approval pause, before any dispatch,
-    at $0 — rather than raising ``ModuleNotFoundError`` inside a metered container.
+    What mattered was never the absence — it was that the 2x2 pack has exactly ONE transcription.
+    Every wrong ordering of the six-axis permute yields the right shape and the wrong values, so a
+    second copy is a silent fork. ``tests/test_qwen_edit_packing.py`` proves the ordering by
+    round-tripping to bit-equality; this asserts nobody has added a rival.
     """
-    assert not (SRC / "signet_trainer" / "conditioning" / "qwen_edit_packing.py").exists(), (
-        "conditioning/qwen_edit_packing.py now exists — delete this test and let the train arm "
-        "dispatch (the readiness probe will stop naming it)."
-    )
+    packing = SRC / "signet_trainer" / "conditioning" / "qwen_edit_packing.py"
+    assert packing.exists(), "conditioning/qwen_edit_packing.py is the strategy's declared pack_fn"
+
     strategy_src = (SRC / "signet_trainer" / "conditioning" / "qwen_edit.py").read_text(
         encoding="utf-8"
     )
     assert "qwen_edit_packing" in strategy_src, (
-        "the strategy no longer names its pack_fn producer — the readiness probe's target moved"
+        "the strategy no longer names its pack_fn producer"
+    )
+
+    # Exactly one EXECUTABLE ``.permute(0, 2, 4, 1, 3, 5)`` under src/ — the pack itself.
+    #
+    # Parsed with ast rather than grepped, because the transform is QUOTED in four docstrings
+    # (this module's, qwen_edit.py's refusal message, qwen_edit_geometry.py's header) to explain
+    # what it is and why it must not be duplicated. Quoting it is documentation; calling it twice
+    # is the fork. A text scan cannot tell those apart and would punish the documentation.
+    import ast
+
+    hits: list[str] = []
+    for path in SRC.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr != "permute":
+                continue
+            args = [a.value for a in node.args if isinstance(a, ast.Constant)]
+            if args == [0, 2, 4, 1, 3, 5]:
+                hits.append(f"{path.relative_to(SRC).as_posix()}:{node.lineno}")
+
+    assert len(hits) == 1, (
+        f"the 2x2 pack permute has {len(hits)} executable transcription(s) under src/: {hits}. It "
+        f"must have exactly one, in conditioning/qwen_edit_packing.py. Every wrong ordering of "
+        f"those six axes yields the RIGHT shape and the WRONG values, so a second copy is a silent "
+        f"fork of a checkpoint contract — nothing raises, the loss descends, the adapter is wrong."
+    )
+    assert "qwen_edit_packing.py" in hits[0], (
+        f"the single transcription moved out of qwen_edit_packing.py to {hits[0]}"
     )
 
 
