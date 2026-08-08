@@ -35,8 +35,13 @@ from signet_trainer.config.validators import (
     H3_PHASE10_REFERENCES_PER_SAMPLE,
     H3_RESIDENT_GIB_RANK64,
     H3_VISUAL_CONDITION_PIN,
+    QWEN_EDIT_CONDITION_IMAGE_SIZE,
+    QWEN_EDIT_LORA_TARGET_REGEX,
+    QWEN_EDIT_MAX_CONTROL_SLOTS,
+    QWEN_EDIT_VAE_IMAGE_SIZE,
     h3_packed_seq_len,
     max_packed_rows_for_budget,
+    qwen_edit_packed_layout,
     validate_a2v_lora_targets,
     validate_batch_size,
     validate_conditioning_items,
@@ -48,6 +53,11 @@ from signet_trainer.config.validators import (
     validate_height,
     validate_inpaint_dims,
     validate_inpaint_resolution_buckets,
+    validate_qwen_edit_frames,
+    validate_qwen_edit_lora_coverage,
+    validate_qwen_edit_rank_alpha_lock,
+    validate_qwen_edit_resolution_buckets,
+    validate_qwen_edit_row_budget,
     validate_resolution_buckets,
     validate_training_dims,
     validate_volume_relative_path,
@@ -73,6 +83,26 @@ LTX_DEFAULT_LORA_TARGETS: tuple[str, ...] = (
     "ff.net.0.proj",
     "ff.net.2",
 )
+
+# Which model FAMILIES each family-only ``ModelConfig`` ID is legal under (the lean field-split, per
+# field rather than per block). Set one of these under a family that is not in its allowlist and the
+# value would be SILENTLY IGNORED — the same class of defect the h3/qwen_edit block reverse guards
+# kill, so it dies at config load the same way.
+#
+# ⚠ Why this replaced a flat ``("vae_id", "audio_vae_id")`` H3-only tuple: Qwen-Image-Edit needs a
+# ``vae_id`` too (``qwen_image_vae.safetensors``), so "not h3 -> reject vae_id" became wrong the
+# moment family #3 landed. Getting this wrong in the PERMISSIVE direction (widening to every family
+# rather than to a named set) would silently hand LTX a no-op knob back, which is why this is an
+# allowlist per field and not a family check per call site.
+#
+# Closed for free on the way past: ``pipeline_root_id`` was never in the old tuple at all, so an LTX
+# config could set it with no error and no consumer (``modal/fns.py:4432`` reads it only on the h3
+# sample path).
+_FAMILY_ONLY_MODEL_IDS: dict[str, frozenset[str]] = {
+    "vae_id": frozenset({"h3", "qwen_edit"}),
+    "audio_vae_id": frozenset({"h3"}),
+    "pipeline_root_id": frozenset({"h3"}),
+}
 
 
 class _Base(BaseModel):
@@ -206,16 +236,20 @@ class ModelConfig(_Base):
     # ``minimax-h3/text_encoder``, ``minimax-h3/vae``, ``minimax-h3/audio_vae``), so there is no
     # suffix to sniff and any heuristic would be a guess. Defaults to ``ltx`` so every pre-Phase-10
     # config loads byte-identically.
-    family: Literal["ltx", "h3"] = Field(
+    family: Literal["ltx", "h3", "qwen_edit"] = Field(
         default="ltx",
-        description="Model FAMILY discriminator ('ltx' | 'h3'). Selects the LoRA target form (LTX "
-        "suffix list vs the H3 path regex) and which frame law / budget checks run at config load. "
-        "Explicit by design: H3 model IDs are directories, so there is no filename to sniff.",
+        description="Model FAMILY discriminator ('ltx' | 'h3' | 'qwen_edit'). Selects the LoRA "
+        "target form (LTX suffix list vs the H3 path regex vs the Qwen 14-leaf path regex) and "
+        "which frame law / budget checks run at config load. Explicit by design: H3 model IDs are "
+        "directories and Qwen-Image-Edit's is a bare .safetensors filename indistinguishable in "
+        "SHAPE from LTX's, so there is nothing to sniff in either case.",
     )
     vae_id: str | None = Field(
         default=None,
-        description="H3-only: VAE dir under WEIGHTS_DIR (e.g. 'minimax-h3/vae'). None for LTX, "
-        "whose VAE ships inside the single checkpoint. DATA only — never FS-checked here (Pitfall 1).",
+        description="H3 / qwen_edit: VAE dir or file under WEIGHTS_DIR (e.g. 'minimax-h3/vae', "
+        "'qwen_image_vae.safetensors'). None for LTX, whose VAE ships inside the single checkpoint. "
+        "Legal families are declared in _FAMILY_ONLY_MODEL_IDS. DATA only — never FS-checked here "
+        "(Pitfall 1).",
     )
     audio_vae_id: str | None = Field(
         default=None,
@@ -490,6 +524,138 @@ class H3Config(_Base):
                 f"CONSTANT across the corpus and invite copy-collapse."
             )
         return v
+
+
+class QwenEditConfig(_Base):
+    """Qwen-Image-Edit-2511 tunables — family #3, the chained-edit family.
+
+    Same doctrine as ``H3Config``: D-NOHARDCODE, so none of these may ever be a literal in code —
+    each one is documented, defaulted to the decided value, and fail-fast validated on CPU BEFORE
+    any GPU is touched. Only meaningful when ``model.family == 'qwen_edit'``; ``SignetConfig``
+    carries the bidirectional lean field-split REVERSE guard that rejects a non-default value under
+    any other family, so this block can never be silently ignored.
+
+    ⚠ One structural difference from ``H3Config`` worth reading before trusting a number here. H3's
+    budget triple (``gpu_usable_gib`` / ``resident_gib`` / ``mib_per_packed_row``) is MEASURED, so
+    H3 can DERIVE a packed-row ceiling and refuse an over-budget geometry. **No equivalent
+    measurement exists for Qwen-Image-Edit on any card in this program.** ``max_packed_rows``
+    therefore defaults to ``0`` = ceiling DISABLED, the row layout is computed and reported but
+    nothing is refused, and the dry-run banner is required to say ``ceiling=DISABLED (unmeasured)``
+    in that state. Synthesising a plausible ceiling from H3's A100 numbers would be a different
+    model with a different row width and different resident weights — i.e. a guess wearing a
+    measurement's clothes. When someone measures the real OOM boundary they set the integer and the
+    refusal turns on.
+
+    Deliberately NOT fields here: any qfloat8 / quantization switch, and any "which stage runs"
+    mode knob. The house recipe locks the quantization (``qfloat8`` model + text encoder) the same
+    way it locks the optimizer, and a recipe block must never be able to change a Modal function's
+    OPERATIONAL mode (the ``arch_smoke_only`` precedent on ``H3Config``).
+    """
+
+    control_slots: int = Field(
+        default=QWEN_EDIT_MAX_CONTROL_SLOTS,
+        ge=1,
+        le=QWEN_EDIT_MAX_CONTROL_SLOTS,
+        description="How many control-image slots every sample carries. The cap is ai-toolkit's: "
+        "its prompt template exposes ctrl_img_1..3 and nothing beyond "
+        "(qwen_image_edit_plus.py:105-122). The count is FIXED, not per-sample — a sample with "
+        "fewer real control images is blank-padded to this many slots (see blank_slot_fill), so "
+        "the packed sequence length is a constant of the config rather than a property of the row. "
+        "A variable-length sequence would make the row budget a distribution instead of a number, "
+        "and the entire point of pricing at config load is that the answer is one integer.",
+    )
+    blank_slot_fill: Literal["black", "white", "gray"] = Field(
+        default="black",
+        description="Which synthetic image fills a control slot that has no real image for this "
+        "sample. A DECLARED choice rather than an implicit zero-tensor, because the fill is a "
+        "visual input the adapter sees on every padded row and 'black' vs 'gray' is not a "
+        "cosmetic difference to a VAE.",
+    )
+    control_area_px: int = Field(
+        default=QWEN_EDIT_VAE_IMAGE_SIZE,
+        ge=1024,
+        description="Pixel-AREA budget each control image is fitted to before the VAE encodes it "
+        "(channel B). TRANSCRIBED, not chosen: diffusers' "
+        "pipeline_qwenimage_edit_plus.py:67 VAE_IMAGE_SIZE = 1024*1024. An arbitrarily-sized "
+        "control image is resized to this budget, so slot cost does not vary with source "
+        "resolution — which is exactly why the packed length is knowable at config load.",
+    )
+    condition_area_px: int = Field(
+        default=QWEN_EDIT_CONDITION_IMAGE_SIZE,
+        ge=1024,
+        description="Pixel-AREA budget each control image is fitted to for the Qwen2.5-VL text "
+        "encoder (channel A). TRANSCRIBED: pipeline_qwenimage_edit_plus.py:66 "
+        "CONDITION_IMAGE_SIZE = 384*384. ⚠ The SAME control image goes down BOTH channels at "
+        "DIFFERENT sizes — ai-toolkit's encode_control_in_text_embeddings is True "
+        "(qwen_image_edit_plus.py:66), so the VL encoder sees a 384x384-budget copy while the VAE "
+        "sees a 1024x1024-budget copy. Conflating the two budgets is the easy mistake here.",
+    )
+    prompt_tokens_estimate: int = Field(
+        default=256,
+        ge=1,
+        description="Token budget the packed-row layout assumes for the caption. An ESTIMATE used "
+        "ONLY for the layout/budget arithmetic — it is never the real tokenization, which happens "
+        "Modal-side against the actual Qwen2.5-VL encoder. Mirrors H3Config.prompt_tokens_estimate.",
+    )
+    text_embed_dim: int = Field(
+        default=3584,
+        ge=1,
+        description="[UNVERIFIED] Width of a Qwen2.5-VL text embedding, used ONLY as a synthetic "
+        "shape in the zero-GPU dry-run. The TRUE value is ``txt_in.in_features`` in the live "
+        "checkpoint, and the measured ground truth this family was specified from enumerates the "
+        "60 transformer blocks but NOT txt_in's shape — so this number is carried as a declared "
+        "assumption, not a fact. The weight-loading pass MUST assert it against the real txt_in and "
+        "correct it here if it differs; nothing downstream may treat it as measured until then.",
+    )
+    rank_alpha_lock: int | None = Field(
+        default=42,
+        ge=2,
+        description="The rank == alpha value locked across every round of a chain "
+        "(QWEN-CHAINED-EDIT-METHOD.md: only dataset / name / steps change between rounds). "
+        "Machine-checked at config load rather than remembered, because lora_A/lora_B are "
+        "RANK-SHAPED: change the rank mid-chain and no later round can warm-start from an earlier "
+        "one, and a published primer becomes unloadable. ``null`` is the deliberate exit from the "
+        "chain — it still requires rank == alpha (PEFT scale 1.0) and then FORBIDS "
+        "training.init_adapter_path.",
+    )
+    max_packed_rows: int = Field(
+        default=0,
+        ge=0,
+        description="Packed-row ceiling for the refusal check. ``0`` = ceiling DISABLED, which is "
+        "the honest default: no MiB-per-row figure has been MEASURED for Qwen-Image-Edit on any "
+        "card in this program, and H3's measured triple prices a different model at a different "
+        "row width. With 0 the layout is still computed and printed — it is simply not used to "
+        "refuse anything, and the banner must say so. Set the integer once the real OOM boundary "
+        "is measured; the refusal turns on with it.",
+    )
+    caption_dropout_rate: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="P(replace this sample's caption with the empty string for one step) — "
+        "unconditional-branch regularization. ZERO FOOTPRINT in signet today (no consumer exists "
+        "yet), declared here rather than on ``data``/``training`` because a shared block is exactly "
+        "what gets SILENTLY IGNORED under a family that has no consumer, and LTX has none. If LTX "
+        "ever gains one, this field PROMOTES to ``data`` in the same commit as its LTX consumer — "
+        "never before. See the cache_text_embeddings cross-check: a non-zero rate under caching is "
+        "refused rather than silently trained at 0.",
+    )
+    cache_text_embeddings: bool = Field(
+        default=True,
+        description="Pre-compute and cache the Qwen2.5-VL text embeddings instead of encoding live "
+        "each step. Effectively REQUIRED at >= 2 control slots: ai-toolkit's multi-slot path reads "
+        "only the cached batch.control_tensor (SDTrainer.py:1509-1510), so signet mirrors the "
+        "requirement rather than inventing a live multi-slot encode it has never run.",
+    )
+    control_cache_key_mode: Literal["path", "content"] = Field(
+        default="content",
+        description="What the control-image cache key hashes. ⚠ 'path' reproduces ai-toolkit "
+        "BIT-FOR-BIT and that is the ONLY reason it exists: ai-toolkit hashes the control PATH "
+        "STRING (dataloader_mixins.py:1971-1984), so overwriting a control file IN PLACE reuses a "
+        "STALE VL embedding — and overwriting control images in place is precisely the chained-edit "
+        "workflow this family is for. 'content' (the default) hashes the file BYTES and is correct "
+        "for any chain; choose 'path' only when bug-compatibility with ai-toolkit is the goal.",
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1611,6 +1777,10 @@ class SignetConfig(_Base):
     # byte-identically. Only meaningful when model.family == 'h3'; the REVERSE guard in
     # _cross_field_checks rejects a non-default value under any other family.
     h3: H3Config = Field(default_factory=H3Config)
+    # Qwen-Image-Edit-2511 family block (family #3) — every field defaulted, so every LTX and H3
+    # config loads byte-identically. Only meaningful when model.family == 'qwen_edit'; the REVERSE
+    # guard in _cross_field_checks rejects a non-default value under any other family.
+    qwen_edit: QwenEditConfig = Field(default_factory=QwenEditConfig)
 
     # top-level scalars mirrored from native config.
     seed: int = Field(default=42)
@@ -1645,15 +1815,26 @@ class SignetConfig(_Base):
         """The LoRA targets this run will actually inject — explicit override, else family default.
 
         Resolution order: an explicit ``lora.target_modules`` wins; otherwise the H3 path regex when
-        ``model.family == 'h3'``; otherwise the ten LTX suffixes. ``_cross_field_checks`` writes the
+        ``model.family == 'h3'``, or the Qwen 14-leaf path regex when ``model.family ==
+        'qwen_edit'``; otherwise the ten LTX suffixes. ``_cross_field_checks`` writes the
         result back onto ``lora.target_modules`` at config load, so this accessor and the field
         agree — a consumer may read either.
+
+        ⚠ The qwen_edit default is a REGEX for a different reason than H3's. H3 needed the anchor to
+        EXCLUDE collateral (``token_refiner.refiner_blocks.*``, 12 modules). On Qwen the 14 suffixes
+        happen to be collateral-free today; the anchor is there because ai-toolkit's real inclusion
+        rule is "prefix ``transformer_blocks`` AND module type in {Linear, QLinear}"
+        (``lora_special.py:342-434``) and PEFT has no type filter, so the anchored path regex is the
+        only faithful expression of it — correct by construction rather than by coincidence of this
+        checkpoint's top-level module names.
         """
         explicit = self.lora.target_modules
         if explicit is not None:
             return explicit
         if self.model.family == "h3":
             return H3_LORA_TARGET_REGEX
+        if self.model.family == "qwen_edit":
+            return QWEN_EDIT_LORA_TARGET_REGEX
         return list(LTX_DEFAULT_LORA_TARGETS)
 
     @model_validator(mode="after")
@@ -1693,19 +1874,47 @@ class SignetConfig(_Base):
                 for name in H3Config.model_fields
                 if getattr(self.h3, name) != getattr(pristine_h3, name)
             ]
-            # vae_id / audio_vae_id live on ModelConfig (they are model IDs, not recipe knobs) but
-            # are just as H3-only, and just as silently ignored under LTX — same doctrine, same raise.
-            nondefault_h3 += [
-                name
-                for name in ("vae_id", "audio_vae_id")
-                if getattr(self.model, name) is not None
-            ]
             if nondefault_h3:
                 raise ValueError(
                     f"H3 field(s) {nondefault_h3} set while model.family is "
                     f"{self.model.family!r}: the h3 block (and the H3-only model IDs) is only valid "
                     f"when model.family == 'h3' (lean field-split — no silently-ignored config "
                     f"block). Remove them or set model.family: h3."
+                )
+        # Family #3 REVERSE guard — the same bidirectional lean field-split, same shape, same
+        # PRISTINE-instance technique so a qwen_edit field added later is covered automatically and
+        # the guard cannot drift out of sync with the block (T-10-05-T).
+        if self.model.family != "qwen_edit":
+            pristine_qe = QwenEditConfig()
+            nondefault_qe = [
+                name
+                for name in QwenEditConfig.model_fields
+                if getattr(self.qwen_edit, name) != getattr(pristine_qe, name)
+            ]
+            if nondefault_qe:
+                raise ValueError(
+                    f"qwen_edit field(s) {nondefault_qe} set while model.family is "
+                    f"{self.model.family!r}: the qwen_edit block is only valid when "
+                    f"model.family == 'qwen_edit' (lean field-split — no silently-ignored config "
+                    f"block). Remove them or set model.family: qwen_edit."
+                )
+        # The family-only MODEL IDS (they live on ModelConfig — they are model IDs, not recipe
+        # knobs — but are just as silently ignored under a family that reads none of them). This ran
+        # as a flat "not h3 -> reject vae_id / audio_vae_id" list until family #3, which BREAKS on
+        # qwen_edit: Qwen-Image-Edit ships its VAE as a separate file and legitimately needs vae_id.
+        # An allowlist PER FIELD is the shape that survives a fourth family; widening the check to
+        # "any non-ltx family" instead would have silently handed LTX a no-op knob back.
+        for _id_field, _allowed_families in _FAMILY_ONLY_MODEL_IDS.items():
+            if (
+                getattr(self.model, _id_field) is not None
+                and self.model.family not in _allowed_families
+            ):
+                raise ValueError(
+                    f"model.{_id_field} is set while model.family is {self.model.family!r}: that "
+                    f"ID is only read under family "
+                    f"{{{', '.join(repr(f) for f in sorted(_allowed_families))}}} and would be "
+                    f"silently ignored here (lean field-split — no silently-ignored config block). "
+                    f"Remove it or set a family that consumes it."
                 )
         # Phase 10 (H3-04) FAMILY-EXACT geometry + budget. The field-level validators above are only
         # a both-families PRE-SCREEN (a sub-model cannot see model.family, and training_dims is
@@ -1754,6 +1963,89 @@ class SignetConfig(_Base):
                     self.h3.reference_image_short_edge,
                 )
                 validate_h3_seq_len_budget(layout.total, max_rows)
+        elif self.model.family == "qwen_edit":
+            # Family #3 FAMILY-EXACT geometry. Note what is NOT here: no pre-screen was widened for
+            # qwen_edit, and none needed to be. Its frame law (F == 1 exactly) is a strict SUBSET of
+            # LTX's ((F - 1) % 8 == 0, which admits 1), and its spatial rule is LTX's %32 verbatim —
+            # so every qwen-legal geometry already passes the field-level pre-screens untouched.
+            # The consequence runs the other way and is the whole reason this arm exists: an F of 9
+            # sails through the pre-screen WITH LTX'S BLESSING and would reach the packer as a
+            # nine-frame video request against an image model. These two lines are the only guard.
+            validate_qwen_edit_frames(self.training_dims[2])
+            validate_qwen_edit_resolution_buckets(self.data.resolution_buckets)
+            # The chained-edit rank/alpha lock (rank == alpha == 42 across every round). CPU, at
+            # config load, before any dispatch — a rank change mid-chain re-shapes lora_A/lora_B, so
+            # it must be caught here and not by a partial state-dict load in a metered container.
+            validate_qwen_edit_rank_alpha_lock(self.lora, self.qwen_edit, self.training)
+            # Coverage over the FOURTEEN dual-stream leaves, on the RESOLVED targets — so it guards
+            # the explicit override and the family default alike. Reads the written-back value from
+            # the top of this method, which is why the write-back has to happen first.
+            validate_qwen_edit_lora_coverage(self.resolved_lora_targets())
+            # Chain INTERLOCK: covering all fourteen is enough for a fresh round but NOT for a warm
+            # start. should_warm_start (train/loop.py:177-189) is a weights-only load at step 0, so
+            # the resumed adapter must be shape-identical end to end — a SUPERSET re-shapes nothing
+            # yet still changes the module set, and the extra modules would load from nothing.
+            if self.training.init_adapter_path is not None:
+                if self.lora.target_modules != QWEN_EDIT_LORA_TARGET_REGEX:
+                    raise ValueError(
+                        f"training.init_adapter_path is set "
+                        f"({self.training.init_adapter_path!r}) but lora.target_modules is not the "
+                        f"qwen_edit family default: a chained round must be SHAPE-IDENTICAL to the "
+                        f"round it resumes, and covering all fourteen leaves is not the same as "
+                        f"matching the module set (a superset warm-starts its extra modules from "
+                        f"nothing). Remove the lora.target_modules override so the family default "
+                        f"is used, or drop init_adapter_path to train a fresh adapter."
+                    )
+            # LTX reference-control modes are structurally foreign here: qwen_edit conditioning is
+            # the multi-SLOT control-image mechanism declared on the qwen_edit block (encoded
+            # through BOTH the VL encoder and the VAE), not a ConditioningStrategy mode. A
+            # non-'none' mode would select machinery this family has none of.
+            if self.conditioning.mode != "none":
+                raise ValueError(
+                    f"conditioning.mode is {self.conditioning.mode!r} while model.family is "
+                    f"'qwen_edit': the LTX reference-control modes (single_frame / multi_frame / "
+                    f"ic_lora / inpaint / audio_to_video) have no qwen_edit implementation — this "
+                    f"family's conditioning is the multi-slot CONTROL-IMAGE mechanism declared on "
+                    f"the qwen_edit block (control_slots / control_area_px / condition_area_px). "
+                    f"Set conditioning.mode: none and configure the slots there."
+                )
+            # validation.frame_count defaults to 49 (an LTX clip length), so a qwen_edit config that
+            # simply omits the validation block would request a 49-FRAME render from an image model.
+            # Defaulting per-family would be the wrong fix — `validation` is shared, and a
+            # family-conditional default is invisible in the YAML. Make the operator state it.
+            if self.validation.frame_count != 1:
+                raise ValueError(
+                    f"validation.frame_count is {self.validation.frame_count} while model.family "
+                    f"is 'qwen_edit': Qwen-Image-Edit is an IMAGE model and renders exactly one "
+                    f"frame. The shared default is 49 (an LTX clip length), so this fires on a "
+                    f"config that merely OMITS the validation block rather than one that gets it "
+                    f"wrong. Set validation.frame_count: 1."
+                )
+            # A cached text embedding is computed ONCE per (caption, control) key, so a per-step
+            # caption dropout can never reach it. ai-toolkit resolves the collision by HARD-DISABLING
+            # caption dropout under caching (dataloader_mixins.py:402,417) — i.e. it silently trains
+            # at rate 0. Refuse at config load instead; a knob that reads as set and behaves as unset
+            # is the exact class the lean field-split exists to kill.
+            if self.qwen_edit.caption_dropout_rate > 0.0 and self.qwen_edit.cache_text_embeddings:
+                raise ValueError(
+                    "qwen_edit.caption_dropout_rate > 0 with cache_text_embeddings: true — a "
+                    "cached text embedding is computed once per (caption, control) key, so a "
+                    "per-step caption dropout cannot reach it. ai-toolkit resolves this by "
+                    "HARD-DISABLING caption dropout under caching "
+                    "(dataloader_mixins.py:402,417); signet refuses at config load instead of "
+                    "silently training at rate 0. Either set caption_dropout_rate: 0.0, or set "
+                    "cache_text_embeddings: false — which control_slots >= 2 does not currently "
+                    "support."
+                )
+            # Price the packed sequence ALWAYS; refuse only against a ceiling someone MEASURED.
+            # The layout call is not optional even with the ceiling disabled: it is what validates
+            # control_slots against the ai-toolkit 1..3 cap and prompt_tokens_estimate positivity,
+            # and it is what the dry-run banner reports. See QwenEditConfig.max_packed_rows for why
+            # there is no derived ceiling here and why the banner must print
+            # "ceiling=DISABLED (unmeasured)" rather than a headroom number.
+            layout = qwen_edit_packed_layout(self.training_dims, self.qwen_edit)
+            if self.qwen_edit.max_packed_rows:
+                validate_qwen_edit_row_budget(layout.total, self.qwen_edit.max_packed_rows)
         else:
             # LTX family: re-assert the EXACT LTX law that the widened pre-screens deliberately let
             # through, so the widening created no hole. Identical messages, identical verdicts — an

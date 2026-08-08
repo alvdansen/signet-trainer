@@ -36,6 +36,7 @@ from signet_trainer.inference.render_key import h3_render_key
 __all__ = [
     "SAMPLES_SUBDIR_BY_FAMILY",
     "expected_h3_render_key",
+    "expected_qwen_edit_render_key",
     "landed_render_ids",
     "samples_root",
     "samples_subdir",
@@ -45,9 +46,18 @@ __all__ = [
 #: Transcribed from ``modal/fns.py`` (``"samples_h3" / h3_render_key(...)`` for H3; the LTX
 #: ``sample`` branch's ``samples*`` dirs) — NOT guessed. ``samples_text_to_video`` is never written
 #: by anything (training-review §2 WR-08); do not add it here on the strength of a mode name.
+#:
+#: ``qwen_edit`` (family #3) is RESERVED here rather than transcribed: no Qwen sample fn exists yet.
+#: Reserving it is the money-safe move and it is why this dict is not a "register when you build it"
+#: table. ``samples_subdir`` raises on an unknown family, and the FIRST thing anyone wiring a Qwen
+#: render will do is discover that raise and reach for the shortest fix — which, without an entry
+#: here, is to point the watcher at ``"samples"`` and re-open the phantom-spend hole this module
+#: exists to close. Claiming the name now costs one line and makes that shortcut unavailable. The
+#: ``landed_render_ids`` arm below is a LOUD stub, so nothing can accidentally verify against it.
 SAMPLES_SUBDIR_BY_FAMILY = {
     "ltx": "samples",
     "h3": "samples_h3",
+    "qwen_edit": "samples_qwen_edit",
 }
 
 #: A LTX render dir is a UTC wall-clock stamp: ``samples/20260805T154357Z/``.
@@ -103,6 +113,39 @@ def expected_h3_render_key(
     )
 
 
+def expected_qwen_edit_render_key(**kwargs: Any) -> str:
+    """DECLARED STUB — the ``qwen_edit`` render identity does not exist yet.
+
+    Raises unconditionally and on purpose. The CPU dry-run milestone ships no Qwen sampler, no grid
+    builder and no render key, so there is nothing to transcribe here — and a *guess* would be worse
+    than a gap, because the watcher's whole contract is that the key it checks for is byte-identical
+    to the key the render writes. A plausible-looking guess is how a render that succeeded gets
+    marked FAILED and re-dispatched at full price.
+
+    ⚠ Two things must be settled TOGETHER when this lands, and settling only the first is the trap:
+    an ``h3``-shaped key (``<ckpt>_s<seed>_f<frames>_<ids>``) carries ``_f<frames>``, which is
+    meaningless for an image family where F is pinned to 1 — so the identity axes are the checkpoint,
+    the seed, and *which control images were fed*. Whatever shape is chosen, ``_QWEN_EDIT_KEY_RE``
+    and the ``landed_render_ids`` arm below must be updated in the SAME commit, or the watcher will
+    parse zero landed renders out of a directory full of them.
+    """
+    raise NotImplementedError(
+        "[qwen_edit] expected_qwen_edit_render_key is a DECLARED STUB (no Qwen sampler exists yet). "
+        f"Called with {sorted(kwargs)}. The CPU dry-run milestone deliberately ships no render "
+        "surface; this raise exists so the gap announces itself at the call site rather than "
+        "degrading into a guessed key that makes every successful render look FAILED and get "
+        "re-dispatched at full price. Land it in the sampler pass together with "
+        "inference/render_key.py's qwen_edit key builder, the _QWEN_EDIT_KEY_RE below, the "
+        "landed_render_ids arm, and their tests."
+    )
+
+
+#: A ``qwen_edit`` render dir has NO agreed shape yet — see ``expected_qwen_edit_render_key``.
+#: Deliberately ``None`` rather than a speculative pattern: ``landed_render_ids`` checks it and
+#: raises, so the absence is a loud stop instead of a regex that quietly matches nothing.
+_QWEN_EDIT_KEY_RE = None
+
+
 def landed_render_ids(listing: str, family: str) -> list[str]:
     """Every committed render identity visible in a ``modal volume ls`` listing, sorted.
 
@@ -112,10 +155,24 @@ def landed_render_ids(listing: str, family: str) -> list[str]:
       * ``ltx`` -> the UTC stamps, the historical behaviour, byte-for-byte.
       * ``h3``  -> the identity keys, so two renders differing ONLY in reference condition or frame
         count are two distinct ids rather than one.
+      * ``qwen_edit`` -> RAISES. There is no Qwen render key yet (see
+        ``expected_qwen_edit_render_key``), and the H3 arm below is NOT a safe default for it: an
+        H3-shaped listing parse against Qwen dir names returns ``[]`` for a directory full of
+        successful renders, which reads to the watcher as "nothing landed" and re-dispatches every
+        one of them. An explicit arm is required precisely because the fall-through is silent.
     """
     subdir = samples_subdir(family)  # validates the family first — unknown families raise here
     if family == "ltx":
         return sorted(set(_LTX_STAMP_RE.findall(listing or "")))
+    if family == "qwen_edit":
+        raise NotImplementedError(
+            "[qwen_edit] landed_render_ids is a DECLARED STUB: the render-key shape for family "
+            f"'qwen_edit' is not defined yet, so {subdir!r} cannot be parsed. Falling through to "
+            "the H3 key regex would return [] for a directory of SUCCESSFUL renders — the watcher "
+            "would read that as 'nothing landed', never mark the step rendered, and re-book the "
+            "full per-render estimate on every poll (KNOWLEDGE.md 'watcher phantom-spend'). Define "
+            "the key in expected_qwen_edit_render_key first, then _QWEN_EDIT_KEY_RE, then this arm."
+        )
 
     found: set[str] = set()
     for raw in (listing or "").splitlines():

@@ -1,0 +1,106 @@
+# Qwen-Image-Edit-2511 chained-edit round 1 — model family #3 (`qwen_edit`).
+#
+# Loads clean and passes the zero-GPU hard gate:
+#   PYTHONPATH=src python -m signet_trainer.dryrun configs/qwen_image_edit.example.yaml
+#
+# IMAGE family: F == 1 everywhere. Note that LTX's frame law ALREADY admits 1 — (1 - 1) % 8 == 0,
+# probe-verified on this tree — so the shared both-families pre-screen cannot catch a video frame
+# count here. The qwen_edit arm pins F EXACTLY to 1 so a `9` typo cannot ride LTX's law through.
+training_dims: [1024, 1024, 1]
+
+data:
+  preprocessed_data_root: /dataset/.precomputed_qwen_edit_r1
+  metadata_path: dataset/qwen_edit_r1/metadata.jsonl
+  num_dataloader_workers: 2
+  batch_size: 1
+  resolution_buckets:
+    - 1024x1024x1
+
+lora:
+  # HARD LOCK across a chain (QWEN-CHAINED-EDIT-METHOD.md). rank == alpha -> PEFT scale 1.0.
+  # Changing either mid-chain re-shapes lora_A/lora_B and makes the published primer unloadable —
+  # enforced at config load by qwen_edit.rank_alpha_lock, not left to memory.
+  rank: 42
+  alpha: 42
+  dropout: 0.0
+  # target_modules DELIBERATELY OMITTED. Omission selects the FAMILY default: the anchored 14-leaf
+  # path regex over `transformer_blocks.\d+.` (840 modules = 14 leaves x 60 blocks).
+  #
+  # Do NOT paste the LTX suffix list here. Qwen-Image-Edit is a dual-stream MMDiT and has no
+  # `attn1.` / `attn2.` / `ff.` path anywhere, so the LTX list matches ZERO modules — and the
+  # "no trainable parameters" guard that would eventually catch that lives in the training loop,
+  # on a metered GPU, not at config load. validate_qwen_edit_lora_coverage refuses it here instead,
+  # in both directions: a six-leaf "attention + image MLP" adapter is refused too, because dropping
+  # the four txt_* leaves and the two *_mod.1 projections is a DIFFERENT SHAPE, not a smaller one,
+  # and it cannot warm-start from a 14-leaf primer.
+
+training:
+  max_steps: 2000
+  learning_rate: 5.0e-5      # constant; house recipe, locked
+  weight_decay: 0.01
+  optimizer: adamw8bit
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  scheduler: constant
+  warmup_steps: 0
+  checkpoint_every: 250
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+  # Round 2+ of a chain sets this to round 1's final adapter dir. When set, the qwen_edit arm
+  # additionally requires the resolved targets to be BYTE-EQUAL to the family default — a warm start
+  # is the one operation where "covers all fourteen" is not enough, because a superset warm-starts
+  # its extra modules from nothing.
+  # init_adapter_path: outputs/qwen_edit_r1/checkpoints/step-2000
+
+model:
+  family: qwen_edit
+  model_id: qwen_image_edit_2511_bf16.safetensors
+  text_encoder_id: qwen2.5-vl-fp8-scaled
+  vae_id: qwen_image_vae.safetensors
+
+qwen_edit:
+  control_slots: 3
+  blank_slot_fill: black
+  control_area_px: 1048576     # VAE_IMAGE_SIZE   — pipeline_qwenimage_edit_plus.py:67
+  condition_area_px: 147456    # CONDITION_IMAGE_SIZE — same file, :66 (the VL channel, NOT the VAE)
+  prompt_tokens_estimate: 256
+  text_embed_dim: 3584         # [UNVERIFIED] — the loader pass must assert this against txt_in
+  rank_alpha_lock: 42
+  max_packed_rows: 0           # UNMEASURED -> ceiling disabled; the banner says so explicitly
+  caption_dropout_rate: 0.0
+  cache_text_embeddings: true
+  control_cache_key_mode: content
+
+offload:
+  blocks_to_swap: 0
+
+modal:
+  hourly_rate_usd: 1.64
+  cost_guardrail_usd: 50.0
+  est_hours: 3.0
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250                # save_every == sample_every (house recipe)
+  # REQUIRED, not optional: the shared default is 49 (an LTX clip length), so a qwen_edit config
+  # that merely OMITS this block would request a 49-frame render from an image model.
+  frame_count: 1
+  width: 1024
+  height: 1024
+  guidance_scale: 4.0
+  num_samples: 1
+  seed: 42
+  prompts:
+    - "the same subject, three-quarter view, neutral studio light"
+
+conditioning:
+  # REQUIRED on qwen_edit. The LTX reference-control modes have no implementation for this family;
+  # its conditioning is the multi-SLOT control-image mechanism declared in the qwen_edit block above.
+  mode: none
+
+seed: 42
+output_dir: outputs/qwen_edit_r1

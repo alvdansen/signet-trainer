@@ -29,6 +29,7 @@ OOM in a PAID container.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from pathlib import PurePosixPath, PureWindowsPath
 
@@ -62,6 +63,26 @@ from signet_trainer.conditioning.h3_geometry import (
     h3_packed_seq_len,
     h3_worst_case_packed_seq_len,
     max_packed_rows_for_budget,
+)
+
+# Single home for the Qwen-Image-Edit-2511 arch math (family #3). Re-export, do not duplicate.
+# ``qwen_edit_geometry`` is the same CONFINED tier as ``h3_geometry`` — stdlib + dataclasses only —
+# so this import adds ZERO new third-party roots to the ``config.validators`` closure (and therefore
+# to ``modal/app.py::download_image``'s).
+from signet_trainer.conditioning.qwen_edit_geometry import (
+    QWEN_EDIT_BLOCK_COUNT,
+    QWEN_EDIT_CANVAS_MULTIPLE,
+    QWEN_EDIT_CONDITION_IMAGE_SIZE,
+    QWEN_EDIT_FRAMES,
+    QWEN_EDIT_LATENT_CHANNELS,
+    QWEN_EDIT_MAX_CONTROL_SLOTS,
+    QWEN_EDIT_PATCH_DIM,
+    QWEN_EDIT_PIXELS_PER_ROW_EDGE,
+    QWEN_EDIT_VAE_IMAGE_SIZE,
+    QwenEditPackedLayout,
+    qwen_edit_packed_layout,
+    qwen_edit_rows_of,
+    qwen_edit_vae_latent_shape,
 )
 
 __all__ = [
@@ -110,6 +131,29 @@ __all__ = [
     "h3_packed_seq_len",
     "h3_worst_case_packed_seq_len",
     "max_packed_rows_for_budget",
+    # --- Qwen-Image-Edit-2511 (family #3) ----------------------------------------------------
+    "QWEN_EDIT_LORA_LEAVES",
+    "QWEN_EDIT_LORA_TARGET_REGEX",
+    "validate_qwen_edit_frames",
+    "validate_qwen_edit_resolution_bucket",
+    "validate_qwen_edit_resolution_buckets",
+    "validate_qwen_edit_rank_alpha_lock",
+    "validate_qwen_edit_lora_coverage",
+    "validate_qwen_edit_row_budget",
+    # Re-exported qwen_edit geometry (defined in conditioning/qwen_edit_geometry.py, NOT here).
+    "QWEN_EDIT_BLOCK_COUNT",
+    "QWEN_EDIT_CANVAS_MULTIPLE",
+    "QWEN_EDIT_CONDITION_IMAGE_SIZE",
+    "QWEN_EDIT_FRAMES",
+    "QWEN_EDIT_LATENT_CHANNELS",
+    "QWEN_EDIT_MAX_CONTROL_SLOTS",
+    "QWEN_EDIT_PATCH_DIM",
+    "QWEN_EDIT_PIXELS_PER_ROW_EDGE",
+    "QWEN_EDIT_VAE_IMAGE_SIZE",
+    "QwenEditPackedLayout",
+    "qwen_edit_packed_layout",
+    "qwen_edit_rows_of",
+    "qwen_edit_vae_latent_shape",
 ]
 
 # Reference-control modes signet accepts TODAY (Phase 9). Phase 5 shipped {none, single_frame};
@@ -161,6 +205,56 @@ H3_LORA_TARGET_REGEX = (
     r"transformer_blocks\.\d+\."
     r"(attn\.to_q|attn\.to_k|attn\.to_v|attn\.to_out\.0|ff\.net\.0\.proj|ff\.net\.2)"
 )
+
+# Qwen-Image-Edit-2511 LoRA leaves (family #3) — the FOURTEEN LoRA-targetable ``Linear`` leaves per
+# transformer block, MEASURED on the live checkpoint (``qwen_image_edit_2511_bf16.safetensors``,
+# 40,861,031,560 B, 1934 tensors, 60 blocks, hidden dim 3072). Kept HERE for exactly the reason
+# ``H3_LORA_TARGET_REGEX`` and ``A2V_CROSS_MODAL_ATTN_TARGETS`` are: ``schema.py`` must select the
+# family default WITHOUT importing the heavy ``lora/peft.py`` (which pulls ``peft``/``torch`` and
+# would widen ``modal/app.py::download_image``'s closure — the BK-01 landmine). ``lora/peft.py``
+# DERIVES a byte-identical copy from its own leaf lists and a test asserts the two are equal, so the
+# single source of truth is enforced by TEST rather than by a cross-import.
+#
+# ⚠ FOURTEEN, not six. Qwen-Image-Edit is a DUAL-STREAM MMDiT: ``img_*`` and ``txt_*`` are separate
+# parameter sets joined only inside attention, so every leaf exists twice. The house LTX invariant
+# "attn1 + attn2 + ff.net" (TIER-TAXONOMY.yaml:48, HARD-FENCED D-07) transfers as an INTENT — never
+# ship an attention-only adapter, the MLP is where identity lives — but NOT as a literal list: its
+# six names match ZERO modules on this checkpoint (Qwen has no ``attn1.``/``attn2.``/``ff.`` path
+# anywhere), and a 6-of-14 adapter is a DIFFERENT SHAPE, not a smaller one. See
+# ``validate_qwen_edit_lora_coverage`` for what that costs a chained round.
+#
+# ⚠ A REGEX, not a suffix list. ai-toolkit's real inclusion rule is "prefix ``transformer_blocks``
+# AND module type in {Linear, QLinear}" (``lora_special.py:342-434``); PEFT has no type filter, so
+# the anchored PATH regex is the only faithful signet expression of it. On THIS checkpoint the 14
+# suffixes happen to be collateral-free (the non-block ``Linear`` leaves are ``img_in``, ``txt_in``,
+# ``norm_out.linear``, ``proj_out`` and the two ``time_text_embed`` projections — none suffix-match),
+# but that is a coincidence of this release, and an anchor costs nothing.
+QWEN_EDIT_LORA_LEAVES = (
+    # image-stream attention
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    # text-stream attention (the dual-stream half that a ported LTX list silently omits)
+    "attn.add_q_proj",
+    "attn.add_k_proj",
+    "attn.add_v_proj",
+    "attn.to_add_out",
+    # feed-forward, both streams — the "ff.net is ~2/3 of block params" fence, in Qwen's spelling
+    "img_mlp.net.0.proj",
+    "img_mlp.net.2",
+    "txt_mlp.net.0.proj",
+    "txt_mlp.net.2",
+    # AdaLN modulation projections, both streams
+    "img_mod.1",
+    "txt_mod.1",
+)
+
+#: The anchored path regex the 14 leaves compose to. Built from the tuple above rather than typed
+#: out, so a leaf added to the list cannot fail to reach the pattern.
+QWEN_EDIT_LORA_TARGET_REGEX = r"transformer_blocks\.\d+\.(" + "|".join(
+    leaf.replace(".", r"\.") for leaf in QWEN_EDIT_LORA_LEAVES
+) + r")"
 
 # D-10-REFPIN — the level a VISUAL conditioning row is pinned at, as a CONFIG DEFAULT.
 #
@@ -759,3 +853,249 @@ def validate_h3_reference_budget(
     )
     validate_h3_seq_len_budget(worst_layout.total, max_packed_rows, label=worst_label)
     return worst_layout
+
+
+# --------------------------------------------------------------------------------------------------
+# Qwen-Image-Edit-2511 (family #3). Same doctrine as the H3 block above: the geometry lives in
+# ``conditioning/qwen_edit_geometry.py`` and is re-exported, never duplicated. Nothing below
+# re-derives a row count, a patch dim or an area budget — each one arrives from that module or from
+# an argument.
+# --------------------------------------------------------------------------------------------------
+
+
+def validate_qwen_edit_frames(frames: int) -> int:
+    """Pin the frame count to EXACTLY 1 — Qwen-Image-Edit is an IMAGE model.
+
+    A NEW function rather than a parameterization of ``validate_frames`` / ``validate_h3_frames``,
+    and deliberately not a modulus at all: there is no law here, there is a single legal value.
+
+    ⚠ This pin is doing REAL work, not decoration. LTX's law is ``(F - 1) % 8 == 0`` and
+    ``(1 - 1) % 8 == 0``, so ``1`` is ALREADY legal under the both-families pre-screen in
+    ``SignetConfig._check_training_dims`` — which means a ``9`` typo in a qwen_edit config sails
+    through that pre-screen with LTX's blessing and would otherwise reach the packer as a
+    nine-frame video request against an image model. This is the only place that stops it.
+
+    Returns ``frames`` unchanged on success so it plugs straight into a Pydantic field_validator.
+    """
+    if frames != QWEN_EDIT_FRAMES:
+        raise ValueError(
+            f"invalid frame count {frames} for model.family 'qwen_edit': Qwen-Image-Edit-2511 is "
+            f"an IMAGE model and F must be EXACTLY {QWEN_EDIT_FRAMES}. Note that LTX's frame law "
+            f"ALSO admits 1 ((1 - 1) % {TIME_SCALE} == 0), so the shared pre-screen cannot catch "
+            f"this — a video frame count reaching here means this family-exact pin is the only "
+            f"guard standing. If you want video, you want a different family."
+        )
+    return frames
+
+
+def validate_qwen_edit_resolution_bucket(bucket: str) -> tuple[int, int, int]:
+    """Parse + validate ONE ``WxHxF`` qwen_edit bucket string, returning ``(W, H, F)``.
+
+    Same fail-fast contract and same return-the-parsed-triple divergence as
+    ``validate_h3_resolution_bucket`` (every qwen_edit caller needs the integers and would otherwise
+    re-split the string). Two rule changes from the LTX singular:
+
+      * the frame rule is ``validate_qwen_edit_frames`` — exactly 1, so ``1024x1024x9`` is refused
+        here even though it is a perfectly legal LTX bucket;
+      * the spatial rules are REUSED verbatim. ``QWEN_EDIT_CANVAS_MULTIPLE`` is 32, identical to
+        LTX's ``HEIGHT_SCALE``/``WIDTH_SCALE``, so re-implementing them would only create drift.
+        32 is twice the strict 16-pixel packing requirement (``QWEN_EDIT_PIXELS_PER_ROW_EDGE``),
+        which is what guarantees an EVEN latent edge and therefore an exact 2x2 patch pack.
+    """
+    parts = bucket.split("x")
+    if len(parts) != 3:
+        raise ValueError(
+            f"invalid resolution bucket {bucket!r}: expected 'WxHxF' — exactly three lowercase-'x'-"
+            f"separated integers (e.g. '1024x1024x1'); got {len(parts)} part(s)."
+        )
+    try:
+        width, height, frames = (int(part) for part in parts)
+    except ValueError:
+        raise ValueError(
+            f"invalid resolution bucket {bucket!r}: each of W, H, F must be an integer "
+            f"('WxHxF', e.g. '1024x1024x1')."
+        ) from None
+    validate_width(width)
+    validate_height(height)
+    validate_qwen_edit_frames(frames)
+    return (width, height, frames)
+
+
+def validate_qwen_edit_resolution_buckets(buckets: Sequence[str]) -> Sequence[str]:
+    """Validate every ``WxHxF`` qwen_edit bucket in a list, naming the offending index. Fail-fast.
+
+    Returns ``buckets`` UNCHANGED (the Pydantic field_validator shape) — the parsed triples are
+    available from the singular ``validate_qwen_edit_resolution_bucket``.
+    """
+    for i, bucket in enumerate(buckets):
+        try:
+            validate_qwen_edit_resolution_bucket(bucket)
+        except ValueError as exc:
+            raise ValueError(f"resolution_buckets[{i}]: {exc}") from None
+    return buckets
+
+
+def _qwen_edit_target_would_match(resolved: object, key: str) -> bool:
+    """Would ``resolved`` (a PEFT ``target_modules`` value) select the module named ``key``?
+
+    Mirrors PEFT's own two-form resolution so a coverage check answers the question PEFT will
+    actually be asked at injection time:
+
+      * a bare ``str`` is a REGEX matched with ``re.fullmatch``
+        (``check_target_module_exists`` -> ``match_target_against_key``) — NOT ``re.search``, which
+        would over-report by accepting ``...attn.to_q.base_layer``;
+      * a list/tuple is a SUFFIX list, matched on a DOT boundary, so ``to_q`` does not accidentally
+        satisfy a required ``add_q_proj`` and ``mlp.net.2`` does not satisfy ``txt_mlp.net.2``.
+
+    Kept private and local: ``lora/peft.py`` owns the injection-time probe against a real model, and
+    this is only the config-load question "does this target form cover the required leaf names?".
+    """
+    if isinstance(resolved, str):
+        return re.fullmatch(resolved, key) is not None
+    for target in resolved:
+        if key == target or key.endswith("." + target):
+            return True
+    return False
+
+
+def validate_qwen_edit_lora_coverage(resolved: object) -> object:
+    """Refuse a qwen_edit LoRA target set that does not cover all FOURTEEN required leaves.
+
+    Runs on EVERY qwen_edit config — default or explicit override — because it guards two failure
+    modes that point in opposite directions and neither one fails loud on its own:
+
+      1. **The ported LTX list.** Pasting LTX's suffixes into a qwen_edit config matches ZERO
+         modules on this checkpoint: Qwen has no ``attn1.`` / ``attn2.`` / ``ff.`` path anywhere.
+         ``train/loop.py``'s "no trainable parameters" guard WOULD eventually fire — on a metered
+         GPU, after the weights load, not at config load. (This is the mirror image of the H3
+         hazard at ``schema.py:164-171``, where the LTX list matched 104 WRONG modules and the
+         guard never fired at all.)
+      2. **The plausible six-leaf adapter.** Someone reads the house invariant "attn1 + attn2 +
+         ff.net" (``harness_data/TIER-TAXONOMY.yaml:48``, HARD-FENCED D-07) and writes the four
+         attention leaves plus the two image MLP leaves, dropping the four ``txt_*`` leaves and the
+         two ``*_mod.1`` projections. That is not a smaller adapter, it is a DIFFERENT SHAPE —
+         dual-stream MMDiT keeps ``img_*`` and ``txt_*`` as separate parameter sets. The
+         consequence is specific: such an adapter CANNOT warm-start from a published 14-leaf
+         primer, because ``train/loop.py:177-189``'s ``should_warm_start`` is a weights-only load
+         at step 0. Depending on ``strict``, that is either a hard key error deep inside a metered
+         container or — worse — a silent partial load that leaves eight leaves per block at init
+         while the optimizer trains all fourteen.
+
+    The house fence's INTENT (never ship an attention-only adapter; the MLP is where identity is
+    encoded) is what carries over to this family. Its LTX leaf LIST does not.
+
+    Returns ``resolved`` unchanged on success so it can be used inline.
+    """
+    missing = [
+        leaf
+        for leaf in QWEN_EDIT_LORA_LEAVES
+        if not _qwen_edit_target_would_match(resolved, f"transformer_blocks.0.{leaf}")
+    ]
+    if missing:
+        raise ValueError(
+            f"qwen_edit LoRA targets do not cover {len(missing)} of the "
+            f"{len(QWEN_EDIT_LORA_LEAVES)} required leaves: {missing}. Qwen-Image-Edit is a "
+            f"DUAL-STREAM MMDiT — img_* and txt_* are separate parameter sets joined only in "
+            f"attention — so the LTX six-leaf house invariant (attn1 + attn2 + ff.net) is NOT the "
+            f"same adapter here; it is 6 of 14, and on this checkpoint its literal names match "
+            f"ZERO modules. An adapter missing any of these cannot warm-start from a 14-leaf "
+            f"published primer (train/loop.py:177-189 is a weights-only load: the missing modules "
+            f"stay at init while the optimizer trains them). Remove lora.target_modules to take "
+            f"the family default, or cover all fourteen."
+        )
+    return resolved
+
+
+def validate_qwen_edit_rank_alpha_lock(lora: object, qwen_edit: object, training: object) -> None:
+    """Enforce the chained-edit rank/alpha lock at config load, on CPU, before any dispatch.
+
+    ``QWEN-CHAINED-EDIT-METHOD.md`` locks ``rank == alpha == 42`` across EVERY round of a chain —
+    only dataset, name and steps change between rounds. The lock is machine-checked here rather
+    than remembered because ``lora_A`` / ``lora_B`` are RANK-SHAPED: change the rank mid-chain and
+    no later round can warm-start from an earlier one, and the published primer becomes unloadable.
+
+    ``rank_alpha_lock: null`` is the deliberate exit from the chain. It still requires
+    ``rank == alpha`` (PEFT scale ``alpha / rank`` must be 1.0 — the recipe's scaling, independent
+    of the chain), and it FORBIDS ``training.init_adapter_path``: warm-starting without declaring
+    the chain's rank is precisely the silent partial load the lock exists to prevent.
+
+    All three arguments are duck-typed for the same reason ``qwen_edit_packed_layout``'s are —
+    ``config.validators`` must not import ``config.schema`` (the dependency runs the other way).
+    """
+    lock = getattr(qwen_edit, "rank_alpha_lock")
+    rank = int(getattr(lora, "rank"))
+    alpha = int(getattr(lora, "alpha"))
+    init_adapter_path = getattr(training, "init_adapter_path", None)
+
+    if lock is None:
+        if rank != alpha:
+            raise ValueError(
+                f"qwen_edit with rank_alpha_lock disabled still requires rank == alpha (PEFT "
+                f"scale alpha/rank == 1.0, the house recipe): got rank={rank}, alpha={alpha}."
+            )
+        if init_adapter_path is not None:
+            raise ValueError(
+                f"training.init_adapter_path is set ({init_adapter_path!r}) while "
+                f"qwen_edit.rank_alpha_lock is null: a chained round MUST carry the chain's locked "
+                f"rank/alpha, because lora_A/lora_B are rank-shaped and a warm start across a rank "
+                f"change is a silent partial load, not an error. Set rank_alpha_lock to the "
+                f"chain's value (the house chain: 42)."
+            )
+        return
+
+    lock = int(lock)
+    if rank != lock or alpha != lock:
+        raise ValueError(
+            f"qwen_edit chain lock violated: lora.rank={rank}, lora.alpha={alpha}, "
+            f"qwen_edit.rank_alpha_lock={lock}. QWEN-CHAINED-EDIT-METHOD.md locks rank == alpha == "
+            f"{lock} across EVERY round of a chain: only dataset / name / steps change between "
+            f"rounds. Changing rank re-shapes lora_A/lora_B so no later round can warm-start from "
+            f"an earlier one. Set rank and alpha to {lock}, or set rank_alpha_lock: null to leave "
+            f"the chain deliberately (which then forbids init_adapter_path)."
+        )
+
+
+def validate_qwen_edit_row_budget(
+    packed_rows: int, max_packed_rows: int, *, label: str = ""
+) -> int:
+    """Refuse a qwen_edit packed sequence that exceeds a DECLARED row ceiling.
+
+    Structurally the H3 check (``validate_h3_seq_len_budget``) with one deliberate difference, and
+    the difference is the honest part: **there is no measured MiB-per-row figure for
+    Qwen-Image-Edit on any card in this program**, so there is no
+    ``max_packed_rows_for_budget``-style derivation here and no default ceiling. The caller passes
+    an integer an operator measured, or does not call this at all.
+
+    ``qwen_edit.max_packed_rows == 0`` therefore means CEILING DISABLED, and the dry-run banner is
+    required to print ``ceiling=DISABLED (unmeasured)`` in that state — an operator reading a
+    headroom number must never be able to mistake "nobody measured this" for "this is safe".
+    Synthesising a plausible ceiling from H3's A100 numbers would be exactly that mistake:
+    different model, different row width, different resident weights.
+
+    Returns ``packed_rows`` unchanged on success.
+    """
+    if packed_rows < 1:
+        raise ValueError(
+            f"invalid packed row count {packed_rows}: must be a positive integer (it is computed "
+            f"by conditioning.qwen_edit_geometry.qwen_edit_packed_layout)."
+        )
+    if max_packed_rows < 1:
+        raise ValueError(
+            f"invalid max_packed_rows {max_packed_rows}: must be a positive integer, or 0 to "
+            f"disable the ceiling entirely. There is no measured MiB-per-row figure for "
+            f"Qwen-Image-Edit in this program, so a ceiling here is an operator's measurement — "
+            f"never a derived default."
+        )
+    if packed_rows > max_packed_rows:
+        where = f" for {label}" if label else ""
+        raise ValueError(
+            f"qwen_edit packed sequence too long{where}: {packed_rows} rows exceeds the declared "
+            f"ceiling of {max_packed_rows} rows by {packed_rows - max_packed_rows}. Refused "
+            f"locally, before any metered dispatch. The levers, in order of effect: "
+            f"qwen_edit.control_slots (EVERY slot is priced at the full control_area_px budget, "
+            f"filled or blank, so the control block is normally the majority of the sequence), "
+            f"then qwen_edit.control_area_px, then training_dims. NOTE the ceiling itself is a "
+            f"DECLARED number, not a measured one: if it was guessed, measure it before trusting "
+            f"this refusal."
+        )
+    return packed_rows
