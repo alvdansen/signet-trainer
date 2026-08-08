@@ -61,12 +61,24 @@ model:
   # <root>/processor/, not beside the text encoder, and it is also the config_source a
   # single-file transformer load would need.
   pipeline_root_id: qwen-image-edit-2511
-  model_id: qwen_image_edit_2511_bf16.safetensors
-  text_encoder_id: qwen2.5-vl-fp8-scaled
-  vae_id: qwen_image_vae.safetensors
+  # Diffusers component DIRECTORIES under the pipeline root, not ComfyUI single files. Each
+  # directory carries its own config beside its weights, which is what removes the
+  # from_single_file/infer_diffusers_model_type hazard (that function has no Qwen branch on the
+  # pinned diffusers, so a bare .safetensors would need an explicit config_source).
+  model_id: qwen-image-edit-2511/transformer
+  text_encoder_id: qwen-image-edit-2511/text_encoder
+  vae_id: qwen-image-edit-2511/vae
 
 qwen_edit:
   control_slots: 3
+  # POSITIONAL and manifest-relative: directory i fills slot i, which is what a caption's
+  # ctrl_img_{i+1} names. Resolved against the manifest's parent, so the same config works
+  # locally and in the container (where CWD is /root and a bare name would miss). Absolute
+  # entries are honoured unchanged. Never inferred — a guessed order re-points every caption.
+  control_dirs: ["control_1", "control_2", "control_3"]
+  # Slots with no source directory, blank-filled on every sample. control_dirs + blank_slots
+  # must account for exactly control_slots; the schema refuses any other arrangement.
+  blank_slots: []
   blank_slot_fill: black
   control_area_px: 1048576     # VAE_IMAGE_SIZE   — pipeline_qwenimage_edit_plus.py:67
   condition_area_px: 147456    # CONDITION_IMAGE_SIZE — same file, :66 (the VL channel, NOT the VAE)

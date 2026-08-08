@@ -5471,7 +5471,20 @@ def qwen_edit_preprocess(
             "model.text_encoder_id. Add the root to your config's `model:` block, e.g.\n"
             "    pipeline_root_id: qwen-image-edit-2511"
         )
-    processor = _qwen_edit_load_processor(str(WEIGHTS_DIR / pipeline_root_id))
+    # ...and specifically the root's ``processor/`` SUBFOLDER, not the root itself. Measured, both
+    # ways round, on live A100 runs:
+    #   <root>/text_encoder  -> OSError: Can't load image processor ... no preprocessor_config.json
+    #   <root>               -> ValueError: Unrecognized model ... (transformers then prints all
+    #                           ~400 known model types). The root holds diffusers'
+    #                           ``model_index.json``, which is a PIPELINE index and carries no
+    #                           ``model_type``, so AutoProcessor has nothing to dispatch on.
+    #   <root>/processor     -> correct: preprocessor_config.json + tokenizer.json + vocab.json +
+    #                           tokenizer_config.json + special_tokens_map.json, i.e. a complete
+    #                           processor directory.
+    # Composed here rather than stored as its own config field: it is a fixed property of the
+    # diffusers snapshot layout, not an operator choice, and a field would invite it to disagree
+    # with the root it must live under.
+    processor = _qwen_edit_load_processor(str(WEIGHTS_DIR / pipeline_root_id / "processor"))
     text_encoder = load_qwen_edit_text_encoder(str(WEIGHTS_DIR / text_encoder_id), device="cuda")
     print(assert_qwen_edit_text_encoder_vision(text_encoder, what="the Qwen2.5-VL text encoder"))
     quantize_qwen_edit(text_encoder, what="the Qwen2.5-VL text encoder")
@@ -5480,13 +5493,29 @@ def qwen_edit_preprocess(
     # and the configured directories, and resolving it twice invites the two phases to disagree about
     # which file filled slot i — the positional-identity failure this family's resolver exists to
     # refuse.
+    # ⛔ control_dirs are MANIFEST-RELATIVE, exactly like ``row["media_path"]``, and are resolved
+    # against ``data_root`` here — ``resolve_qwen_edit_control_sources`` takes directories as given
+    # and does no joining of its own. Anchoring them to the manifest rather than to the process CWD
+    # is what makes a config portable between the local dry-run and the container, where CWD is
+    # ``/root`` and a bare ``refs_a`` resolves to ``/root/refs_a`` and is simply absent. An ABSOLUTE
+    # entry is honoured unchanged, so a corpus whose controls live outside the manifest's tree stays
+    # expressible.
+    resolved_control_dirs = tuple(
+        str(entry) if Path(str(entry)).is_absolute() else str(data_root / str(entry))
+        for entry in control_dirs
+    )
+    print(
+        f"[qwen_edit_preprocess] control dirs resolved against {data_root}: "
+        f"{list(control_dirs)} -> {list(resolved_control_dirs)}"
+    )
+
     plans: list[dict] = []
     for index, row in enumerate(rows):
         media_path = str(row["media_path"])
         stem = Path(media_path).stem
         slots = resolve_qwen_edit_control_sources(
             stem,
-            control_dirs,
+            resolved_control_dirs,
             control_slots=control_slots,
             blank_slot_fill=blank_slot_fill,
             blank_slots=blank_slots,

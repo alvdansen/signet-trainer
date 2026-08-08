@@ -639,14 +639,14 @@ def load_qwen_edit_transformer(
         model = QwenImageTransformer2DModel.from_single_file(
             checkpoint_path,
             config=config_source,
-            subfolder=subfolder,
+            subfolder=subfolder or "",  # None is NOT accepted: transformers does os.path.join(subfolder, path)
             torch_dtype=resolved_dtype,
             local_files_only=local_files_only,
         )
     else:
         model = QwenImageTransformer2DModel.from_pretrained(
             checkpoint_path,
-            subfolder=subfolder,
+            subfolder=subfolder or "",  # None is NOT accepted: transformers does os.path.join(subfolder, path)
             torch_dtype=resolved_dtype,
             local_files_only=local_files_only,
         )
@@ -707,7 +707,7 @@ def load_qwen_edit_text_encoder(
     )
     encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         encoder_path,
-        subfolder=subfolder,
+        subfolder=subfolder or "",  # None is NOT accepted: transformers does os.path.join(subfolder, path)
         torch_dtype=resolved_dtype,
         local_files_only=local_files_only,
     )
@@ -760,7 +760,7 @@ def load_qwen_edit_vae(
     logger.info("Loading Qwen-Image VAE from %s (subfolder=%s, dtype=%s)", vae_path, subfolder, resolved_dtype)
     vae = AutoencoderKLQwenImage.from_pretrained(
         vae_path,
-        subfolder=subfolder,
+        subfolder=subfolder or "",  # None is NOT accepted: transformers does os.path.join(subfolder, path)
         torch_dtype=resolved_dtype,
         local_files_only=local_files_only,
     )
