@@ -370,6 +370,18 @@ def _qwen_edit_config_gaps(cfg: object, *, mode: str) -> list[str]:
             "config from the Hub inside a metered container."
         )
 
+    if mode in ("preprocess", "train") and cfg.model.pipeline_root_id is None:
+        gaps.append(
+            "model.pipeline_root_id is unset, and the Qwen2.5-VL PROCESSOR is a PIPELINE-ROOT "
+            "component: a Qwen-Image-Edit-2511 snapshot writes preprocessor_config.json into "
+            "<root>/processor/, NOT into <root>/text_encoder/. Composing the processor path from "
+            "model.text_encoder_id raises \"Can't load image processor for .../text_encoder\" — and "
+            "it raises AFTER the arch gate has loaded 38 GiB of transformer, so the discovery is "
+            "metered. Declaring the root here makes it free. WHAT LANDS IT: add the root directory "
+            "under WEIGHTS_DIR to your `model:` block, e.g.\n"
+            "        pipeline_root_id: qwen-image-edit-2511"
+        )
+
     if mode == "preprocess":
         declared = tuple(getattr(cfg.qwen_edit, "control_dirs", ()) or ())
         blanks = tuple(getattr(cfg.qwen_edit, "blank_slots", ()) or ())

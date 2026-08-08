@@ -101,7 +101,12 @@ LTX_DEFAULT_LORA_TARGETS: tuple[str, ...] = (
 _FAMILY_ONLY_MODEL_IDS: dict[str, frozenset[str]] = {
     "vae_id": frozenset({"h3", "qwen_edit"}),
     "audio_vae_id": frozenset({"h3"}),
-    "pipeline_root_id": frozenset({"h3"}),
+    # qwen_edit added 2026-08-08: the field now has a consumer on this family, which is the exact
+    # condition the comment above records for inclusion. The Qwen2.5-VL PROCESSOR is a pipeline-root
+    # component — a Qwen-Image-Edit-2511 snapshot puts preprocessor_config.json in `processor/`,
+    # NOT in `text_encoder/` — so composing its path from text_encoder_id raises
+    # "Can't load image processor for .../text_encoder". Measured on a live A100 run.
+    "pipeline_root_id": frozenset({"h3", "qwen_edit"}),
 }
 
 
@@ -264,10 +269,14 @@ class ModelConfig(_Base):
     # convention no config states and nothing checks; naming it is one line and cannot drift.
     pipeline_root_id: str | None = Field(
         default=None,
-        description="H3-only: the diffusers pipeline ROOT dir under WEIGHTS_DIR (e.g. "
-        "'minimax-h3') — the directory holding model_index.json and every component partition. "
-        "NOT the same as model_id, which names the transformer partition INSIDE this root. "
-        "Required by `--mode sample` on a family: h3 config; unused by train/preprocess. DATA "
+        description="h3 / qwen_edit: the diffusers pipeline ROOT dir under WEIGHTS_DIR (e.g. "
+        "'minimax-h3', 'qwen-image-edit-2511') — the directory holding model_index.json and every "
+        "component partition. NOT the same as model_id, which names the transformer partition "
+        "INSIDE this root. On h3: required by `--mode sample`, unused by train/preprocess. On "
+        "qwen_edit: required by preprocess and train, for TWO distinct reasons — (1) the "
+        "Qwen2.5-VL PROCESSOR lives in the root's `processor/` subfolder, not beside the text "
+        "encoder, and (2) it is the `config_source` a single-file transformer load needs, because "
+        "diffusers' infer_diffusers_model_type has no Qwen branch on the pinned version. DATA "
         "only — never FS-checked here (Pitfall 1).",
     )
 

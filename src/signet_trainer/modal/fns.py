@@ -5453,7 +5453,25 @@ def qwen_edit_preprocess(
     )
 
     # ── PHASE A — text conditions. The processor + encoder have the card essentially to themselves.
-    processor = _qwen_edit_load_processor(str(WEIGHTS_DIR / text_encoder_id))
+    #
+    # ⛔ The PROCESSOR comes from the PIPELINE ROOT, the encoder from the text_encoder partition.
+    # They are different directories and conflating them is a measured failure, not a theoretical
+    # one: a Qwen-Image-Edit-2511 snapshot writes preprocessor_config.json into `processor/`, so
+    # AutoProcessor.from_pretrained(WEIGHTS_DIR / text_encoder_id) dies with
+    #   OSError: Can't load image processor for '/weights/qwen-image-edit-2511/text_encoder'
+    # AFTER the 38 GiB arch-gate load has already been paid for. The root is required rather than
+    # guessed-with-a-fallback because a silent fallback is how the wrong processor gets used: the
+    # image-preprocessing config decides the control image's pixel budget and grid, and a mismatched
+    # one produces a plausible tensor of the wrong shape rather than an error.
+    if not pipeline_root_id:
+        raise RuntimeError(
+            "[qwen_edit_preprocess] model.pipeline_root_id is unset. The Qwen2.5-VL PROCESSOR is a "
+            "pipeline-root component — a Qwen-Image-Edit-2511 snapshot puts preprocessor_config.json "
+            "in <root>/processor/, not in <root>/text_encoder/ — so it cannot be composed from "
+            "model.text_encoder_id. Add the root to your config's `model:` block, e.g.\n"
+            "    pipeline_root_id: qwen-image-edit-2511"
+        )
+    processor = _qwen_edit_load_processor(str(WEIGHTS_DIR / pipeline_root_id))
     text_encoder = load_qwen_edit_text_encoder(str(WEIGHTS_DIR / text_encoder_id), device="cuda")
     print(assert_qwen_edit_text_encoder_vision(text_encoder, what="the Qwen2.5-VL text encoder"))
     quantize_qwen_edit(text_encoder, what="the Qwen2.5-VL text encoder")

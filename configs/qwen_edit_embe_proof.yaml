@@ -62,6 +62,10 @@ model:
   # Diffusers SUBDIRECTORIES, written by modal/fns.py::download_qwen_edit_weights. Directories,
   # not bare .safetensors, because from_single_file would need an explicit config_source: diffusers'
   # infer_diffusers_model_type has no Qwen branch on the pinned version.
+  # The diffusers pipeline ROOT. Required on qwen_edit: the Qwen2.5-VL processor lives in
+  # <root>/processor/, not beside the text encoder, and it is also the config_source a
+  # single-file transformer load would need.
+  pipeline_root_id: qwen-image-edit-2511
   model_id: qwen-image-edit-2511/transformer
   text_encoder_id: qwen-image-edit-2511/text_encoder
   vae_id: qwen-image-edit-2511/vae

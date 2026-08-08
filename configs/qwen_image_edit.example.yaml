@@ -57,6 +57,10 @@ training:
 
 model:
   family: qwen_edit
+  # The diffusers pipeline ROOT. Required on qwen_edit: the Qwen2.5-VL processor lives in
+  # <root>/processor/, not beside the text encoder, and it is also the config_source a
+  # single-file transformer load would need.
+  pipeline_root_id: qwen-image-edit-2511
   model_id: qwen_image_edit_2511_bf16.safetensors
   text_encoder_id: qwen2.5-vl-fp8-scaled
   vae_id: qwen_image_vae.safetensors
