@@ -17,6 +17,7 @@ from signet_trainer.conditioning.h3_fl2va import (
     h3_keyframe_rows,
     validate_keyframe_anchors,
 )
+from signet_trainer.conditioning.h3_geometry import h3_latent_frames
 from signet_trainer.conditioning.h3_packing import (
     H3_ROPE_FRAME_RESCALE,
     H3_ROPE_FRAMES_PER_LATENT,
@@ -49,17 +50,25 @@ def test_last_anchor_matches_the_reference_arithmetic_exactly():
     assert h3_keyframe_anchor_time("last", n_text, frames) == expected
 
 
-def test_last_anchor_does_NOT_sit_on_the_last_video_frame():
-    """Documented, deliberate divergence — see the module docstring.
+@pytest.mark.parametrize("f_pixels", [5, 22, 39, 56, 73, 90, 107])
+def test_last_anchor_is_the_final_PIXEL_frame_and_the_gap_is_invariant(f_pixels):
+    """The `"last"` anchor is `5/3 * (F_pixels - 1)` — the last PIXEL frame's rotary time.
 
-    If a future change makes these equal, it has changed every keyframe's rotary time. That must be
-    an argued decision, not a silent one, so the gap is pinned here with its exact value.
+    The last LATENT frame's coordinate marks where its 4-pixel-frame aggregate BEGINS, so the two
+    differ by exactly 3 pixel frames = 5.0 rotary units — and that gap is INVARIANT across every
+    legal 17n+5 count, because the last latent index is always ≡ 1 (mod 5).
+
+    Pinning the invariance, not just the F=22 value, is the point: a single-frame-count assertion
+    would pass for an implementation that got the semantics wrong and the arithmetic right by
+    coincidence.
     """
-    n_text, frames = 200, 7
+    frames = h3_latent_frames(f_pixels)
+    n_text = 200
     anchor = h3_keyframe_anchor_time("last", n_text, frames)
     last_video_frame = float(h3_temporal_position_grid(frames, float(n_text))[-1])
-    # (1,4,4,4,4,1,4) -> spans[0] = 5/3, spans[-1] = 20/3; the anchor lands 5.0 units past the frame.
-    assert anchor - last_video_frame == pytest.approx(5.0, abs=1e-12)
+
+    assert anchor - last_video_frame == pytest.approx(5.0, abs=1e-9)
+    assert anchor - n_text == pytest.approx(H3_ROPE_FRAME_RESCALE * (f_pixels - 1), abs=1e-9)
 
 
 def test_pairwise_and_sequential_summation_are_not_interchangeable():

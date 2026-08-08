@@ -36,15 +36,26 @@ frames onwards, and ``h3_packing`` already documents that it deliberately keeps 
 site. Substituting the sequential sum here would produce rotary coordinates that are correct to
 ~1e-16, train without error, and be wrong in a way no test that rounds would ever catch.
 
-⚠ A "LAST" KEYFRAME DOES **NOT** LAND ON THE LAST VIDEO FRAME'S ROTARY TIME
----------------------------------------------------------------------------
-Upstream computes ``anchor_time = n_text + spans.sum() - RESCALE``, i.e. ``n_text + sum(spans[1:])``.
-The last generated latent frame sits at ``n_text + sum(spans[:-1])`` (``h3_temporal_position_grid``).
-Those agree only when ``spans[0] == spans[-1]``, and the ``(1, 4, 4, 4, 4)`` cycle makes that false
-for most frame counts — at F=22 (7 latent frames) the cycle is ``(1,4,4,4,4,1,4)``, so the anchor
-lands 5.0 rotary units PAST the last frame. That is the reference's behaviour, it is deliberate
-here, and ``tests/test_h3_fl2va.py`` pins the exact numbers so a future "fix" has to argue with a
-test instead of silently shifting every keyframe.
+⚠ A "LAST" KEYFRAME LANDS ON THE FINAL **PIXEL** FRAME, NOT THE FINAL **LATENT** FRAME
+--------------------------------------------------------------------------------------
+This reads like an off-by-something and is not. The arithmetic:
+
+* ``spans.sum()`` is exactly ``5/3 * F_pixels`` — the ``(1, 4, 4, 4, 4)`` cycle sums to 17 per
+  5 latent frames, mirroring the 17->5 chunking contract.
+* so ``anchor_time = n_text + spans.sum() - RESCALE`` is ``n_text + 5/3 * (F_pixels - 1)``:
+  **the rotary time of the last PIXEL frame**, on the 5/3-units-per-pixel-frame clock.
+* the last LATENT frame's coordinate (``h3_temporal_position_grid``) marks where its 4-pixel-frame
+  aggregate BEGINS — pixel frame 18 of 22, not 21.
+
+The difference is therefore 3 pixel frames = **exactly 5.0 rotary units, for EVERY legal 17n+5
+count** (verified F=5..107 in ``tests/test_h3_fl2va.py``); the last latent index is always ``≡ 1
+(mod 5)``, so its span is always ``20/3``. It is a coherent semantic — "the last keyframe is the
+final frame you will generate" — not a rounding artifact, and the released weights were trained
+with it. Porting it faithfully is mandatory.
+
+⛔ An earlier version of this docstring explained the gap as ``spans[0] != spans[-1]``. That gets the
+right number at F=22 by accident and frames a deliberate semantic as an artifact, which is an
+invitation to "fix" it. The test pins the value AND the invariance across frame counts.
 """
 
 from __future__ import annotations
