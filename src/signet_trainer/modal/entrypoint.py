@@ -371,16 +371,21 @@ def _qwen_edit_config_gaps(cfg: object, *, mode: str) -> list[str]:
         )
 
     if mode == "preprocess":
-        gaps.append(
-            "no config block declares the ORDERED control-image directories (one per slot). "
-            "prep/qwen_edit_encode.resolve_qwen_edit_control_sources requires exactly "
-            f"{cfg.qwen_edit.control_slots} of them because the mapping is POSITIONAL — directory i "
-            "fills slot i, which is what the caption's ctrl_img_{i+1} refers to. WHAT LANDS IT: a "
-            "'control_dirs' (and optional 'blank_slots') field on QwenEditConfig, validated against "
-            "control_slots at config load. This is deliberately NOT defaulted to a convention: a "
-            "guessed directory order re-points every caption's ctrl_img_N and trains the sample "
-            "against a request nobody wrote, silently and at an ordinary loss."
-        )
+        declared = tuple(getattr(cfg.qwen_edit, "control_dirs", ()) or ())
+        blanks = tuple(getattr(cfg.qwen_edit, "blank_slots", ()) or ())
+        covered = len(declared) + len(blanks)
+        if covered != int(cfg.qwen_edit.control_slots):
+            gaps.append(
+                "the ORDERED control-image directories (one per slot) are not fully declared: "
+                f"qwen_edit.control_dirs has {len(declared)} entr(ies) and qwen_edit.blank_slots "
+                f"has {len(blanks)}, covering {covered} of {cfg.qwen_edit.control_slots} slot(s). "
+                "prep/qwen_edit_encode.resolve_qwen_edit_control_sources requires every slot to be "
+                "accounted for because the mapping is POSITIONAL — directory i fills slot i, which "
+                "is what the caption's ctrl_img_{i+1} refers to. This is deliberately NOT defaulted "
+                "to a convention: a guessed directory order re-points every caption's ctrl_img_N "
+                "and trains the sample against a request nobody wrote, silently and at an ordinary "
+                "loss. Declare them explicitly, in slot order."
+            )
 
     return gaps
 

@@ -26,7 +26,7 @@ training_dims: [1024, 1024, 1]
 
 data:
   preprocessed_data_root: /dataset/.precomputed_qwen_edit_embe_proof
-  metadata_path: dataset/qwen_edit_embe_proof/metadata.jsonl
+  metadata_path: /dataset/qwen_edit_embe_proof/metadata.jsonl  # ABSOLUTE — DATASET_DIR = Path("/dataset")
   num_dataloader_workers: 2
   batch_size: 1
   resolution_buckets:

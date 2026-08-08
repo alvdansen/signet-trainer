@@ -10,7 +10,7 @@ training_dims: [1024, 1024, 1]
 
 data:
   preprocessed_data_root: /dataset/.precomputed_qwen_edit_r1
-  metadata_path: dataset/qwen_edit_r1/metadata.jsonl
+  metadata_path: /dataset/qwen_edit_r1/metadata.jsonl        # ABSOLUTE — the dataset Volume mounts at /dataset (app.py:73)
   num_dataloader_workers: 2
   batch_size: 1
   resolution_buckets:
