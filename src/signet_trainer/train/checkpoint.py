@@ -212,7 +212,74 @@ class CheckpointManager:
         if not adapter_weights:
             # A zeroed/corrupted adapter must NOT silently continue (threat T-03-41).
             raise RuntimeError(f"Resume aborted: empty adapter state_dict in {latest}")
-        set_peft_model_state_dict(model, adapter_weights, adapter_name="default")
+
+        # ── LANDMINE #1b: set_peft_model_state_dict CANNOT be used on a QUANTIZED model ──────────
+        #
+        # It ends in ``model.load_state_dict(peft_state_dict, strict=False)``
+        # (peft/utils/save_and_load.py:941), and ``load_state_dict`` walks EVERY submodule — not
+        # only the ones the incoming dict mentions. On a quanto-quantized transformer the base
+        # Linears are ``QModuleMixin``, whose ``_load_from_state_dict`` does an UNCONDITIONAL
+        # ``state_dict.pop(prefix + name)`` for its own ``_data`` internals
+        # (optimum/quanto/tensor/qbytes.py:90). A LoRA adapter dict carries no base weights, so the
+        # pop raises and ``strict=False`` does not save you — quanto's override never consults it:
+        #
+        #   KeyError: 'base_model.model.time_text_embed.timestep_embedder.linear_1.weight._data'
+        #
+        # MEASURED, and it cost a 5000-step run: phase 1 trained to step 500, the container was
+        # interrupted, Modal retried it (``retries=modal.Retries(max_retries=10)``), and every
+        # retry died here. Under quantization the trainer had NO crash resume at all — an
+        # interruption was permanent, which is the opposite of the documented property
+        # ("deterministic crash resume; restart-from-scratch must be an explicit choice").
+        #
+        # The adapter parameters are NOT quantized — ``quantize_qwen_edit`` runs on the un-wrapped
+        # transformer BEFORE ``inject_lora``, so quanto converts the base Linears and the LoRA
+        # tensors are added afterwards as ordinary parameters. So they can be assigned DIRECTLY,
+        # which never visits a quantized module. The only transform PEFT applies to a saved key is
+        # inserting the adapter name before the final component; verified against the real
+        # 1680-tensor checkpoint, all 1680 keys map.
+        quantized = any(
+            type(module).__name__.startswith("Q") and hasattr(module, "weight")
+            and hasattr(type(module), "_load_from_state_dict")
+            and "quanto" in type(module).__module__
+            for module in model.modules()
+        )
+        if not quantized:
+            set_peft_model_state_dict(model, adapter_weights, adapter_name="default")
+        else:
+            live = dict(model.named_parameters())
+            missing: list[str] = []
+            loaded = 0
+            with torch.no_grad():
+                for key, tensor in adapter_weights.items():
+                    target = live.get(key)
+                    if target is None:
+                        head, sep, tail = key.rpartition(".")
+                        target = live.get(f"{head}.default{sep}{tail}") if sep else None
+                    if target is None:
+                        missing.append(key)
+                        continue
+                    if tuple(target.shape) != tuple(tensor.shape):
+                        raise RuntimeError(
+                            f"Resume aborted: {key} is {tuple(tensor.shape)} on disk but "
+                            f"{tuple(target.shape)} in the live model. A rank/alpha change between "
+                            f"rounds re-shapes lora_A/lora_B and breaks the resume — that is why "
+                            f"rank == alpha is a HARD LOCK across a chain."
+                        )
+                    target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+                    loaded += 1
+            if missing or loaded != len(adapter_weights):
+                raise RuntimeError(
+                    f"Resume aborted: {loaded}/{len(adapter_weights)} adapter tensor(s) matched a "
+                    f"live parameter; {len(missing)} unmatched, first few: {missing[:4]}. Loading "
+                    f"a PARTIAL adapter is worse than refusing — the run would continue from a "
+                    f"half-restored state at a plausible loss."
+                )
+            logger.info(
+                "Resumed a QUANTIZED model by direct parameter assignment: %d/%d adapter tensors "
+                "(set_peft_model_state_dict is unusable here — see LANDMINE #1b).",
+                loaded,
+                len(adapter_weights),
+            )
 
         # ── restore optimizer / scheduler / step / RNG from training_state.pt ────────────────────
         state = torch.load(

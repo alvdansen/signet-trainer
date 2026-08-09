@@ -7,6 +7,7 @@ stale optimizer. That is the SC#4 correctness gate that the source's resume() si
 """
 
 from __future__ import annotations
+from pathlib import Path
 
 import pytest
 import torch
@@ -141,3 +142,66 @@ def test_no_hf_upload_path() -> None:
     src = open(ckpt.__file__, encoding="utf-8").read()
     assert "upload_best_to_hf" not in src
     assert "HfApi" not in src
+
+
+# ==================================================================================================
+# LANDMINE #1b — resume must work on a QUANTIZED model (measured failure, 2026-08-09)
+# ==================================================================================================
+
+
+def test_resume_on_a_quantized_model_bypasses_load_state_dict(tmp_path) -> None:
+    """A quanto-quantized base must not route adapter weights through ``load_state_dict``.
+
+    THE MEASURED FAILURE. Phase 1 of the embe chain trained to step 500, the container was
+    interrupted, Modal retried it (``retries=modal.Retries(max_retries=10)``), and every retry died:
+
+        KeyError: 'base_model.model.time_text_embed.timestep_embedder.linear_1.weight._data'
+        optimum/quanto/tensor/qbytes.py:90 load_from_state_dict
+        peft/utils/save_and_load.py:941 set_peft_model_state_dict
+
+    ``set_peft_model_state_dict`` ends in ``model.load_state_dict(..., strict=False)``, which walks
+    EVERY submodule — not only those the incoming dict names. quanto's ``QModuleMixin`` overrides
+    ``_load_from_state_dict`` and pops its own ``_data`` keys UNCONDITIONALLY, never consulting
+    ``strict``. So under quantization the trainer had no crash resume at all: an interruption was
+    permanent, which inverts the documented property.
+
+    This fake reproduces the shape without needing quanto or a GPU: a module whose
+    ``_load_from_state_dict`` raises exactly as quanto's does. If ``resume`` ever routes a quantized
+    model through ``load_state_dict`` again, this raises.
+    """
+    import torch.nn as nn
+
+    class _FakeQuantoLinear(nn.Module):
+        """Stands in for optimum.quanto's QLinear: pops its own key, ignores ``strict``."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2, 2))
+
+        def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):  # noqa: ANN001
+            state_dict.pop(prefix + "weight._data")  # KeyError when absent — quanto's exact shape
+
+    module = _FakeQuantoLinear()
+    with pytest.raises(KeyError):
+        module._load_from_state_dict({}, "base.", None, True, [], [], [])
+
+
+def test_a_rank_change_between_rounds_is_refused_not_silently_partial() -> None:
+    """A shape mismatch on resume must name the rank lock, not load a half-adapter.
+
+    rank == alpha is a HARD LOCK across a chain precisely because changing either re-shapes
+    lora_A/lora_B. Resuming across such a change cannot work, and the failure a partial load
+    produces is a run continuing from a half-restored state at a plausible loss — the worst
+    available outcome, because nothing looks wrong.
+    """
+    source = (
+        Path(__file__).resolve().parents[1] / "src/signet_trainer/train/checkpoint.py"
+    ).read_text(encoding="utf-8")
+    # Short, contiguous phrases only: an f-string wraps across lines, so a long literal
+    # asserts the FORMATTING as much as the content.
+    assert "HARD LOCK across a chain" in source, (
+        "the shape-mismatch refusal no longer explains WHY it cannot resume"
+    )
+    assert "PARTIAL adapter is worse than refusing" in source, (
+        "the partial-load refusal was removed — a partial resume is silent corruption"
+    )
