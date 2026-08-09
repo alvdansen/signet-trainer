@@ -49,15 +49,11 @@ def test_the_acceptance_oracle_exists_on_disk() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "docs/source-methods/ is UNTRACKED (git status: '?? docs/source-methods/'). The acceptance "
-        "test's oracle is therefore absent on a fresh clone and the suite goes red in CI for a "
-        "reason unrelated to the code. Fix: `git add docs/source-methods/` in the commit that "
-        "lands this slice. Remove this xfail in the same commit."
-    ),
-)
+# FIXED 2026-08-09 — was xfail(strict). The oracle and train_kohya.py are now git-tracked under
+# docs/source-methods/musubi-wan21/. Kept live rather than deleted: the acceptance test
+# compares the renderer against this file, so an untracked oracle means the suite is green on
+# the author's box and RED on a fresh clone — the failure mode that makes a byte-exact proof
+# worthless to everyone but the person who wrote it.
 def test_the_acceptance_oracle_is_tracked_in_git() -> None:
     """The oracle is a TEST INPUT. An untracked test input is a test that only passes locally."""
     result = subprocess.run(
