@@ -1,0 +1,89 @@
+# Wan 2.1 t2v-14B via the musubi-tuner RUNNER — the three-dataset method, in signet YAML.
+#
+# ⚠ THIS LIVES IN tests/fixtures/, NOT configs/, AND THAT IS DELIBERATE.
+# `DataConfig` has no `sources` field and `ModelConfig.family` has no "wan" member on this tree, so
+# `load_config_from_text` would reject this file today. A config in configs/ that cannot load is a
+# landmine for the zero-GPU dry-run gate, so it waits here until the schema lands and then moves to
+# `configs/wan21_kaboom.example.yaml` unchanged. Nothing else in the suite reads configs/ by glob
+# except the `render_tier:` scan (tests/test_optimization_target.py:531), which this would pass.
+#
+# What IS proved against this file today, on CPU, at $0:
+#   tests/test_musubi_toml_render.py renders `data.sources` and asserts the result is EQUIVALENT —
+#   semantically AND byte-for-byte — to Timothy's real runner config at
+#   docs/source-methods/musubi-wan21/wan21-dataset-config.toml.
+
+# The LARGEST DECLARED VIEW (1280x720x21, the `appearance` source), not a fourth geometry: the
+# dry-run gate prices the most expensive thing this run will actually assemble. `motion` is
+# 640x352x45 and `stills` is 1024x1024x1; both are cheaper per sample than this one.
+training_dims: [1280, 720, 21]
+
+data:
+  # When `sources:` is set this is the cache PARENT under which a source that names no `cache_root`
+  # mints `<preprocessed_data_root>/cache/<id>`. It keeps its ordinary meaning when `sources:` is
+  # absent, which is why `sources` is an OPTIONAL SIBLING rather than a re-expression of the flat
+  # single-source form — the byte-identical path for every existing config is the ABSENCE of a key,
+  # and an absent key cannot regress.
+  preprocessed_data_root: /datasets/datasets/Kaboom
+  caption_extension: ".txt"      # -> [general] in the rendered TOML
+  enable_bucket: true            # -> [general]
+  bucket_no_upscale: true        # -> [general]; nothing is ever upscaled, so nothing is invented
+
+  # resolution_buckets DELIBERATELY OMITTED. musubi does its own bucketing from each source's
+  # `resolution` AREA BUDGET, so a bucket list here would be read by nobody — the exact
+  # silently-ignored-config defect the lean field-split guards kill elsewhere in this schema.
+
+  sources:
+    # ── stills: maximum detail, no temporal axis ──────────────────────────────────────────────
+    - id: stills                  # LOAD-BEARING: cache discriminator, provenance tag, census label
+      kind: image
+      directory: /datasets/datasets/Kaboom/Images
+      cache_root: /datasets/datasets/Kaboom/Images/cache
+      resolution: [1024, 1024]
+      extraction: image           # the only legal mode on kind: image
+      num_repeats: 1
+      batch_size: 1
+
+    # ── appearance: expensive-and-narrow. The opening beat, at full resolution ────────────────
+    - id: appearance
+      kind: video
+      directory: /datasets/datasets/Kaboom/Videos
+      cache_root: /datasets/datasets/Kaboom/Videos/cache_1
+      resolution: [1280, 720]
+      extraction: head            # window from frame 0 — the establishing moment of each clip
+      target_frames: [1, 21]      # TWO clips per video, BOTH from frame 0: a still and a 21f window
+      num_repeats: 1
+      batch_size: 1
+
+    # ── motion: cheap-and-wide. Long extent, bought with resolution ───────────────────────────
+    - id: motion
+      kind: video
+      # THE SAME DIRECTORY AS `appearance`, and this is the point of the whole feature. Two views
+      # of one corpus are two blocks precisely because they are two CACHES: the cache filename
+      # carries the SOURCE video's size, never the training resolution.
+      directory: /datasets/datasets/Kaboom/Videos
+      cache_root: /datasets/datasets/Kaboom/Videos/cache_2
+      resolution: [640, 360]      # ⚠ TRAINS AT 640x352 — 360 is not a multiple of 16. Warned, not
+                                  # refused: this is the method's own working value.
+      extraction: uniform
+      target_frames: [45]         # 45 frames is unaffordable at 720p; that trade IS the method
+      frame_sample: 2             # first and last possible 45f window: linspace(0, n-45, 2)
+      num_repeats: 1
+      batch_size: 1
+
+model:
+  family: wan                     # the FOURTH family — a family, not a seventh --mode
+  # ⚠ DECLARED GAP. train_kohya.py:69-92 hardcodes two Hub repo ids and downloads the four
+  # components at run time. signet resolves weights from the weights Volume, so model_id / vae_id /
+  # text_encoder_id / clip_id (plus a `wan:` block for task / network_dim / discrete_flow_shift /
+  # max_train_epochs, which train_kohya.py:136-159 also hardcodes) are what land a real dispatch.
+
+modal:
+  hourly_rate_usd: 1.64
+  cost_guardrail_usd: 50.0
+  # ⚠ DECLARED, NOT MEASURED — no Wan steps/hour figure has been measured on any card in this
+  # program. The batch line beside the cost line prints the clip-instance arithmetic so the two can
+  # be checked against each other; it never replaces this number with an invented one.
+  est_hours: 6.0
+
+seed: 42
+output_dir: outputs/wan21_kaboom
