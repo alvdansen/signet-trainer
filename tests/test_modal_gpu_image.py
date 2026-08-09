@@ -37,7 +37,13 @@ _APP = _SRC / "app.py"
 #: line citation in ``conditioning/qwen_edit_geometry.py`` / ``models/qwen_edit_loader.py`` /
 #: ``prep/qwen_edit_encode.py`` was measured against. One image cannot carry two SHAs, and
 #: re-pinning h3's would risk a working path for build convenience.
-_KNOWN_GPU_IMAGES = ("gpu_image", "h3_gpu_image", "qwen_gpu_image")
+#: ⚠ WIDENED for family #4 (2026-08-09). ``wan_musubi_image`` is the musubi-tuner runner image: it
+#: is the ONLY entry here built on python 3.10 (train_kohya.py:24) and the only one that
+#: DELIBERATELY omits the pydantic-v2 config-loader closure, because it carries musubi's
+#: ``pydantic==1.10.13`` instead. Adding it is a widening of the ALLOWLIST, not of the RULE — the
+#: rule ("a gpu= function must name one of these") is unchanged, and the companion test below still
+#: requires every name here to be a real module-level image in app.py, so a typo cannot buy a pass.
+_KNOWN_GPU_IMAGES = ("gpu_image", "h3_gpu_image", "qwen_gpu_image", "wan_musubi_image")
 
 # Each @app.function(...) decorator paired with its function name. The decorators contain no nested
 # parens (only {}/[] for volumes/secrets), so a non-greedy match to the first ')' is safe.

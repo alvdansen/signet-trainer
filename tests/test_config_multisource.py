@@ -344,25 +344,58 @@ def test_data_caption_extension_must_start_with_a_dot() -> None:
 # ==================================================================================================
 
 
-def test_the_dryrun_gate_refuses_wan_by_name_instead_of_printing_an_ltx_banner(capsys) -> None:
-    """The money-safe half of the slice.
+def test_the_dryrun_gate_never_prints_an_ltx_banner_for_a_wan_config(capsys) -> None:
+    """The money-safe half of the slice, ASSERTED ON THE CLAIM rather than on the mechanism.
 
-    ``modal/entrypoint.main`` runs ``run_dryrun`` at step (2) and raises ``SystemExit`` on a
-    non-zero return, BEFORE the cost print and long before ``.spawn()``. So this return value is
-    what stops a ``family: wan`` train dispatch from falling through the router's LTX ``else:`` arm
-    — which is exactly what a merely-ABSENT dry-run arm would have allowed.
+    ⚠ AMENDED, DELIBERATELY (slice B). The predecessor —
+    ``test_the_dryrun_gate_refuses_wan_by_name_instead_of_printing_an_ltx_banner`` — asserted
+    ``run_dryrun(...) == 1``, because in slice A there was no Wan Modal stage for the gate to gate
+    and refusing everything was the correct money-safe answer. The stage has now landed, and
+    ``run_dryrun`` routes this family to ``assert_wan_dryrun_manifest`` (the MANIFEST gate the old
+    refusal's own docstring specified), so a valid wan config now legitimately returns 0.
+
+    The CLAIM is unchanged and is what this asserts: a ``family: wan`` config must NEVER be
+    described by the LTX synthetic-batch banner. The old test proved that by proving nothing passed;
+    this proves it by checking WHICH banner was printed — a strictly narrower thing to be right
+    about, and one that keeps holding after the stage exists. ``seq_len`` is the LTX banner's
+    signature term and appears in no wan banner.
+
+    The refusal itself is NOT retired: ``build_dryrun_inputs``'s wan branch still raises, which is
+    what the next test asserts. Gate and refusal are complements — one checks the artifact that
+    gates the run, the other names the batch that cannot be built.
     """
     from signet_trainer.dryrun.shapes import run_dryrun
 
-    assert run_dryrun(load_config(_EXAMPLE)) == 1
-    err = capsys.readouterr().err
-    assert "assert_wan_dryrun_geometry" in err, "the refusal must name the symbol that lands it"
-    assert "OK" not in capsys.readouterr().out
+    assert run_dryrun(load_config(_EXAMPLE)) == 0
+    captured = capsys.readouterr()
+    assert "seq_len" not in captured.out, (
+        "the LTX synthetic-batch banner (its signature term is seq_len) described a wan config — "
+        "compute_seq_len divides by 32 and assumes 128-channel LTX latents, so that number would be "
+        "about a model this run does not use"
+    )
+    assert "wan config valid" in captured.out and "musubi dataset TOML rendered + parsed" in captured.out
+    # The gate must report what it CHECKED, not merely that it passed: the manifest gate's whole
+    # value is that the artifact the runner consumes was rendered and read back here, at $0.
+    assert "3 [[datasets]] block(s)" in captured.out
+    assert "distinct cache director" in captured.out
+    # The declared-vs-trained crop is a WARNING, printed inline (never to stderr, where a
+    # non-interactive dispatch would lose it) — [640, 360] trains at 640x352 and that is the
+    # method's own working value, so it is reported rather than refused.
+    assert "640x352" in captured.out
 
 
 def test_the_wan_arm_is_reached_before_the_ltx_synthetic_batch() -> None:
-    """Named-symbol form, so the gap is a callable rather than a branch nobody can point at."""
-    from signet_trainer.dryrun.shapes import assert_wan_dryrun_geometry
+    """Named-symbol form, so the gap is a callable rather than a branch nobody can point at.
+
+    UNCHANGED by slice B, and that it still passes is the point: the manifest gate landing did not
+    make the synthetic-batch refusal obsolete. ``build_dryrun_inputs`` is public, anything may call
+    it, and its wan branch must keep saying "there is no synthetic Wan batch" rather than falling
+    through to LTX's.
+    """
+    from signet_trainer.dryrun.shapes import assert_wan_dryrun_geometry, build_dryrun_inputs
 
     with pytest.raises(NotImplementedError, match="MANIFEST gate"):
         assert_wan_dryrun_geometry(load_config(_EXAMPLE))
+    # ...and it is genuinely REACHED from the synthetic-batch builder, not merely defined beside it.
+    with pytest.raises(NotImplementedError, match="MANIFEST gate"):
+        build_dryrun_inputs(load_config(_EXAMPLE))

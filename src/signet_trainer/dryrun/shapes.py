@@ -1173,31 +1173,135 @@ def assert_wan_dryrun_geometry(cfg: SignetConfig) -> ModelInputs:
     because ``compute_seq_len`` is silently 4x wrong there; here it is not wrong by a factor, it is
     about the wrong architecture entirely.
 
-    ``run_dryrun`` turns this into a non-zero return with the message on stderr, and
-    ``modal/entrypoint.main`` aborts on that BEFORE the cost print and long before ``.spawn()``. So
-    until the Wan/musubi stage lands, a ``family: wan`` dispatch of ANY mode stops here, at $0, with
-    a message naming what is missing — rather than dispatching down the LTX ``else:`` arm of the
-    train router, which is what a merely-absent arm would have done.
+    ``run_dryrun`` no longer reaches this function (slice B): it routes ``family: wan`` to
+    :func:`assert_wan_dryrun_manifest` — the MANIFEST gate this docstring specified — and skips the
+    synthetic-batch path entirely. This refusal is NOT retired with it, and keeping it is the point:
+    ``build_dryrun_inputs`` is a public function that anything may call, and its wan branch must
+    keep saying "there is no synthetic Wan batch" rather than falling through to the LTX arm. The
+    two are complements, not alternatives — one names what cannot be built, the other checks what
+    actually gates the run.
 
-    What lands it: signet does not need a Wan packing module for this. musubi owns the geometry and
-    reads it from the rendered dataset TOML, so the honest wan gate is a MANIFEST gate, not a
-    synthetic-batch gate — render the TOML through
-    ``runners/musubi_toml.render_from_config``, assert it parses and that every source's cache
-    directory is distinct, report ``musubi_resolution_warnings`` (the declared-vs-trained crop), and
-    print a batch line with the clip-instance arithmetic. Every piece of that already exists and is
-    tested; what does not exist is the Modal stage the gate would be gating, which is why it is not
-    wired here in this slice.
+    What the manifest gate does instead, and why it is the honest shape: musubi owns the geometry
+    and reads it from the rendered dataset TOML, so the artifact IS the thing to check. It renders
+    the TOML through ``runners/musubi_toml.render_from_config``, parses it back through the same
+    ``SourceSpec`` validators, asserts every source's cache directory is distinct, and reports
+    ``musubi_resolution_warnings`` (the declared-vs-trained crop). The clip-instance arithmetic
+    lives beside the cost line rather than here (``modal/cost.format_wan_batch_line``), because it
+    prices work and this gate checks shape.
     """
     raise NotImplementedError(
-        "assert_wan_dryrun_geometry: model.family 'wan' has no dry-run arm. The generic arm is "
-        "LTX's (compute_seq_len divides by 32 and assumes 128-channel LTX latents) and would print "
-        "a plausible OK banner about the wrong architecture, so this refuses instead — at $0, "
-        "before the cost print and before any dispatch. The wan gate is a MANIFEST gate: render "
-        "signet_trainer.runners.musubi_toml.render_from_config(cfg), assert it parses, assert the "
-        "cache directories are distinct, and report musubi_resolution_warnings. It lands with the "
-        "Wan/musubi Modal stage, which is what it would be gating. Until then a wan config is "
-        "config-load-valid and dispatch-refused: use render_from_config to produce the dataset "
-        "TOML and drive musubi directly."
+        "assert_wan_dryrun_geometry: model.family 'wan' has no SYNTHETIC-BATCH dry-run arm, and "
+        "cannot have one. The generic arm is LTX's (compute_seq_len divides by 32 and assumes "
+        "128-channel LTX latents) and would print a plausible OK banner about the wrong "
+        "architecture, so this refuses instead — at $0, before the cost print and before any "
+        "dispatch. The wan gate is a MANIFEST gate and it has LANDED as a separate function: "
+        "signet_trainer.dryrun.shapes.assert_wan_dryrun_manifest renders "
+        "runners.musubi_toml.render_from_config(cfg), parses it back, asserts the cache directories "
+        "are distinct and reports musubi_resolution_warnings. run_dryrun calls THAT for this family "
+        "and never reaches here; if you are seeing this message you called the synthetic-batch "
+        "builder directly."
+    )
+
+
+@dataclass(frozen=True)
+class WanDryrunManifest:
+    """What the wan gate CHECKED, so its banner reports facts rather than a bare OK.
+
+    A MANIFEST gate produces a manifest. The other two families' gate objects carry a sequence
+    length because their gate builds a batch; this one carries the rendered artifact and the three
+    properties that were asserted about it, because that artifact IS what the runner consumes.
+    """
+
+    toml_text: str
+    source_ids: tuple[str, ...]
+    cache_roots: tuple[str, ...]
+    resolution_warnings: tuple[str, ...]
+    blocks: int
+
+
+def assert_wan_dryrun_manifest(cfg: SignetConfig) -> WanDryrunManifest:
+    """The ``wan`` arm of the gate — a MANIFEST gate, exactly as the refusal below specified.
+
+    ``assert_wan_dryrun_geometry`` (immediately above) records why a SYNTHETIC-BATCH gate is
+    impossible here and stays the standing refusal on that path. This is the gate that replaces it,
+    and its shape is the one that refusal named: musubi owns the geometry and reads it from the
+    rendered dataset TOML, so the honest thing to check is the ARTIFACT, not a tensor signet would
+    have to invent.
+
+    Four assertions, every one free, in the order a failure is cheapest:
+
+      1. **It renders.** ``runners/musubi_toml.render_from_config`` refuses an absent/empty source
+         list rather than synthesising a block out of ``preprocessed_data_root``.
+      2. **It parses.** ``parse_musubi_toml`` reads the rendered text back through the SAME
+         ``SourceSpec`` validators, so a file this repo can write but musubi's schema would reject
+         dies here rather than in a metered container after the weights are resident. This is the
+         round trip the acceptance test performs against Timothy's real config, run against THIS
+         config.
+      3. **The caches are distinct.** Held a second time at the dispatch seam even though
+         ``DataConfig._check_sources`` already refused it at load: a shared cache directory turns
+         musubi's default cache pruning into mutual destruction between two datasets of one run,
+         and this feature's defining move is hand-writing near-identical cache paths off a single
+         source directory.
+      4. **The declared resolution is the TRAINED resolution** — reported as a WARNING, never a
+         refusal, because ``[640, 360]`` (which trains at 640x352) is the method's own working
+         value. The line prints the real number so the crop is accepted knowingly.
+
+    Raises:
+        ValueError: from the renderer or the parser. ``run_dryrun`` converts it into a non-zero
+            return with the message on stderr, and ``modal/entrypoint.main`` aborts on that BEFORE
+            the cost print and long before ``.spawn()``.
+    """
+    # Function-local: this module must stay importable on the SDK-free interpreter the dry-run
+    # contract targets, and ``runners`` is a sibling layer this file does not otherwise depend on.
+    from signet_trainer.runners.musubi_toml import (  # noqa: PLC0415
+        check_cache_collisions,
+        musubi_resolution_warnings,
+        parse_musubi_toml,
+        render_from_config,
+    )
+
+    sources = cfg.data.sources or ()
+    text = render_from_config(cfg)
+    parsed = parse_musubi_toml(text)
+    collisions = check_cache_collisions(sources, data_root=cfg.data.preprocessed_data_root)
+    if collisions:
+        raise ValueError(
+            "wan manifest gate: " + "; ".join(collisions) + " — musubi deletes cache files absent "
+            "from the current spec, so two sources sharing one directory destroy each other's "
+            "latents rather than merely colliding."
+        )
+    return WanDryrunManifest(
+        toml_text=text,
+        source_ids=tuple(s.id for s in sources),
+        cache_roots=tuple(
+            s.resolve_cache_root(cfg.data.preprocessed_data_root) for s in sources
+        ),
+        resolution_warnings=tuple(musubi_resolution_warnings(sources)),
+        blocks=len(parsed.sources),
+    )
+
+
+def _wan_ok_banner(cfg: SignetConfig, manifest: WanDryrunManifest) -> str:
+    """The wan OK line: what was rendered, what it parsed back to, and every declared-vs-trained crop.
+
+    Prints the resolution warnings INLINE rather than to stderr so they cannot be lost in a
+    non-interactive dispatch, and prints the block count from the PARSE rather than from the source
+    list — a count taken from the input would not be evidence that the output was readable.
+    """
+    width, height, frames = cfg.training_dims
+    warnings = (
+        " WARN: " + " | ".join(manifest.resolution_warnings)
+        if manifest.resolution_warnings
+        else " No declared-vs-trained resolution crops."
+    )
+    return (
+        f"[signet-dryrun] OK — wan config valid, musubi dataset TOML rendered + parsed on CPU: "
+        f"family={cfg.model.family}, {manifest.blocks} [[datasets]] block(s) from "
+        f"{len(manifest.source_ids)} source(s) {list(manifest.source_ids)}, "
+        f"{len(set(manifest.cache_roots))} distinct cache director(ies), priced view "
+        f"[W={width}, H={height}, F={frames}] (the largest declared). No synthetic batch is built "
+        f"on this family — musubi owns the geometry and reads it from this TOML."
+        f"{warnings} Zero GPU, zero Modal spend."
     )
 
 
@@ -1872,16 +1976,33 @@ def run_dryrun(cfg: SignetConfig) -> int:
     card in this program and H3's measured triple prices a different model at a different row width.
     The layout is computed and PRINTED regardless; the banner says ``ceiling=DISABLED (unmeasured)``
     so the gap is visible rather than implied by a comfortable-looking headroom number.
+
+    ``model.family == "wan"`` is the one family that builds NO synthetic batch at all (slice B). It
+    is a RUNNER family — musubi owns the geometry and reads it from the rendered dataset TOML — so
+    its gate checks the ARTIFACT (it renders, it parses back, the cache directories are distinct,
+    the declared-vs-trained crop is reported) and returns before ``build_dryrun_inputs``, whose wan
+    branch still refuses by name for any caller reaching it directly. The skip is guarded on
+    ``wan_manifest is None``, so every other family's path through this function is byte-identical.
     """
     h3_budget: H3DryrunBudget | None = None
     qwen_edit_budget: QwenEditDryrunBudget | None = None
+    wan_manifest: WanDryrunManifest | None = None
     try:
         if cfg.model.family == "h3":
             h3_budget = assert_h3_seq_len_budget(cfg)
         elif cfg.model.family == "qwen_edit":
             qwen_edit_budget = assert_qwen_edit_row_budget(cfg)
-        mi = build_dryrun_inputs(cfg)
-        _assert_contract(cfg, mi)
+        elif cfg.model.family == "wan":
+            wan_manifest = assert_wan_dryrun_manifest(cfg)
+        # ⛔ The wan arm SKIPS both lines below, and that is the whole point of it being a manifest
+        # gate: ``build_dryrun_inputs`` is LTX's for this family (``compute_seq_len`` divides by 32
+        # and assumes 128-channel latents) and would build a shape-correct batch for a model this
+        # run does not use. Its wan branch therefore still REFUSES by name — see
+        # ``assert_wan_dryrun_geometry`` — and that refusal stays live for any caller reaching the
+        # synthetic path directly. Every other family is byte-identical: ``wan_manifest`` is None.
+        if wan_manifest is None:
+            mi = build_dryrun_inputs(cfg)
+            _assert_contract(cfg, mi)
     except AssertionError as exc:
         print(f"[signet-dryrun] dry-run contract assertion FAILED: {exc}", file=sys.stderr)
         return 1
@@ -1895,6 +2016,10 @@ def run_dryrun(cfg: SignetConfig) -> int:
 
     if qwen_edit_budget is not None:
         print(_qwen_edit_ok_banner(cfg, qwen_edit_budget))
+        return 0
+
+    if wan_manifest is not None:
+        print(_wan_ok_banner(cfg, wan_manifest))
         return 0
 
     width, height, frames = cfg.training_dims

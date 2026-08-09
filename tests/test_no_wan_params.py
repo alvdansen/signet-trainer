@@ -78,7 +78,18 @@ _ALLOWED_SHIFT_VALUES = {
 #: Modules OUTSIDE inference/ that carry sampling parameters and must be scanned anyway. Added
 #: because the Qwen scheduler pin lives in models/, and a gate that misses the file holding the
 #: parameter is decorative.
-_EXTRA_SCANNED = ("src/signet_trainer/models/qwen_edit_pipeline.py",)
+#:
+#: ⚠ EXTENDED 2026-08-09 for family #4. ``runners/wan_musubi.py`` holds the LOCKED musubi recipe,
+#: including ``discrete_flow_shift = 7.0`` — a REAL, REQUIRED Wan parameter. It carries the ``wan_``
+#: filename prefix specifically so ``_family_of`` recognises it, and it is listed here so the
+#: family-scoped VALUE rule actually reaches it. Without this line the module would sit outside
+#: every scan, which is the exact defect ``test_the_qwen_pipeline_module_is_actually_scanned``
+#: records: a gate that cannot see the file holding the parameter is decorative. This ADDS coverage;
+#: it relaxes nothing.
+_EXTRA_SCANNED = (
+    "src/signet_trainer/models/qwen_edit_pipeline.py",
+    "src/signet_trainer/runners/wan_musubi.py",
+)
 
 
 def _family_of(name: str) -> str | None:
@@ -177,16 +188,25 @@ def _inference_sources() -> list[Path]:
 
 
 def test_no_wan_params_in_inference_code() -> None:
-    """LTX-path modules keep the total ban; family modules keep a stricter, value-level one."""
+    """LTX-path modules keep the total ban; family modules keep a stricter, value-level one.
+
+    ⚠ WIDENED 2026-08-09 to cover ``_EXTRA_SCANNED`` as well as ``inference/``. Test (b) below
+    already scanned those files for shift VALUES; this one did not scan them at all, so a
+    ``UniPC`` / ``frames=33`` / ``guidance_scale=5`` leak into ``models/qwen_edit_pipeline.py`` or
+    ``runners/wan_musubi.py`` was invisible to the whole gate. Both files are clean today (checked
+    before widening), so this is coverage added at zero cost — and it means the two scans now agree
+    on WHICH FILES exist rather than each knowing about a different set.
+    """
     offenders: list[str] = []
-    for path in _inference_sources():
+    extra = [Path(__file__).resolve().parents[1] / rel for rel in _EXTRA_SCANNED]
+    for path in [*_inference_sources(), *(p for p in extra if p.exists())]:
         code = _strip_comments_and_docstrings(path.read_text(encoding="utf-8"))
         family = _family_of(path.name)
         tokens = _WAN_TOKENS if family is None else _WAN_TOKENS_ALWAYS
         for token in tokens:
             if token in code:
                 offenders.append(f"{path.name}: {token!r}")
-    assert not offenders, f"Wan sampling token(s) leaked into inference/ code: {offenders}"
+    assert not offenders, f"Wan sampling token(s) leaked into scanned code: {offenders}"
 
 
 def test_family_modules_pin_only_their_own_shift_values() -> None:
@@ -238,6 +258,30 @@ def test_the_qwen_pipeline_module_is_actually_scanned() -> None:
         "the Qwen pipeline no longer pins a shift in executable code. Either the pin moved (point "
         "_EXTRA_SCANNED at its new home) or it was lost — and losing it is the documented "
         "muddy-render failure, which looks like a model problem rather than a settings one."
+    )
+
+
+def test_the_wan_recipe_module_is_actually_scanned() -> None:
+    """The file holding the musubi ``--discrete_flow_shift`` pin must be IN scope.
+
+    The sibling of ``test_the_qwen_pipeline_module_is_actually_scanned``, and it exists for the same
+    reason applied to a second family: ``runners/wan_musubi.py`` lives outside ``inference/``, so the
+    directory-scoped scan would miss it entirely and the gate would pass over the one line that
+    matters. It carries the ``wan_`` prefix so ``_family_of`` classifies it, and it is named in
+    ``_EXTRA_SCANNED`` so the value-level rule reaches it — and 7.0 is Wan's OWN value, so this is
+    the family scoping doing its job rather than an exemption.
+    """
+    target = Path(__file__).resolve().parents[1] / "src/signet_trainer/runners/wan_musubi.py"
+    assert target.exists(), "runners/wan_musubi.py is gone — update _EXTRA_SCANNED"
+    assert "src/signet_trainer/runners/wan_musubi.py" in _EXTRA_SCANNED
+    assert _family_of(target.name) == "wan_", (
+        "runners/wan_musubi.py must keep its wan_ filename prefix — that prefix is what puts it "
+        "under the family-scoped VALUE rule instead of outside every rule."
+    )
+    code = _strip_comments_and_docstrings(target.read_text(encoding="utf-8"))
+    assert _shift_literals(code) == {"7.0"}, (
+        "the musubi recipe must pin exactly one shift literal, 7.0 (train_kohya.py:154). Anything "
+        f"else is either a lost pin or a foreign value; found {sorted(_shift_literals(code))}."
     )
 
 

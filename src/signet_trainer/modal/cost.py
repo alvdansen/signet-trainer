@@ -13,6 +13,7 @@ setup (A3) — and the enochiatron ``50.0`` guardrail.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 # RESEARCH.md A3 — confirm against live Modal pricing at setup (this is an assumed constant).
 DEFAULT_HOURLY_RATE_USD = 1.64  # [ASSUMED] A100-80GB $/hr
@@ -181,3 +182,157 @@ def format_render_batch_line(estimate: RenderBatchEstimate) -> str:
             f"{estimate.seconds_per_image_budget:.0f} s per image"
         )
     return f"[signet-cost] render batch: {estimate.describe()}; {budget}"
+
+
+# --------------------------------------------------------------------------------------------------
+# A WAN (musubi) RUN's SIZE — the same "print the WORK beside the estimate" move, for a run whose
+# work is only PARTLY knowable, and which therefore has to say so.
+#
+# The qwen render batch above is fully determined before dispatch, so its line is pure arithmetic.
+# A wan run is not, and pretending otherwise is the failure this whole layer exists to avoid. Three
+# facts are knowable at $0 and one is not:
+#
+#   KNOWABLE  clips per MEDIA FILE per source (head/uniform/full/image are arithmetic on the
+#             declared extraction; chunk/slide depend on video LENGTH, which lives on a Volume)
+#   KNOWABLE  num_repeats, which multiplies them — and on musubi that means RUN LENGTH, not
+#             mixture proportion, because the runner is epoch-driven
+#   KNOWABLE  max_train_epochs, the recipe's actual stopping rule
+#   NOT       how many media files are in each corpus directory. Pitfall 1: no filesystem touch
+#             locally, and the directories are container paths on the dataset Volume.
+#
+# So the line prints PER-MEDIA clip instances and names the one multiplier it cannot supply, rather
+# than inventing a corpus size to make a total. It also prints ``training.max_steps`` beside
+# ``max_train_epochs`` for the reason SourceSpec.num_repeats records at length: musubi is
+# EPOCH-driven and does not read max_steps at all, so an operator reading signet's step budget as
+# the run length is wrong by whatever the corpus happens to be.
+# --------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WanSourceView:
+    """One source, reduced to the plain values the clip arithmetic needs.
+
+    A flat record rather than a ``SourceSpec`` so this module keeps its pure-arithmetic character
+    and its import closure (the caller does the extraction, exactly as it does for the render batch).
+    """
+
+    source_id: str
+    kind: str
+    extraction: str
+    target_frames: tuple[int, ...]
+    frame_sample: int
+    num_repeats: int
+
+
+@dataclass(frozen=True)
+class WanSourceClips:
+    """The per-media clip arithmetic for one source. ``None`` means corpus-dependent, not zero."""
+
+    source_id: str
+    kind: str
+    extraction: str
+    clips_per_media: int | None
+    num_repeats: int
+    instances_per_media: int | None
+
+    def describe(self) -> str:
+        if self.clips_per_media is None:
+            return (
+                f"{self.source_id}={self.extraction}:? (corpus-dependent) x{self.num_repeats}"
+            )
+        return (
+            f"{self.source_id}={self.extraction}:{self.clips_per_media}"
+            f"x{self.num_repeats}={self.instances_per_media}"
+        )
+
+
+@dataclass(frozen=True)
+class WanBatchEstimate:
+    """What one musubi round will do per media file, and the multiplier nobody can supply locally."""
+
+    per_source: tuple[WanSourceClips, ...]
+    instances_per_media_total: int | None
+    max_train_epochs: int
+    declared_max_steps: int
+    est_hours: float
+
+    def describe(self) -> str:
+        breakdown = "; ".join(s.describe() for s in self.per_source) or "no sources"
+        if self.instances_per_media_total is None:
+            total = (
+                "total NOT SIZEABLE — at least one source uses chunk/slide, whose clip count "
+                "depends on video LENGTH (a Volume-side fact)"
+            )
+        else:
+            total = (
+                f"{self.instances_per_media_total} clip instance(s) per media file across "
+                f"{len(self.per_source)} source(s)"
+            )
+        return f"{breakdown} -> {total}"
+
+
+def wan_batch_estimate(
+    *,
+    sources: Sequence[WanSourceView],
+    max_train_epochs: int,
+    declared_max_steps: int,
+    est_hours: float,
+) -> WanBatchEstimate:
+    """Size a musubi round from its declared sources. Pure arithmetic, no SDK call, no filesystem.
+
+    Raises:
+        ValueError: on a non-positive epoch count or a negative ``est_hours`` — a round that runs
+            zero epochs is a config error, not a free run.
+    """
+    from signet_trainer.runners.wan_musubi import wan_clips_per_media  # noqa: PLC0415
+
+    if max_train_epochs <= 0:
+        raise ValueError(f"max_train_epochs must be >= 1, got {max_train_epochs}")
+    if est_hours < 0:
+        raise ValueError(f"est_hours must be >= 0, got {est_hours}")
+
+    per_source: list[WanSourceClips] = []
+    for view in sources:
+        clips = wan_clips_per_media(view.extraction, view.target_frames, view.frame_sample)
+        per_source.append(
+            WanSourceClips(
+                source_id=view.source_id,
+                kind=view.kind,
+                extraction=view.extraction,
+                clips_per_media=clips,
+                num_repeats=view.num_repeats,
+                instances_per_media=None if clips is None else clips * view.num_repeats,
+            )
+        )
+    # None propagates: a total that silently drops an unknown source would UNDER-count, and this
+    # number's only job is to be checkable by eye against the corpus the operator actually has.
+    total: int | None = 0
+    for source in per_source:
+        if source.instances_per_media is None:
+            total = None
+            break
+        total += source.instances_per_media
+    return WanBatchEstimate(
+        per_source=tuple(per_source),
+        instances_per_media_total=total,
+        max_train_epochs=max_train_epochs,
+        declared_max_steps=declared_max_steps,
+        est_hours=est_hours,
+    )
+
+
+def format_wan_batch_line(estimate: WanBatchEstimate) -> str:
+    """The wan batch banner, printed BESIDE ``format_cost_line`` and never in place of it.
+
+    It adds a line, never a decision: the guardrail arithmetic and its basis are byte-identical to
+    every other mode, because turning per-media clip counts into hours would need a seconds-per-step
+    figure nobody in this program has measured for Wan on any card.
+    """
+    return (
+        f"[signet-cost] wan batch: {estimate.describe()}; musubi is EPOCH-driven "
+        f"(--max_train_epochs {estimate.max_train_epochs}), so the run length is that x the clip "
+        f"instances above x the media-file count on the dataset Volume — a number this gate cannot "
+        f"read (Pitfall 1). training.max_steps={estimate.declared_max_steps} is signet's accounting "
+        f"basis and is NOT passed to the runner. The guardrail above is priced on the DECLARED "
+        f"cfg.modal.est_hours={estimate.est_hours:g}, which is not a measurement."
+    )

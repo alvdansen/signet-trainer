@@ -766,6 +766,307 @@ def _qwen_edit_encode_params(cfg: object) -> dict[str, object] | None:
     }
 
 
+# --------------------------------------------------------------------------------------------------
+# Family #4 (wan) — the musubi-tuner RUNNER leg. One gated arm inside the existing ``train`` mode.
+# --------------------------------------------------------------------------------------------------
+
+#: The ONE mode the wan family serves, named once because three places must agree: the gap check
+#: (which refuses the other five), the arm below (which routes on it), and the operator reading the
+#: message. There is no wan encode stage because musubi's two cache passes run INSIDE ``wan_train``,
+#: and no wan render stage because this repo has no Wan inference path at all.
+_WAN_SUPPORTED_MODE = "train"
+
+
+def _wan_source_views(cfg: object) -> tuple[object, ...]:
+    """The declared sources reduced to the flat records ``modal/cost`` prices.
+
+    Read TOLERANTLY through ``getattr`` — the ``_qwen_edit_render_request`` idiom — so this works
+    against a config object whether or not ``data.sources`` exists on it, and the extraction is done
+    HERE rather than inside ``cost.py`` so that module keeps its pure-arithmetic character and its
+    import closure (it never learns what a ``SourceSpec`` is).
+    """
+    from signet_trainer.modal.cost import WanSourceView  # noqa: PLC0415
+
+    return tuple(
+        WanSourceView(
+            source_id=source.id,
+            kind=source.kind,
+            # ``.value`` because ExtractionMode is ``(str, Enum)``: the mixin means ``str(mode)``
+            # renders ``ExtractionMode.HEAD`` on 3.10, not ``head``, and the pricing table keys on
+            # the wire value. StrEnum would have made these identical — and StrEnum is 3.11+, which
+            # is exactly why the enum is a mixin (config/sources.py records the bench-interpreter
+            # reason). Reading ``.value`` is the cost of that, paid once, here.
+            extraction=source.extraction.value,
+            target_frames=tuple(source.target_frames),
+            frame_sample=source.frame_sample,
+            num_repeats=source.num_repeats,
+        )
+        for source in (getattr(cfg.data, "sources", None) or ())
+    )
+
+
+def _wan_batch_note(cfg: object) -> str:
+    """Size the musubi round from its declared sources, printed BESIDE the cost line.
+
+    The ``_qwen_edit_render_batch_note`` move, applied to a run whose work is only PARTLY knowable —
+    and the partial knowledge is reported as partial rather than rounded up into a total. What can
+    be computed at $0 is clip instances PER MEDIA FILE per source; what cannot is how many media
+    files each corpus directory holds, because those are container paths on the dataset Volume and
+    this process performs no filesystem touch (Pitfall 1). ``chunk`` and ``slide`` additionally
+    depend on video LENGTH, so a source using either prices as "corpus-dependent" and the total
+    declines to exist rather than silently under-counting.
+
+    The guardrail's BASIS is unchanged: this adds a line, never a decision. Turning clip counts into
+    hours would need a seconds-per-step figure nobody in this program has measured for Wan on any
+    card, and inventing one to feed a money gate is the opposite of what the gate is for.
+    """
+    from signet_trainer.modal.cost import format_wan_batch_line, wan_batch_estimate  # noqa: PLC0415
+    from signet_trainer.runners.wan_musubi import WAN_MUSUBI_RECIPE  # noqa: PLC0415
+
+    return format_wan_batch_line(
+        wan_batch_estimate(
+            sources=_wan_source_views(cfg),
+            max_train_epochs=WAN_MUSUBI_RECIPE.max_train_epochs,
+            declared_max_steps=int(cfg.training.max_steps),
+            est_hours=float(cfg.modal.est_hours),
+        )
+    )
+
+
+def _wan_components(cfg: object) -> object:
+    """Resolve the four Wan component ids, refusing an INHERITED LTX default as firmly as a gap.
+
+    ONE call site for two readers (the gap check and the params helper), so the two can never
+    disagree about whether a config names its weights.
+
+    The ``schema_defaults`` mapping is DERIVED from ``ModelConfig.model_fields`` rather than
+    restated, and that derivation is the whole point. ``model.text_encoder_id`` defaults to
+    ``"gemma-3-12b-it"`` — LTX's Gemma encoder — and ``model.model_id`` to the LTX checkpoint, so a
+    truthiness test alone RESOLVES on a wan config that declared neither and the stage would hand
+    musubi ``--t5 <weights>/gemma-3-12b-it``. Deriving the defaults means the refusal stays true if
+    a default ever changes; restating them here would be a second copy that silently rots.
+
+    ``ModelConfig`` is imported function-locally so this module keeps its import surface — the same
+    reason ``_qwen_edit_config_gaps`` imports the render recipe inside its own body.
+    """
+    from signet_trainer.config.schema import ModelConfig  # noqa: PLC0415
+    from signet_trainer.runners.wan_musubi import (  # noqa: PLC0415
+        WAN_COMPONENT_CONFIG_FIELDS,
+        wan_resolve_component_ids,
+    )
+
+    return wan_resolve_component_ids(
+        cfg.model,
+        schema_defaults={
+            field: ModelConfig.model_fields[field].default
+            for field in WAN_COMPONENT_CONFIG_FIELDS.values()
+            if field in ModelConfig.model_fields
+        },
+    )
+
+
+def _wan_config_gaps(cfg: object, *, mode: str) -> list[str]:
+    """Every DECLARED gap between a validated ``family: wan`` config and what the stage needs.
+
+    The ``_qwen_edit_config_gaps`` contract: one sentence per gap saying what is missing, why the
+    stage needs it, and what would land it — reported ALL AT ONCE (the enochiatron lesson: fixing
+    one gap and re-running to find the next is how a cheap check becomes an expensive loop).
+
+    ``cfg`` is typed ``object`` and read by ATTRIBUTE throughout. That is not defensiveness for its
+    own sake: two of the checks below are held a SECOND time here, and a second line of defense that
+    silently assumes the first one ran is not one.
+
+    **(1) the MODE — every mode but ``train``.** Family #4 has exactly one stage, and the other five
+    modes are not merely unimplemented, they are wrong in different ways. ``preprocess`` would be a
+    second cost line for work ``wan_train`` already performs, because musubi's two cache passes read
+    the dataset TOML directly and run INSIDE the training stage; a signet-side Wan encoder would
+    additionally be the "never write a custom encoder" landmine, since a canonical one exists.
+    ``sample`` has no Wan inference path anywhere in this repo. ``fuse`` / ``restore`` / ``backup``
+    are CPU utilities keyed to signet's own checkpoint layout, and musubi writes its own. Refusing by
+    name here is what stops a wan config falling through to an arm built for a different family.
+
+    **(2) the SOURCE LIST — every mode.** A wan run's dataset IS the ``[[datasets]]`` array;
+    ``render_from_config`` refuses to synthesise one from ``preprocessed_data_root`` because that
+    would invent a resolution, an extraction mode and a cache identity nobody wrote.
+    ``SignetConfig``'s wan arm already refuses this at config LOAD, so on the normal path this is a
+    second line of defense — and it earns its place: the renderer runs at DISPATCH time, inside this
+    seam, and a traceback out of a renderer the operator did not know was running is a worse
+    failure than a named refusal beside the other gaps.
+
+    **(3) COLLIDING CACHE ROOTS — every mode.** Likewise held a second time (``DataConfig.
+    _check_sources`` delegates to the same ``check_cache_collisions``), and likewise not tidiness:
+    musubi deletes cache files that are absent from the current dataset spec, which is CORRECT when
+    the spec changes between rounds and is only safe because every source has a unique cache
+    directory. Two sources sharing one turn that default into mutual destruction inside a paid
+    container. ``config/sources.check_cache_collisions`` is exposed as a pure list-returning check
+    precisely so it can be reported HERE, at $0, rather than as a renderer exception.
+
+    **(4) the CAPTION EXTENSION — every mode.** ``[general].caption_extension`` is what musubi
+    appends to each media stem to find its caption, and the renderer takes it as a required
+    argument. An absent or blank value renders ``caption_extension = ""`` — a perfectly valid TOML
+    line that makes every caption path the bare media stem, so every clip trains with an empty
+    caption at an entirely ordinary loss curve. Read tolerantly (``getattr``) so this fires on a
+    config object that predates the field as well as one that leaves it empty.
+
+    **(5) the FOUR WEIGHT COMPONENTS — every mode.** Wan 2.1 needs a DiT, a VAE, a umT5 text encoder
+    AND an open-CLIP encoder (``train_kohya.py:69-92``), and signet resolves all four from the
+    weights Volume rather than ``hf_hub_download``-ing them per container. Three distinct kinds of
+    gap sit behind that, which is why ``runners/wan_musubi.wan_resolve_component_ids`` reports them
+    together and this check simply relays its message: ``model.model_id`` / ``model.text_encoder_id``
+    are ordinary UNSET fields; ``model.vae_id`` EXISTS but is fenced away from this family by
+    ``config/schema._FAMILY_ONLY_MODEL_IDS``; ``model.clip_id`` does not exist at all, because no
+    signet family has ever carried two text-side encoders.
+
+    **(6) the UNPINNED musubi CHECKOUT — every mode.** ``modal/app.MUSUBI_TUNER_COMMIT_SHA`` is
+    ``None``. Every other foreign checkout in that file is a literal 40-hex SHA, and this one has no
+    value to transcribe (``train_kohya.py:31`` clones ``main`` with no checkout) and none this pass
+    could resolve (zero downloads). Writing a plausible hex string would be fabrication of exactly
+    the kind those pins exist to prevent, so the gap is refused instead — and it is not cosmetic:
+    musubi's dataset-config SCHEMA is what ``runners/musubi_toml.py`` transcribes, so a floating
+    ``main`` that renamed a key is discovered as a rejected TOML inside a metered container.
+    """
+    gaps: list[str] = []
+
+    if mode != _WAN_SUPPORTED_MODE:
+        gaps.append(
+            f"--mode {mode!r} has no wan arm, and the wan family has exactly one stage "
+            f"(--mode {_WAN_SUPPORTED_MODE!r}). musubi owns caching END TO END: "
+            "wan_cache_latents.py and wan_cache_text_encoder_outputs.py read the dataset TOML "
+            "directly and run INSIDE wan_train, so a 'preprocess' arm would be a second cost line "
+            "for work the train stage already performs (and a signet-side Wan encoder would be a "
+            "custom re-implementation of a canonical one). 'sample' has no Wan inference path "
+            "anywhere in this repo. fuse/restore/backup are keyed to signet's own checkpoint "
+            "layout, which musubi does not write. WHAT LANDS a render arm: a Wan inference path "
+            "(pipeline + sampler), which is a family of work, not a Modal wiring change."
+        )
+
+    sources = tuple(getattr(cfg.data, "sources", None) or ())
+    if not sources:
+        gaps.append(
+            "data.sources is absent or empty. The musubi dataset TOML IS the source list — "
+            "runners/musubi_toml.render_from_config refuses to derive a [[datasets]] block from "
+            "data.preprocessed_data_root because that would invent a resolution, an extraction mode "
+            "and a cache identity nobody wrote. SignetConfig's wan arm refuses this at config load "
+            "too; it is repeated here because the renderer RUNS at this seam. WHAT LANDS IT: "
+            "declare data.sources (see configs/wan21_kaboom.example.yaml)."
+        )
+    else:
+        from signet_trainer.config.sources import check_cache_collisions  # noqa: PLC0415
+
+        collisions = check_cache_collisions(
+            sources, data_root=cfg.data.preprocessed_data_root
+        )
+        if collisions:
+            gaps.append(
+                "; ".join(collisions)
+                + ". musubi DELETES cache files that are absent from the current dataset spec — "
+                "correct when the spec changes between rounds, and safe only because every source "
+                "has a unique cache directory. Two sources sharing one do not merely collide, they "
+                "mutually destroy each other's latents inside a paid container. WHAT LANDS IT: give "
+                "each source its own cache_root, or omit the key and let "
+                "SourceSpec.resolve_cache_root derive <preprocessed_data_root>/cache/<id>, which "
+                "cannot collide by omission."
+            )
+
+    caption_extension = getattr(cfg.data, "caption_extension", None)
+    if not caption_extension:
+        gaps.append(
+            f"data.caption_extension is {caption_extension!r}. It is the [general] key musubi "
+            "appends to each media stem to locate that file's caption, and it is a REQUIRED "
+            "argument of render_musubi_toml — an empty value renders `caption_extension = \"\"`, "
+            "which is valid TOML and makes every caption path the bare media stem, so every clip "
+            "trains with an EMPTY caption at a perfectly ordinary loss curve. WHAT LANDS IT: set "
+            "data.caption_extension (it must start with '.', e.g. \".txt\"); note "
+            "SourceSpec.caption_extension can override it per source, which is what a corpus with "
+            "per-clip captions needs."
+        )
+
+    try:
+        _wan_components(cfg)
+    except NotImplementedError as exc:
+        gaps.append(str(exc))
+
+    from signet_trainer.modal.app import MUSUBI_TUNER_COMMIT_SHA  # noqa: PLC0415
+
+    if not MUSUBI_TUNER_COMMIT_SHA:
+        gaps.append(
+            "modal/app.MUSUBI_TUNER_COMMIT_SHA is unpinned (None), so wan_musubi_image would build "
+            "against a FLOATING kohya-ss/musubi-tuner main — the failure LTX2_COMMIT_SHA / "
+            "DIFFUSERS_SHA / QWEN_DIFFUSERS_SHA all exist to prevent, and worse here because "
+            "musubi's dataset-config SCHEMA is what runners/musubi_toml.py transcribes: an upstream "
+            "key rename surfaces as a rejected TOML inside a metered container after the weights "
+            "are resident. The image build refuses rather than falling back to main, so this is "
+            "belt and braces. WHAT LANDS IT: `gh api repos/kohya-ss/musubi-tuner/commits/main "
+            "--jq .sha`, then set the literal 40-hex string in modal/app.py."
+        )
+
+    return gaps
+
+
+def _wan_refuse_on_gaps(cfg: object, *, mode: str) -> None:
+    """Abort pre-dispatch, naming every gap at once, when a wan config cannot drive ``mode``.
+
+    The ``_qwen_edit_refuse_on_gaps`` shape and position: called AFTER ``_require_approval`` and
+    BEFORE ``.spawn(``, so a doomed run aborts without spending and without weakening MODL-02.
+    """
+    gaps = _wan_config_gaps(cfg, mode=mode)
+    if not gaps:
+        return
+    listed = "\n".join(f"  ({i + 1}) {gap}" for i, gap in enumerate(gaps))
+    raise SystemExit(
+        f"[signet-entrypoint] the wan {mode!r} stage cannot be dispatched from this config — "
+        f"{len(gaps)} DECLARED gap(s):\n{listed}\n"
+        "[signet-entrypoint] Aborting AFTER the approval pause and BEFORE any dispatch: nothing was "
+        "spent. Every gap above names what lands it."
+    )
+
+
+def _wan_train_params(cfg: object) -> dict[str, object] | None:
+    """EVERY required kwarg of ``fns.wan_train`` for a ``family: wan`` config; ``None`` otherwise.
+
+    The ``_h3_encode_params`` shape and the same burned-gate discipline (09-07 T3): read ONLY fields
+    that exist on the loaded config, and read them HERE — bound to a local, before the dispatch —
+    never inline inside the ``.spawn(`` expression.
+
+    ⛔ THE DATASET TOML IS RENDERED HERE, AT DISPATCH TIME, and shipped BY VALUE. That is the whole
+    feature rather than a detail of packaging. ``train_kohya.py:40-43`` bakes the TOML into the
+    IMAGE, which makes changing the dataset an image REBUILD and makes "what did round 2 train on?"
+    unanswerable from the artifacts. Rendering it from the validated manifest at dispatch — and
+    writing it beside the adapter in-container — turns "only the dataset changed between rounds"
+    from a memory into a ``diff`` of two committed files.
+
+    It is also the only way this stage can work at all: ``wan_musubi_image`` carries musubi's
+    ``pydantic==1.10.13`` and cannot load a ``SignetConfig``, so the manifest must be resolved on
+    THIS side of the dispatch. ``wan_train`` declares all eight parameters REQUIRED with no
+    defaults, so a threading gap is a ``TypeError`` at dispatch rather than a silent wrong default.
+
+    ``output_name`` is derived from ``cfg.output_dir``'s final segment (``outputs/wan21_kaboom`` ->
+    ``wan21_kaboom``) rather than carried as a field: musubi's ``--output_name`` is the adapter's
+    FILE stem inside ``--output_dir``, so deriving it keeps one round's artifacts named after that
+    round with nothing new to keep in sync. train_kohya.py's literal ``wan21-lora`` is not carried —
+    it would name every round's adapter identically.
+    """
+    if cfg.model.family != "wan":
+        return None
+    # Raises on every gap at once. Kept BEFORE the render below so a missing component surfaces as
+    # the named refusal rather than as a confusing ValueError out of the renderer.
+    _wan_refuse_on_gaps(cfg, mode=_WAN_SUPPORTED_MODE)
+
+    from signet_trainer.runners.musubi_toml import render_from_config  # noqa: PLC0415
+
+    components = _wan_components(cfg)
+    return {
+        "dataset_toml": render_from_config(cfg),
+        "dit_id": components.dit,
+        "vae_id": components.vae,
+        "t5_id": components.t5,
+        "clip_id": components.clip,
+        "output_dir": cfg.output_dir,
+        "output_name": Path(cfg.output_dir).name,
+        "seed": cfg.seed,
+    }
+
+
 @app.local_entrypoint()
 def main(config: str, approve: bool = False, mode: str = "train") -> None:
     """Preflight + gated launch from a YAML config — load, dry-run gate, cost print, APPROVE, dispatch.
@@ -798,6 +1099,16 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
     ``_qwen_edit_refuse_on_gaps`` (can this config drive that stage at all?) — both strictly AFTER
     the approval pause and BEFORE the ``.spawn``, so they abort a doomed run without spending and
     without weakening MODL-02.
+
+    Family #4 (``wan``) adds the musubi-tuner RUNNER leg and, again, ZERO new modes — but it adds
+    only ONE arm, inside ``train``. That asymmetry is real and is the interesting part: musubi owns
+    caching end to end (its two cache passes read the dataset TOML directly and run INSIDE
+    ``wan_train``), so there is nothing for a ``preprocess`` arm to do that would not be a second
+    cost line for the same work; and no Wan inference path exists in this repo, so there is nothing
+    for ``sample`` to dispatch. TEN dispatches now, still ONE gate and ONE ledger. Because the other
+    five modes have no wan arm, a family FENCE sits between the approval pause and the routing chain
+    — without it a ``family: wan`` config on ``--mode sample`` would fall through to the LTX
+    sampler, which is precisely what the dry-run refusal used to prevent for every mode at once.
 
     Pass ``--approve`` to authorize non-interactively (harness path); otherwise the operator must
     type ``approved`` at the prompt (D-03 / MODL-02).
@@ -953,6 +1264,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
     # guardrail arithmetic and its BASIS are byte-identical to every other mode.
     if mode == "sample" and cfg.model.family == "qwen_edit":
         print(_qwen_edit_render_batch_note(cfg))
+    elif cfg.model.family == "wan":
+        # The wan analogue, and it prints on EVERY mode rather than one: a wan round's work is
+        # declared per SOURCE, so the arithmetic is available whatever the operator asked for — and
+        # for the five modes this family does not serve, seeing the clip counts beside the refusal
+        # is how the refusal reads as "wrong stage", not "broken config". Same discipline as above:
+        # a line BESIDE format_cost_line, never in place of it.
+        print(_wan_batch_note(cfg))
     print(format_cost_line(decision))
     if not decision.allowed:
         print(
@@ -984,6 +1302,18 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
     # (``cfg.modal.dispatch_watch_seconds``) is what keeps the CHEAP aborts synchronous: an arch-gate
     # FAIL, a CPU-preflight refusal, a config raise or an import death still surfaces at this console
     # inside the window; anything longer-running outlives this client on purpose.
+    # ⛔ THE FAMILY FENCE, and it must sit HERE — after the approval pause, before the routing chain
+    # below. Family #4 serves exactly ONE mode. Every other arm in the chain is written for a family
+    # that owns its own encode/loop/render, so a ``family: wan`` config reaching ``elif mode ==
+    # "sample":`` would dispatch the LTX sampler with an LTX-shaped expectation of the checkpoint
+    # layout — the fall-through that ``assert_wan_dryrun_geometry``'s refusal used to block for ALL
+    # modes at once. Now that the dry-run gate PASSES for this family (it is a manifest gate, and
+    # the manifest is fine), that blanket protection is gone and this fence replaces it. Placed
+    # after ``_require_approval`` for consistency with the qwen gap refusals: MODL-02 is untouched
+    # either way, and ``_wan_refuse_on_gaps`` always raises on a non-train mode (gap 1).
+    if cfg.model.family == "wan" and mode != _WAN_SUPPORTED_MODE:
+        _wan_refuse_on_gaps(cfg, mode=mode)
+
     if mode == "sample" and cfg.model.family == "h3":
         # Phase-10 (H3-07) H3 arm of the SAME mode: base-vs-adapter Ref2VA renders at one seed plus
         # the automated ``max|delta velocity|`` floor (D-10-SCOPEGUARD). Routed by family, NOT by a
@@ -1236,6 +1566,41 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         )
         fc = qwen_edit_train.with_options(timeout=qwen_edit_train_timeout_s).spawn(config_text)
         _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "qwen_edit_train")
+    elif cfg.model.family == "wan":
+        # Family #4's ONLY arm, inside the DEFAULT ``train`` mode. Routed by family, not by a
+        # seventh --mode value — six dispatches, one gate, one ledger, unchanged.
+        #
+        # ⛔ ``.spawn(**wan_params)``, NOT ``.spawn(config_text)``, and the difference is forced
+        # rather than stylistic: ``wan_musubi_image`` carries musubi's ``pydantic==1.10.13``
+        # (train_kohya.py:37) while ``config/load.load_config_from_text`` needs pydantic>=2.10.4, so
+        # this is the one train stage that CANNOT re-parse its config in-container. The whole
+        # threading burden therefore sits in ``_wan_train_params`` — bound to a local HERE, before
+        # the dispatch, so a field-read failure is a named abort rather than a traceback out of a
+        # ``.spawn()`` expression (the 09-07 T3 burned-gate lesson) — and it is also where the
+        # dataset TOML is RENDERED, which is what makes "only the dataset changed between rounds" a
+        # property of the artifacts rather than of somebody's memory.
+        from signet_trainer.modal.fns import wan_train
+
+        wan_params = _wan_train_params(cfg)
+        assert wan_params is not None  # family == "wan" was just checked by this arm's condition
+        wan_train_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
+        print(
+            "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
+            "Dispatching wan_train.spawn() (gated, family: wan); ONE stage running musubi's three "
+            "passes in order — wan_cache_latents.py, wan_cache_text_encoder_outputs.py, then "
+            "accelerate launch wan_train_network.py — each with check=True, unlike the "
+            "transcription (train_kohya.py never inspects a return code, so a failed cache pass "
+            "there trains on an empty cache). The rendered dataset TOML and the adapters commit to "
+            "signe-trainer-checkpoints under <output_dir>/.\n"
+            f"[signet-entrypoint] ⚠ COST BASIS: est_hours={cfg.modal.est_hours:g} is a DECLARED "
+            "estimate, not a measurement — no steps/hour figure has been recorded for Wan on any "
+            "card in this program, and musubi is EPOCH-driven so training.max_steps="
+            f"{cfg.training.max_steps} is signet's accounting basis and is not passed to the "
+            "runner. The wan batch line above prints the clip-instance arithmetic that IS knowable; "
+            "the media-file count that completes it lives on the dataset Volume."
+        )
+        fc = wan_train.with_options(timeout=wan_train_timeout_s).spawn(**wan_params)
+        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "wan_train")
     else:
         from signet_trainer.modal.fns import train
 
