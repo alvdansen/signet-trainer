@@ -186,21 +186,26 @@ def test_every_runners_module_is_either_scanned_or_provably_clean() -> None:
     )
 
 
-def test_the_renderer_is_the_module_this_gap_is_about() -> None:
-    """RED self-check + the standing record of WHY the test above is directory-wide.
+def test_the_renderer_is_now_scanned_and_the_gap_is_closed() -> None:
+    """RETIRED-AND-INVERTED 2026-08-09. Its predecessor said so itself.
 
-    If ``musubi_toml.py`` is ever added to ``_EXTRA_SCANNED`` (the better fix), this test starts
-    failing and should be deleted along with the reason for the directory-wide scan.
+    The original asserted musubi_toml.py was NOT in _EXTRA_SCANNED, and its docstring named its own
+    successor condition: "If musubi_toml.py is ever added to _EXTRA_SCANNED (the better fix), this
+    test starts failing and should be deleted." The better fix landed, so this is the inverted form
+    that keeps the property rather than the gap.
+
+    Why it stays a test instead of a deletion: the renderer is the module that WRITES the sampling
+    config, which makes it the single most valuable place for a Wan token to land unnoticed. It was
+    outside every scan for a structural reason — not under inference/, no wan_ prefix — so nothing
+    would have surfaced a regression except someone re-deriving the blind spot.
     """
-    from tests.test_no_wan_params import _EXTRA_SCANNED, _family_of  # noqa: PLC0415
+    from tests.test_no_wan_params import _EXTRA_SCANNED  # noqa: PLC0415
 
     assert _RENDERER.exists()
-    assert _family_of(_RENDERER.name) is None, (
-        "musubi_toml.py gained a family prefix — the value-level rule now reaches it"
-    )
-    assert "src/signet_trainer/runners/musubi_toml.py" not in _EXTRA_SCANNED, (
-        "musubi_toml.py is now in _EXTRA_SCANNED — the gap this file covers is closed upstream; "
-        "delete test_every_runners_module_is_either_scanned_or_provably_clean's rationale"
+    assert "src/signet_trainer/runners/musubi_toml.py" in _EXTRA_SCANNED, (
+        "the renderer left _EXTRA_SCANNED. It has no family prefix, so _family_of returns None and "
+        "the value-level shift rule does not reach it either — removing it from the extra scan "
+        "puts the TOML writer back outside every gate."
     )
 
 
