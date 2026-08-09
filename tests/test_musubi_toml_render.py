@@ -45,6 +45,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from signet_trainer.config.load import load_config_from_text
 from signet_trainer.config.sources import ExtractionMode, SourceSpec
 from signet_trainer.runners.musubi_toml import (
     MUSUBI_DATASET_KEYS,
@@ -59,32 +60,41 @@ from signet_trainer.runners.musubi_toml import (
 _REPO = Path(__file__).resolve().parents[1]
 #: Timothy's REAL musubi config — the oracle. Not a fixture written for this test.
 _REAL_TOML = _REPO / "docs" / "source-methods" / "musubi-wan21" / "wan21-dataset-config.toml"
-#: The signet-side expression of the same three-dataset method.
-_FIXTURE = _REPO / "tests" / "fixtures" / "wan21_kaboom.example.yaml"
+#: The signet-side expression of the same three-dataset method. MOVED in slice A from
+#: ``tests/fixtures/`` to ``configs/`` — with ``DataConfig.sources`` and ``ModelConfig.family: wan``
+#: landed it is a real, loadable run config, which is what its own header said would happen.
+_FIXTURE = _REPO / "configs" / "wan21_kaboom.example.yaml"
 
 
-def _fixture_data() -> dict:
-    """Return the fixture's ``data:`` block.
+def _fixture_config():
+    """Return the example as a VALIDATED ``SignetConfig``.
 
-    Read with ``yaml.safe_load`` rather than ``load_config_from_text`` because ``DataConfig`` has
-    no ``sources`` field yet (``config/schema.py:125-183``); when that lands, this helper becomes
-    ``load_config_from_text(_FIXTURE.read_text()).data`` and every assertion below is unchanged.
+    This helper used to be ``yaml.safe_load(...)["data"]`` with a note saying it would become
+    ``load_config_from_text(...)`` once ``DataConfig.sources`` landed. It has. Going through the
+    real loader is the substantive upgrade in this file: every assertion below is now made about
+    objects the schema BUILT and VALIDATED, so it exercises the ``SourceSpec`` coercion, the
+    cross-source cache-collision gate and the wan family arm — rather than about a dict that merely
+    happened to have the right keys.
     """
-    return yaml.safe_load(_FIXTURE.read_text(encoding="utf-8"))["data"]
+    return load_config_from_text(_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _fixture_data():
+    return _fixture_config().data
 
 
 def _fixture_sources() -> list[SourceSpec]:
-    return [SourceSpec.model_validate(entry) for entry in _fixture_data()["sources"]]
+    return list(_fixture_data().sources)
 
 
 def _render_fixture() -> str:
     data = _fixture_data()
     return render_musubi_toml(
         _fixture_sources(),
-        data_root=data["preprocessed_data_root"],
-        caption_extension=data["caption_extension"],
-        enable_bucket=data["enable_bucket"],
-        bucket_no_upscale=data["bucket_no_upscale"],
+        data_root=data.preprocessed_data_root,
+        caption_extension=data.caption_extension,
+        enable_bucket=data.enable_bucket,
+        bucket_no_upscale=data.bucket_no_upscale,
     )
 
 
@@ -139,17 +149,28 @@ def test_the_same_video_directory_appears_twice_with_different_caches() -> None:
 
 
 def test_the_fixture_prices_the_largest_declared_view() -> None:
-    """``training_dims`` is the most expensive view the run assembles, not a fourth geometry."""
-    config = yaml.safe_load(_FIXTURE.read_text(encoding="utf-8"))
+    """``training_dims`` is the most expensive view the run assembles, not a fourth geometry.
+
+    Slice A promoted this from a property of the example to a LAW of the family: the wan arm of
+    ``SignetConfig._cross_field_checks`` refuses any other value. Both halves are asserted — the
+    example still satisfies it, and the schema still enforces it.
+    """
+    config = _fixture_config()
     views = [
         (s.resolution[0], s.resolution[1], max(s.target_frames, default=1))
         for s in _fixture_sources()
     ]
     largest = max(views, key=lambda v: v[0] * v[1] * v[2])
-    assert config["training_dims"] == list(largest), (
-        f"training_dims {config['training_dims']} is not the largest declared view {list(largest)} "
-        f"(views: {views}) — the gate would price something this run never assembles"
+    assert list(config.training_dims) == list(largest), (
+        f"training_dims {list(config.training_dims)} is not the largest declared view "
+        f"{list(largest)} (views: {views}) — the gate would price something this run never "
+        f"assembles"
     )
+
+    raw = yaml.safe_load(_FIXTURE.read_text(encoding="utf-8"))
+    raw["training_dims"] = [640, 352, 45]  # the `motion` view: legal wan geometry, but not largest
+    with pytest.raises(ValidationError, match="largest view declared in data.sources"):
+        load_config_from_text(yaml.safe_dump(raw))
 
 
 # ==================================================================================================
@@ -166,7 +187,7 @@ def test_render_is_deterministic() -> None:
 def test_explicit_cache_roots_make_data_root_inert() -> None:
     """A source that NAMES its cache never reads ``data_root`` — proved, not assumed."""
     sources = _fixture_sources()
-    caption = _fixture_data()["caption_extension"]
+    caption = _fixture_data().caption_extension
     a = render_musubi_toml(sources, data_root="/one", caption_extension=caption)
     b = render_musubi_toml(sources, data_root="/completely/other", caption_extension=caption)
     assert a == b
@@ -432,9 +453,43 @@ def test_the_general_table_carries_exactly_the_three_shared_settings() -> None:
 # ==================================================================================================
 
 
-def test_render_from_config_names_what_lands_it() -> None:
-    with pytest.raises(NotImplementedError, match=r"sources.*DataConfig|DataConfig has no"):
-        render_from_config(object())
+def test_render_from_config_renders_the_oracle_straight_from_a_loaded_config() -> None:
+    """⚠ WAS a declared-gap test (``NotImplementedError``); the gap CLOSED in slice A.
+
+    ``DataConfig.sources`` landed, so ``render_from_config`` has something to read and asserting it
+    still raises would be asserting that the wiring did NOT happen. This is the same acceptance
+    claim as :func:`test_renders_the_kaboom_config_equivalently`, made through the SEAM an operator
+    actually uses: YAML on disk -> validated ``SignetConfig`` -> the real runner config, byte for
+    byte. It is the end-to-end proof that the schema field, the loader and the renderer agree.
+    """
+    rendered = render_from_config(_fixture_config())
+    assert rendered == _REAL_TOML.read_text(encoding="utf-8")
+    assert rendered == _render_fixture(), (
+        "render_from_config disagrees with the explicit render_musubi_toml call — the [general] "
+        "kwargs it reads off DataConfig have drifted from the ones the test passes by hand"
+    )
+
+
+def test_render_from_config_refuses_a_sourceless_config_rather_than_inventing_a_block() -> None:
+    """A config with no sources has no dataset. Deriving one block from the root would be a guess.
+
+    Reached with a plain namespace rather than a ``SignetConfig``, because the schema itself refuses
+    ``family: wan`` without sources — this guards the function's OWN contract, which is what a
+    future caller holding a partially-built config would hit.
+    """
+
+    class _Data:
+        sources = None
+        preprocessed_data_root = "/datasets/whatever"
+        caption_extension = ".txt"
+        enable_bucket = True
+        bucket_no_upscale = True
+
+    class _Cfg:
+        data = _Data()
+
+    with pytest.raises(ValueError, match="data.sources is empty or absent"):
+        render_from_config(_Cfg())
 
 
 def test_render_control_directories_names_what_lands_it() -> None:

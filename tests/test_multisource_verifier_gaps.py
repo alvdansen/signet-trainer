@@ -27,13 +27,20 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from signet_trainer.config.sources import SourceSpec
 from signet_trainer.runners.musubi_toml import check_cache_collisions, render_musubi_toml
 
 _REPO = Path(__file__).resolve().parents[1]
 _REAL_TOML = _REPO / "docs" / "source-methods" / "musubi-wan21" / "wan21-dataset-config.toml"
-_FIXTURE = _REPO / "tests" / "fixtures" / "wan21_kaboom.example.yaml"
+#: MOVED in slice A from ``tests/fixtures/`` to ``configs/``, exactly as its own header said it
+#: would once ``DataConfig.sources`` and ``ModelConfig.family: wan`` landed. It is now a real,
+#: LOADABLE config rather than a fixture describing one, which is what lets the assertions below be
+#: about the schema instead of about a YAML file's shape.
+_FIXTURE = _REPO / "configs" / "wan21_kaboom.example.yaml"
+#: The one config permitted to declare ``data.sources``. See the test that reads it.
+_SOURCES_OPT_IN = {"wan21_kaboom.example.yaml"}
 
 
 # ==================================================================================================
@@ -123,16 +130,47 @@ def test_trailing_slash_cache_roots_are_recognised_as_one_directory() -> None:
 # ==================================================================================================
 
 
-def test_no_shipped_config_declares_sources_so_absence_is_the_identity_path() -> None:
-    """The feature is opt-in BECAUSE every shipped config omits the key. Absence cannot regress."""
-    offenders = [
+def test_only_the_opt_in_config_declares_sources_so_absence_is_the_identity_path() -> None:
+    """The feature is opt-in BECAUSE every other shipped config omits the key.
+
+    ⚠ AMENDED, DELIBERATELY (slice A). This asserted ``offenders == []`` while no config could
+    declare ``sources`` at all. Now one does — ``configs/wan21_kaboom.example.yaml``, which is the
+    feature's own worked example and the reason the field exists. The CLAIM is unchanged and is if
+    anything sharper: the byte-identical dry-run path for every PRE-EXISTING config is the ABSENCE
+    of the key, so the allowlist is pinned by name and a 20th config cannot join it by accident.
+
+    Not a weakening, and this is checkable rather than a matter of opinion: the opt-in config is on
+    ``family: wan``, which no other config uses, and the 18 pre-existing configs' dry-run output is
+    byte-identical across this slice (verified by re-running the gate on a clean ``git archive
+    HEAD`` extraction and diffing).
+    """
+    declaring = {
         path.name
         for path in sorted((_REPO / "configs").glob("*.yaml"))
         if "sources" in (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("data", {})
-    ]
-    assert offenders == [], (
-        f"{offenders} declare data.sources; the byte-identical dry-run guarantee for existing "
-        f"configs rests on the key being ABSENT everywhere it has not been opted into"
+    }
+    assert declaring == _SOURCES_OPT_IN, (
+        f"configs declaring data.sources are {sorted(declaring)}, expected "
+        f"{sorted(_SOURCES_OPT_IN)}; the byte-identical dry-run guarantee for pre-existing configs "
+        f"rests on the key being ABSENT everywhere it has not been deliberately opted into"
+    )
+
+
+def test_every_other_config_stays_on_a_native_family() -> None:
+    """The opt-in is fenced by FAMILY too, not only by the ``sources`` key.
+
+    ``data.sources`` is refused at config load on ltx/h3/qwen_edit, so the two fences agree: a
+    config that does not say ``family: wan`` could not carry sources even if someone added the key.
+    """
+    families = {
+        path.name: (yaml.safe_load(path.read_text(encoding="utf-8")) or {})
+        .get("model", {})
+        .get("family", "ltx")
+        for path in sorted((_REPO / "configs").glob("*.yaml"))
+    }
+    wan_configs = {name for name, family in families.items() if family == "wan"}
+    assert wan_configs == _SOURCES_OPT_IN, (
+        f"configs on family 'wan' are {sorted(wan_configs)}, expected {sorted(_SOURCES_OPT_IN)}"
     )
 
 
@@ -155,17 +193,20 @@ def test_source_spec_is_declared_exactly_once() -> None:
 
 
 # ==================================================================================================
-# The geometry blocker — why `wan` is not a one-word literal change
+# The geometry blocker — why `wan` was not a one-word literal change
 # ==================================================================================================
 
 
-def test_the_fixtures_geometry_is_rejected_by_every_family_that_exists() -> None:
-    """1280x720x21 fails BOTH axes of both existing laws, so `wan` needs its own dims branch.
+def test_the_examples_geometry_is_rejected_by_every_NATIVE_family() -> None:
+    """1280x720x21 fails BOTH axes of both native laws — which is why `wan` got its own branch.
 
     720 % 32 == 16 (LTX/H3 spatial step is 32; musubi's Wan step is 16) and 21 satisfies neither
     ``(F-1) % 8 == 0`` nor ``(F-5) % 17 == 0`` (musubi's law is ``F % 4 == 1``, which 21 meets).
     Landing ``"wan"`` in ``ModelConfig.family`` without a third arm in the ``training_dims``
-    pre-screen produces a family that cannot be configured at all.
+    pre-screen would have produced a family that could not be configured at all.
+
+    Kept live rather than deleted now that the branch exists: it is the STANDING reason the branch
+    exists, and it fails loudly if someone ever tries to collapse the three laws into one.
     """
     from signet_trainer.config import validators as v
 
@@ -177,17 +218,37 @@ def test_the_fixtures_geometry_is_rejected_by_every_family_that_exists() -> None
         v.validate_frames(dims[2])
     with pytest.raises(ValueError, match=r"frame count 21"):
         v.validate_h3_frames(dims[2])
+    # ...and is accepted by the wan law, on both axes. Without this half the test above proves only
+    # that the geometry is unusual, not that it is USABLE.
+    assert v.validate_wan_training_dims(tuple(dims)) == (1280, 720, 21)
 
 
-def test_the_wan_family_tripwire_is_still_armed() -> None:
-    """A pre-existing test uses "wan" as its example of a REJECTED family.
+def test_the_wan_family_tripwire_fired_and_was_answered() -> None:
+    """The successor to ``test_the_wan_family_tripwire_is_still_armed``.
 
-    ``tests/test_h3_config_schema.py::test_model_config_rejects_unknown_family`` asserts
-    ``ModelConfig(family="wan")`` raises. Whoever adds ``"wan"`` to the literal must amend that
-    test deliberately and say why — this assertion exists so the amendment cannot be accidental.
+    The armed form asserted that ``tests/test_h3_config_schema.py`` still contained
+    ``ModelConfig(family="wan")`` as its example of a REJECTED family, so that adding ``"wan"`` to
+    the literal could not be an accident. Slice A added it. The amendment was deliberate, and this
+    is the assertion that the tripwire's actual REQUIREMENT — "an equivalent rejection case still
+    covers unknown families" — was honoured rather than deleted along with the example.
     """
+    from signet_trainer.config.schema import ModelConfig
+
     source = (_REPO / "tests" / "test_h3_config_schema.py").read_text(encoding="utf-8")
-    assert 'ModelConfig(family="wan")' in source, (
-        "the tripwire moved or was silently edited; confirm the family allowlist change was "
-        "intentional and that an equivalent rejection case still covers unknown families"
+    assert "def test_model_config_rejects_unknown_family" in source, (
+        "the unknown-family rejection case was removed rather than amended; the discriminator must "
+        "stay an allowlist"
     )
+    # The requirement itself, asserted BEHAVIOURALLY rather than by sniffing source text. The armed
+    # form had to read a file because the thing it guarded was a literal in another test; the
+    # successor guards the schema, which can just be called. (A source-substring check would also
+    # have been wrong here: the amended file legitimately contains ``ModelConfig(family="wan")``
+    # again, in the test that asserts the family is now ACCEPTED.)
+    with pytest.raises(ValidationError):
+        ModelConfig(family="svd")
+    assert [ModelConfig(family=f).family for f in ("ltx", "h3", "qwen_edit", "wan")] == [
+        "ltx",
+        "h3",
+        "qwen_edit",
+        "wan",
+    ]

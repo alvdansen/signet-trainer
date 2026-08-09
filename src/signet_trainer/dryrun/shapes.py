@@ -1162,6 +1162,45 @@ def _multi_frame_regions(cfg: SignetConfig) -> tuple[list[tuple[int, int, float]
     return regions, per_frame_tokens
 
 
+def assert_wan_dryrun_geometry(cfg: SignetConfig) -> ModelInputs:
+    """The ``wan`` arm of the gate. NOT LANDED — refuses rather than prints a fiction.
+
+    This is a REFUSAL, not an omission, and the distinction is the money-safe part. The
+    ``build_dryrun_inputs`` fall-through below is LTX's: ``compute_seq_len`` divides by 32 and
+    assumes 128-channel LTX latents, so a ``family: wan`` config reaching it would build a
+    shape-correct LTX batch, assert an LTX contract against it, and print an OK banner with a
+    plausible ``seq_len`` — a number about a model this run does not use. The qwen_edit arm exists
+    because ``compute_seq_len`` is silently 4x wrong there; here it is not wrong by a factor, it is
+    about the wrong architecture entirely.
+
+    ``run_dryrun`` turns this into a non-zero return with the message on stderr, and
+    ``modal/entrypoint.main`` aborts on that BEFORE the cost print and long before ``.spawn()``. So
+    until the Wan/musubi stage lands, a ``family: wan`` dispatch of ANY mode stops here, at $0, with
+    a message naming what is missing — rather than dispatching down the LTX ``else:`` arm of the
+    train router, which is what a merely-absent arm would have done.
+
+    What lands it: signet does not need a Wan packing module for this. musubi owns the geometry and
+    reads it from the rendered dataset TOML, so the honest wan gate is a MANIFEST gate, not a
+    synthetic-batch gate — render the TOML through
+    ``runners/musubi_toml.render_from_config``, assert it parses and that every source's cache
+    directory is distinct, report ``musubi_resolution_warnings`` (the declared-vs-trained crop), and
+    print a batch line with the clip-instance arithmetic. Every piece of that already exists and is
+    tested; what does not exist is the Modal stage the gate would be gating, which is why it is not
+    wired here in this slice.
+    """
+    raise NotImplementedError(
+        "assert_wan_dryrun_geometry: model.family 'wan' has no dry-run arm. The generic arm is "
+        "LTX's (compute_seq_len divides by 32 and assumes 128-channel LTX latents) and would print "
+        "a plausible OK banner about the wrong architecture, so this refuses instead — at $0, "
+        "before the cost print and before any dispatch. The wan gate is a MANIFEST gate: render "
+        "signet_trainer.runners.musubi_toml.render_from_config(cfg), assert it parses, assert the "
+        "cache directories are distinct, and report musubi_resolution_warnings. It lands with the "
+        "Wan/musubi Modal stage, which is what it would be gating. Until then a wan config is "
+        "config-load-valid and dispatch-refused: use render_from_config to produce the dataset "
+        "TOML and drive musubi directly."
+    )
+
+
 def build_dryrun_inputs(cfg: SignetConfig) -> ModelInputs:
     """Build a synthetic CPU ``ModelInputs`` from the validated config dims (D-12).
 
@@ -1195,6 +1234,8 @@ def build_dryrun_inputs(cfg: SignetConfig) -> ModelInputs:
         return _build_h3_dryrun_inputs(cfg)
     if cfg.model.family == "qwen_edit":
         return build_qwen_edit_dryrun_inputs(cfg)
+    if cfg.model.family == "wan":
+        return assert_wan_dryrun_geometry(cfg)
 
     width, height, frames = cfg.training_dims
     seq_len = compute_seq_len(width, height, frames)

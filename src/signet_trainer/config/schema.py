@@ -24,6 +24,16 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+# The multi-source vocabulary. IMPORTED, never redeclared — ``SourceSpec`` has exactly one home
+# (``tests/test_multisource_verifier_gaps.py::test_source_spec_is_declared_exactly_once`` pins it),
+# and both the manifest layer here and the runner translator read it from there. The module is
+# pydantic + stdlib only, so this adds nothing to the import closure.
+from signet_trainer.config.sources import (
+    ExtractionMode,
+    SourceSpec,
+    check_cache_collisions,
+    check_duplicate_ids,
+)
 from signet_trainer.config.validators import (
     H3_A100_80GB_USABLE_GIB,
     H3_CAMPAIGN_ASPECT,
@@ -61,8 +71,10 @@ from signet_trainer.config.validators import (
     validate_resolution_buckets,
     validate_training_dims,
     validate_volume_relative_path,
+    validate_wan_training_dims,
     validate_width,
 )
+from signet_trainer.data.multisource import NATIVE_FAMILIES
 
 # The LTX-2.3 LoRA target set, preserved as a module constant so the value survives
 # ``LoraConfig.target_modules`` becoming an OPTIONAL override (Phase 10, H3-02). attn1 + attn2 +
@@ -110,6 +122,17 @@ _FAMILY_ONLY_MODEL_IDS: dict[str, frozenset[str]] = {
 }
 
 
+#: The ``DataConfig`` fields that render into musubi's ``[general]`` table and are read ONLY on
+#: ``model.family == "wan"``. Named once so the reverse guard and the renderer's kwargs cannot drift
+#: apart; ``sources`` is NOT in here because it is guarded separately, with its own message naming
+#: the symbol that would land native support.
+_MUSUBI_GENERAL_FIELDS: tuple[str, ...] = (
+    "caption_extension",
+    "enable_bucket",
+    "bucket_no_upscale",
+)
+
+
 class _Base(BaseModel):
     """Base with ``extra="forbid"`` so a malformed/hand-edited YAML is rejected (T-01-CF1)."""
 
@@ -123,12 +146,55 @@ class _Base(BaseModel):
 
 
 class DataConfig(_Base):
-    """Mirrors native ``DataConfig`` (the only native sub-config without a default factory)."""
+    """Mirrors native ``DataConfig`` (the only native sub-config without a default factory).
+
+    MULTI-SOURCE (slice A). ``sources`` is an OPTIONAL SIBLING, never a re-expression of the flat
+    single-source form, and ``None`` is its default. That shape is the whole additive guarantee: the
+    byte-identical path for the 18 pre-existing configs is the ABSENCE of the key, not a
+    one-element list that happens to render the same — an absent key cannot regress, and a
+    re-expressed one can. ``sources`` is honoured ONLY by ``model.family: wan``; every native family
+    refuses it at config load (``SignetConfig._cross_field_checks``, naming
+    ``data/multisource.build_native_source_datasets``).
+    """
 
     preprocessed_data_root: str = Field(
         ...,
         description="Path to the preprocessed-latents root. A STRING here — NOT FS-validated "
-        "locally; existence is checked Modal-side where the Volume is mounted (Pitfall 1).",
+        "locally; existence is checked Modal-side where the Volume is mounted (Pitfall 1). ⚠ ONE "
+        "FIELD, TWO ROLES: with `sources` absent it keeps its ordinary meaning unchanged; with "
+        "`sources` set it is additionally the cache PARENT under which any source that names no "
+        "cache_root mints <preprocessed_data_root>/cache/<id> (SourceSpec.resolve_cache_root).",
+    )
+    # ---- The musubi ``[general]`` table. Three fields, all defaulted to the values
+    # ``runners/musubi_toml.render_musubi_toml`` already defaults to, so a wan config that omits
+    # them renders the file it would have rendered by naming them. They are read ONLY on
+    # ``family: wan``; a non-default value under any other family is refused by the reverse guard in
+    # ``SignetConfig._cross_field_checks`` (lean field-split — no silently-ignored config).
+    caption_extension: str = Field(
+        default=".txt",
+        description="[wan] Caption suffix, rendered into the musubi [general] table. musubi appends "
+        "it to the media stem verbatim, so it must start with '.'. Per-source overrides live on "
+        "SourceSpec.caption_extension.",
+    )
+    enable_bucket: bool = Field(
+        default=True,
+        description="[wan] musubi [general] aspect-ratio bucketing. Read only on family 'wan'.",
+    )
+    bucket_no_upscale: bool = Field(
+        default=True,
+        description="[wan] musubi [general]: never upscale into a bucket, so nothing is invented "
+        "from pixels the source does not have. Read only on family 'wan'. ⚠ NOTE the renderer and "
+        "the PARSER disagree on this default upstream (render_musubi_toml defaults True, "
+        "parse_musubi_toml reads musubi's own False); signet's schema follows the RENDERER, since "
+        "this field's job is to be written.",
+    )
+    sources: list[SourceSpec] | None = Field(
+        default=None,
+        description="[wan] The training set as a LIST of (corpus, geometry, sampling policy, repeat "
+        "weight, cache identity) tuples — the resolution-vs-temporal-extent trade inside one run. "
+        "None (the default) means 'behave exactly as today' and is what every pre-existing config "
+        "carries. Refused on family ltx/h3/qwen_edit: nothing native consumes a source list "
+        "(data/multisource.build_native_source_datasets names what would land it).",
     )
     # D-8-PREPROC — the metadata.jsonl the gated `--mode preprocess` arm encodes. A STRING carried
     # as DATA (read Modal-side by fns.preprocess, NOT FS-checked here — Pitfall 1). Defaulted to the
@@ -160,6 +226,20 @@ class DataConfig(_Base):
     def _check_batch_size(cls, v: int) -> int:
         return validate_batch_size(v)
 
+    @field_validator("caption_extension")
+    @classmethod
+    def _check_caption_extension(cls, v: str) -> str:
+        # Same rule ``SourceSpec.caption_extension`` enforces on the per-source override, held here
+        # for the run-level default: musubi appends it to the media stem VERBATIM, so a missing dot
+        # silently looks for ``clip0001txt`` and every caption goes missing at once — which reads as
+        # an empty-caption run, not as a config error.
+        if not v.startswith("."):
+            raise ValueError(
+                f"data.caption_extension {v!r} must start with '.' — musubi appends it to the "
+                f"media stem verbatim."
+            )
+        return v
+
     @field_validator("resolution_buckets")
     @classmethod
     def _check_resolution_buckets(cls, v: list[str]) -> list[str]:
@@ -181,6 +261,46 @@ class DataConfig(_Base):
             except ValueError:
                 raise ltx_error from None
         return v
+
+    @model_validator(mode="after")
+    def _check_sources(self) -> "DataConfig":
+        """Cross-SOURCE checks. Fail-fast at config load, CPU, before any dispatch.
+
+        What is NOT here, because it already fires: every PER-SOURCE rule lives on ``SourceSpec``
+        and runs as part of this model's own nested validation — ``num_repeats``/``batch_size``/
+        ``frame_sample``/``frame_stride``/``max_frames`` positivity (pydantic ``ge=1``), the
+        kind<->extraction coherence, and the ``N*4+1`` ``target_frames`` refusal that names the
+        value musubi would have silently floored to. Re-asserting them here would be a second
+        implementation of one law, which is the failure this schema keeps naming. What is left is
+        exactly the part one source cannot see: the other sources.
+
+        ``check_cache_collisions`` is DELEGATED, not reimplemented — it is the same function
+        ``render_musubi_toml`` raises on, so the config-load refusal and the render-time refusal
+        cannot disagree, and it lands here at $0 instead of as a traceback out of a renderer the
+        operator did not know was running.
+        """
+        if self.sources is None:
+            return self
+        if not self.sources:
+            raise ValueError(
+                "data.sources is present but EMPTY. musubi needs at least one [[datasets]] block; "
+                "a run with none would cache nothing and train on nothing. Remove the key to take "
+                "the single-root behaviour, or declare at least one source."
+            )
+        problems = [
+            *check_duplicate_ids(self.sources),
+            *check_cache_collisions(self.sources, data_root=self.preprocessed_data_root),
+        ]
+        if problems:
+            raise ValueError(
+                "; ".join(problems)
+                + ". Two views of one corpus are two blocks PRECISELY because they are two caches "
+                "(the cache filename carries the SOURCE video's size, never the training "
+                "resolution). Sharing one cache directory makes musubi write two extractions' "
+                "latents into it with no warning, and musubi's default cache pruning then makes "
+                "the two datasets delete each other's files."
+            )
+        return self
 
 
 class LoraConfig(_Base):
@@ -241,13 +361,18 @@ class ModelConfig(_Base):
     # ``minimax-h3/text_encoder``, ``minimax-h3/vae``, ``minimax-h3/audio_vae``), so there is no
     # suffix to sniff and any heuristic would be a guess. Defaults to ``ltx`` so every pre-Phase-10
     # config loads byte-identically.
-    family: Literal["ltx", "h3", "qwen_edit"] = Field(
+    # Family #4 ``wan`` (slice A) is a RUNNER family, not a fourth native backend: musubi-tuner owns
+    # its caching, encoding and training loop, and signet owns the manifest that produced its
+    # dataset TOML plus the gate and the ledger. It is a family rather than a seventh ``--mode`` for
+    # the same reason h3 and qwen_edit were — six dispatches, one gate, one ledger.
+    family: Literal["ltx", "h3", "qwen_edit", "wan"] = Field(
         default="ltx",
-        description="Model FAMILY discriminator ('ltx' | 'h3' | 'qwen_edit'). Selects the LoRA "
-        "target form (LTX suffix list vs the H3 path regex vs the Qwen 14-leaf path regex) and "
-        "which frame law / budget checks run at config load. Explicit by design: H3 model IDs are "
-        "directories and Qwen-Image-Edit's is a bare .safetensors filename indistinguishable in "
-        "SHAPE from LTX's, so there is nothing to sniff in either case.",
+        description="Model FAMILY discriminator ('ltx' | 'h3' | 'qwen_edit' | 'wan'). Selects the "
+        "LoRA target form (LTX suffix list vs the H3 path regex vs the Qwen 14-leaf path regex) "
+        "and which frame law / budget checks run at config load. Explicit by design: H3 model IDs "
+        "are directories and Qwen-Image-Edit's is a bare .safetensors filename indistinguishable "
+        "in SHAPE from LTX's, so there is nothing to sniff in either case. 'wan' is the "
+        "musubi-tuner RUNNER family — the only one that consumes data.sources.",
     )
     vae_id: str | None = Field(
         default=None,
@@ -2173,12 +2298,20 @@ class SignetConfig(_Base):
     def _check_training_dims(cls, v: tuple[int, int, int]) -> tuple[int, int, int]:
         # Fires at model_validate time — fail-fast, before any GPU (CONF-02 / D-06).
         #
-        # Phase 10: a PRE-SCREEN over BOTH families' frame laws. Pydantic validates fields in
+        # Phase 10: a PRE-SCREEN over ALL families' frame laws. Pydantic validates fields in
         # definition order and ``training_dims`` is the first field, so ``model.family`` is not yet
         # available here — the FAMILY-EXACT law is therefore re-asserted in ``_cross_field_checks``
-        # below, where the family IS known. Dims invalid under BOTH laws still die right here with
-        # the unchanged LTX message; only a dims triple that is legal for the OTHER family is passed
-        # through, and the cross-field check then rejects it if the family does not match.
+        # below, where the family IS known. Dims invalid under EVERY law still die right here with
+        # the unchanged LTX message; only a dims triple that is legal for SOME other family is
+        # passed through, and the cross-field check then rejects it if the family does not match.
+        #
+        # Slice A adds the WAN arm, and it is the loosest of the three (%16 spatial vs %32, F%4==1
+        # vs F%8==1), so it widens this screen the most. That is provably hole-free for the same
+        # reason the H3 widening was: the ``else:`` arm of ``_cross_field_checks`` re-asserts
+        # ``validate_training_dims`` verbatim, so an LTX config gets the identical verdict and the
+        # identical message — only LATER. It was also checked rather than assumed: every dims
+        # rejection case in the suite ([768,512,32], [768,512,22], width 770, height 510, and all
+        # seven zero/negative triples) fails the WAN law too and therefore still dies right here.
         try:
             return validate_training_dims(v)
         except ValueError as ltx_error:
@@ -2189,6 +2322,15 @@ class SignetConfig(_Base):
                 validate_width(width)
                 validate_height(height)
                 validate_h3_frames(frames)
+            except ValueError:
+                pass
+            else:
+                return (width, height, frames)
+            try:
+                # musubi/Wan: 16-pixel bucketing step, N*4+1 clip lengths. Neither axis is shared
+                # with the two laws above, which is why 1280x720x21 — the reference method's own
+                # geometry — needed a THIRD branch rather than a widened literal.
+                validate_wan_training_dims(v)
             except ValueError:
                 raise ltx_error from None
             return (width, height, frames)
@@ -2279,6 +2421,42 @@ class SignetConfig(_Base):
                     f"{self.model.family!r}: the qwen_edit block is only valid when "
                     f"model.family == 'qwen_edit' (lean field-split — no silently-ignored config "
                     f"block). Remove them or set model.family: qwen_edit."
+                )
+        # Family #4 REVERSE guard (slice A) — the multi-source block. Same bidirectional
+        # lean-field-split shape as the h3 / qwen_edit guards above, with one difference worth
+        # stating: those blocks are UNIMPLEMENTED-elsewhere, whereas ``data.sources`` is a coherent
+        # idea on a native family and is refused anyway, because nothing native CONSUMES a source
+        # list. The refusal names the symbol that would land it rather than merely saying no.
+        if self.model.family != "wan":
+            if self.data.sources is not None:
+                raise ValueError(
+                    f"data.sources is set while model.family is {self.model.family!r}: only the "
+                    f"'wan' family (the musubi-tuner runner) consumes a source list. The native "
+                    f"families {list(NATIVE_FAMILIES)} read ONE data.preprocessed_data_root "
+                    f"through signet_trainer.data.precomputed and have no multi-corpus dataset, no "
+                    f"weighted sampler, and no per-source provenance — so this key would load, "
+                    f"diff cleanly and change nothing about the run. "
+                    f"signet_trainer.data.multisource.build_native_source_datasets names what "
+                    f"would land it. Note num_repeats does NOT carry over unchanged: musubi is "
+                    f"EPOCH-driven (3 lengthens the run 3x) and signet's loop is STEP-driven (3 "
+                    f"must re-weight the MIXTURE at a fixed step budget)."
+                )
+            # The musubi ``[general]`` trio. All three are defaulted, so silence is the norm and
+            # only a DECLARED value is refused — a non-wan config that never mentions them is
+            # untouched, which is what keeps every pre-existing config byte-identical.
+            nondefault_general = [
+                name
+                for name in _MUSUBI_GENERAL_FIELDS
+                if getattr(self.data, name) != DataConfig.model_fields[name].default
+            ]
+            if nondefault_general:
+                raise ValueError(
+                    f"data field(s) {nondefault_general} set while model.family is "
+                    f"{self.model.family!r}: caption_extension / enable_bucket / "
+                    f"bucket_no_upscale are the musubi [general] table and are read only when "
+                    f"rendering a wan dataset TOML (runners/musubi_toml.render_from_config). Under "
+                    f"any other family they would be silently ignored (lean field-split — no "
+                    f"silently-ignored config block). Remove them or set model.family: wan."
                 )
         # The family-only MODEL IDS (they live on ModelConfig — they are model IDs, not recipe
         # knobs — but are just as silently ignored under a family that reads none of them). This ran
@@ -2469,6 +2647,70 @@ class SignetConfig(_Base):
             layout = qwen_edit_packed_layout(self.training_dims, self.qwen_edit)
             if self.qwen_edit.max_packed_rows:
                 validate_qwen_edit_row_budget(layout.total, self.qwen_edit.max_packed_rows)
+        elif self.model.family == "wan":
+            # Family #4 (slice A) FAMILY-EXACT geometry. musubi's law, not LTX's — 16-pixel
+            # bucketing and N*4+1 clip lengths. The pre-screen already accepted this triple under
+            # SOME law; this decides WHICH.
+            validate_wan_training_dims(self.training_dims)
+            # (a) A wan run's dataset IS the source list. musubi reads a [[datasets]] array and has
+            #     no single-root form to fall back on, so a wan config without sources declares no
+            #     corpus at all — and the flat preprocessed_data_root cannot stand in for one
+            #     without inventing a resolution, an extraction mode and a cache identity.
+            if not self.data.sources:
+                raise ValueError(
+                    "model.family is 'wan' but data.sources is absent: the musubi dataset TOML IS "
+                    "the source list ([[datasets]] blocks), and data.preprocessed_data_root alone "
+                    "declares no corpus — deriving one block from it would invent a resolution, an "
+                    "extraction mode and a cache identity nobody wrote. Declare data.sources (see "
+                    "configs/wan21_kaboom.example.yaml)."
+                )
+            # (b) resolution_buckets is signet's PRECOMPUTED-latents bucket set. musubi does its own
+            #     bucketing from each source's `resolution` AREA BUDGET, so a bucket list here is
+            #     read by nobody. It has a default_factory, so silence is the norm and only a
+            #     DECLARED value is refused — the same reverse-guard shape as the h3/qwen_edit
+            #     blocks above, for the same lean-field-split reason.
+            if self.data.resolution_buckets != DataConfig.model_fields["resolution_buckets"].default_factory():
+                raise ValueError(
+                    f"data.resolution_buckets {self.data.resolution_buckets} is set while "
+                    f"model.family is 'wan': musubi buckets from each source's own `resolution` "
+                    f"area budget and never reads this list, so the value would be silently "
+                    f"ignored (lean field-split — no silently-ignored config block). Remove the "
+                    f"key; declare the geometry per source in data.sources."
+                )
+            # (c) training_dims must RESTATE THE LARGEST DECLARED VIEW. On every other family
+            #     training_dims IS the geometry; on wan the geometry lives per-source and the
+            #     runner reads it from the rendered TOML, so this field's only remaining job is to
+            #     be the view signet PRICES in the cost line and the dry-run banner. Left free it
+            #     would be a fourth geometry the run never assembles — a priced number an operator
+            #     cannot check against the artifact. Pinning it to the largest view keeps the
+            #     estimate conservative (the most expensive thing this run will actually build) and
+            #     is the property tests/test_musubi_toml_render.py already asserts of the reference
+            #     config; this makes it a law rather than a fixture's habit.
+            #     ⚠ ``full`` reads max_frames and IGNORES target_frames (which SourceSpec refuses
+            #     to let it carry at all), so a full-mode source's clip length must come from
+            #     max_frames or it prices as a single frame — a 129-frame view costed as 1/129th of
+            #     itself, which is the exact under-pricing this law exists to prevent. An image
+            #     source has no temporal axis and is 1.
+            views = [
+                (
+                    s.resolution[0],
+                    s.resolution[1],
+                    s.max_frames
+                    if s.extraction is ExtractionMode.FULL
+                    else max(s.target_frames, default=1),
+                )
+                for s in self.data.sources
+            ]
+            largest = max(views, key=lambda v: v[0] * v[1] * v[2])
+            if tuple(self.training_dims) != largest:
+                raise ValueError(
+                    f"training_dims {list(self.training_dims)} is not the largest view declared in "
+                    f"data.sources ({list(largest)}; all views: {views}). On family 'wan' the "
+                    f"geometry lives PER SOURCE — musubi reads it from the rendered TOML — so "
+                    f"training_dims' only job is to name the view signet prices in the cost line "
+                    f"and the dry-run banner. A value that is not one of the declared views prices "
+                    f"something this run never assembles."
+                )
         else:
             # LTX family: re-assert the EXACT LTX law that the widened pre-screens deliberately let
             # through, so the widening created no hole. Identical messages, identical verdicts — an

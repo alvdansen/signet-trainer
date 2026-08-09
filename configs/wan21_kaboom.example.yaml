@@ -1,20 +1,28 @@
 # Wan 2.1 t2v-14B via the musubi-tuner RUNNER — the three-dataset method, in signet YAML.
 #
-# ⚠ THIS LIVES IN tests/fixtures/, NOT configs/, AND THAT IS DELIBERATE.
-# `DataConfig` has no `sources` field and `ModelConfig.family` has no "wan" member on this tree, so
-# `load_config_from_text` would reject this file today. A config in configs/ that cannot load is a
-# landmine for the zero-GPU dry-run gate, so it waits here until the schema lands and then moves to
-# `configs/wan21_kaboom.example.yaml` unchanged. Nothing else in the suite reads configs/ by glob
-# except the `render_tier:` scan (tests/test_optimization_target.py:531), which this would pass.
+# THE ONLY SHIPPED CONFIG THAT DECLARES `data.sources`, and the only one on `family: wan`. It moved
+# here from tests/fixtures/ when slice A landed the schema; every other config in this directory
+# omits the key entirely, which is what keeps their dry-run byte-identical (an absent key cannot
+# regress — a re-expressed one-element list could).
 #
-# What IS proved against this file today, on CPU, at $0:
-#   tests/test_musubi_toml_render.py renders `data.sources` and asserts the result is EQUIVALENT —
-#   semantically AND byte-for-byte — to Timothy's real runner config at
-#   docs/source-methods/musubi-wan21/wan21-dataset-config.toml.
+# WHAT IS PROVED AGAINST THIS FILE, on CPU, at $0:
+#   * it LOADS — `load_config_from_text` accepts it, which exercises every validator below;
+#   * tests/test_musubi_toml_render.py renders `data.sources` and asserts the result is EQUIVALENT
+#     — semantically AND byte-for-byte — to Timothy's real runner config at
+#     docs/source-methods/musubi-wan21/wan21-dataset-config.toml.
+#
+# ⚠ WHAT IS NOT PROVED: this config CANNOT BE DISPATCHED yet. The dry-run gate refuses family 'wan'
+# by name (dryrun/shapes.assert_wan_dryrun_geometry), so `modal run ... --mode train` aborts at $0
+# before the cost print. That refusal is deliberate — the generic dry-run arm is LTX's and would
+# print a plausible OK banner about the wrong architecture. Render the dataset TOML with
+# runners/musubi_toml.render_from_config and drive musubi directly until the Wan stage lands.
 
 # The LARGEST DECLARED VIEW (1280x720x21, the `appearance` source), not a fourth geometry: the
 # dry-run gate prices the most expensive thing this run will actually assemble. `motion` is
-# 640x352x45 and `stills` is 1024x1024x1; both are cheaper per sample than this one.
+# 640x352x45 and `stills` is 1024x1024x1; both are cheaper per sample than this one. This is a LAW
+# on family 'wan', not a habit: SignetConfig refuses a training_dims that is not the largest
+# declared view, because on this family the geometry lives per-source and training_dims' only
+# remaining job is to name the view signet PRICES.
 training_dims: [1280, 720, 21]
 
 data:
@@ -69,6 +77,13 @@ data:
       frame_sample: 2             # first and last possible 45f window: linspace(0, n-45, 2)
       num_repeats: 1
       batch_size: 1
+
+training:
+  # The one required run-specific knob (D-RUN-1). ⚠ SEMANTICS DIFFER ACROSS THE RUNNER BOUNDARY:
+  # musubi is EPOCH-driven (--max_train_epochs), so this step budget is signet's accounting basis
+  # for the cost line and NOT a value the runner reads. The epoch count that actually bounds the
+  # run — and `num_repeats`, which multiplies it — land with the `wan:` block in the Modal stage.
+  max_steps: 4000
 
 model:
   family: wan                     # the FOURTH family — a family, not a seventh --mode

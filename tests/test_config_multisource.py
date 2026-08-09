@@ -1,0 +1,368 @@
+"""``DataConfig.sources`` — the multi-source wiring (slice A), asserted through the real loader.
+
+``tests/test_musubi_toml_render.py`` proves the RENDERER reproduces Timothy's runner config. This
+file proves the SCHEMA: that a source list survives YAML -> ``SignetConfig`` intact, that every
+refusal fires at config load rather than in a metered container, and — the part that costs the most
+if it is wrong — that the feature is genuinely opt-in.
+
+Everything here is CPU-only, filesystem-read-only, and free.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import yaml
+from pydantic import ValidationError
+
+from signet_trainer.config.load import load_config, load_config_from_text
+from signet_trainer.config.schema import DataConfig, SignetConfig
+from signet_trainer.config.sources import ExtractionMode, SourceSpec
+from signet_trainer.data.multisource import NATIVE_FAMILIES, build_native_source_datasets
+
+_REPO = Path(__file__).resolve().parents[1]
+_EXAMPLE = _REPO / "configs" / "wan21_kaboom.example.yaml"
+
+
+def _wan_payload(**overrides) -> dict:
+    """The example config as a dict, with top-level overrides applied."""
+    payload = yaml.safe_load(_EXAMPLE.read_text(encoding="utf-8"))
+    payload.update(overrides)
+    return payload
+
+
+def _with_sources(*sources: dict, **data_overrides) -> dict:
+    payload = _wan_payload()
+    payload["data"]["sources"] = list(sources)
+    payload["data"].update(data_overrides)
+    return payload
+
+
+_STILLS = {
+    "id": "stills",
+    "kind": "image",
+    "directory": "/d/Images",
+    "resolution": [1024, 1024],
+    "extraction": "image",
+}
+
+
+# ==================================================================================================
+# THE ADDITIVE PROMISE — absence is the identity path
+# ==================================================================================================
+
+
+def test_sources_defaults_to_none_and_none_means_behave_as_today() -> None:
+    """The default is ``None``, NOT an empty list and NOT a one-element list.
+
+    This is the whole additive guarantee in one assertion. An empty-list default would make
+    ``if cfg.data.sources`` and ``if cfg.data.sources is not None`` disagree at every call site; a
+    synthesised one-element default would put every pre-existing config on the new code path, where
+    "byte-identical" would be a claim about a renderer rather than about an untouched branch.
+    """
+    assert DataConfig.model_fields["sources"].default is None
+    assert DataConfig(preprocessed_data_root="/data").sources is None
+    assert load_config(_REPO / "configs" / "ltx23_lora.example.yaml").data.sources is None
+
+
+def test_the_general_trio_defaults_match_the_renderers_own_defaults() -> None:
+    """A wan config that omits them renders the file it would have rendered by naming them.
+
+    Asserted against the renderer's signature rather than against literals, so the two cannot drift:
+    if someone changes a default on either side this fails instead of silently changing an artifact.
+    """
+    import inspect
+
+    from signet_trainer.runners.musubi_toml import render_musubi_toml
+
+    params = inspect.signature(render_musubi_toml).parameters
+    assert DataConfig.model_fields["enable_bucket"].default == params["enable_bucket"].default
+    assert (
+        DataConfig.model_fields["bucket_no_upscale"].default
+        == params["bucket_no_upscale"].default
+    )
+
+
+# ==================================================================================================
+# The example config — the wiring, end to end
+# ==================================================================================================
+
+
+def test_the_example_loads_and_yields_real_source_specs() -> None:
+    cfg = load_config(_EXAMPLE)
+    assert cfg.model.family == "wan"
+    assert [s.id for s in cfg.data.sources] == ["stills", "appearance", "motion"]
+    assert all(isinstance(s, SourceSpec) for s in cfg.data.sources)
+    assert [s.extraction for s in cfg.data.sources] == [
+        ExtractionMode.IMAGE,
+        ExtractionMode.HEAD,
+        ExtractionMode.UNIFORM,
+    ]
+
+
+def test_the_two_video_views_read_one_directory_through_two_caches() -> None:
+    """The FEATURE, asserted on the loaded config rather than only on the rendered TOML."""
+    cfg = load_config(_EXAMPLE)
+    videos = [s for s in cfg.data.sources if s.kind == "video"]
+    assert len({s.directory for s in videos}) == 1, "the two views must read ONE corpus"
+    roots = {s.resolve_cache_root(cfg.data.preprocessed_data_root) for s in videos}
+    assert len(roots) == len(videos), "each view must own its cache — the cache IS the identity"
+
+
+def test_preprocessed_data_root_is_the_cache_parent_for_an_unnamed_source() -> None:
+    """The field's second role, exercised through the loader: derived, never guessed."""
+    payload = _with_sources({**_STILLS, "resolution": [1280, 720]})
+    # One image source -> exactly one view, [1280, 720, 1]; the wan arm requires training_dims to
+    # restate it. That coupling is the point of the law, so the test states it rather than dodging.
+    payload["training_dims"] = [1280, 720, 1]
+    cfg = load_config_from_text(yaml.safe_dump(payload))
+    (source,) = cfg.data.sources
+    assert source.cache_root is None
+    assert source.resolve_cache_root(cfg.data.preprocessed_data_root) == (
+        f"{cfg.data.preprocessed_data_root}/cache/stills"
+    )
+
+
+# ==================================================================================================
+# Native families — REFUSED, with the symbol that would land it
+# ==================================================================================================
+
+
+@pytest.mark.parametrize("family", NATIVE_FAMILIES)
+def test_sources_is_refused_on_every_native_family(family: str) -> None:
+    """Not "meaningless on an image family" — unconsumed on ALL of them, which is stronger.
+
+    ``qwen_edit``'s frame pin does make the video extraction vocabulary meaningless there, and
+    ``kind: image`` corpus balancing would be perfectly coherent. It is refused anyway, because
+    signet's native loop reads ONE ``preprocessed_data_root`` and has no multi-corpus dataset to
+    honour the list with. A key that loads and changes nothing is the defect.
+    """
+    payload = {
+        "training_dims": [768, 512, 49],
+        "data": {"preprocessed_data_root": "/data", "sources": [_STILLS]},
+        "training": {"max_steps": 100},
+        "model": {"family": family},
+    }
+    with pytest.raises((ValidationError, ValueError)) as exc:
+        SignetConfig.model_validate(payload)
+    message = str(exc.value)
+    assert "data.sources is set" in message
+    assert "build_native_source_datasets" in message, (
+        "the refusal must name the symbol that lands it, not merely say no"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("caption_extension", ".caption"), ("enable_bucket", False), ("bucket_no_upscale", False)],
+)
+def test_the_general_trio_is_refused_under_a_native_family(field: str, value: object) -> None:
+    """Set-but-unread is the same defect as sources-but-unconsumed — same reverse guard."""
+    payload = {
+        "training_dims": [768, 512, 49],
+        "data": {"preprocessed_data_root": "/data", field: value},
+        "training": {"max_steps": 100},
+    }
+    with pytest.raises((ValidationError, ValueError), match=field):
+        SignetConfig.model_validate(payload)
+
+
+def test_an_ltx_config_that_never_mentions_the_new_fields_is_untouched() -> None:
+    """The guard fires on a DECLARED value only — silence is the norm and stays free."""
+    cfg = SignetConfig.model_validate(
+        {
+            "training_dims": [768, 512, 49],
+            "data": {"preprocessed_data_root": "/data"},
+            "training": {"max_steps": 100},
+        }
+    )
+    assert (cfg.data.caption_extension, cfg.data.enable_bucket, cfg.data.bucket_no_upscale) == (
+        ".txt",
+        True,
+        True,
+    )
+
+
+def test_build_native_source_datasets_names_what_lands_it() -> None:
+    with pytest.raises(NotImplementedError, match="weighted sampler|MIXTURE PROPORTION"):
+        build_native_source_datasets([], family="qwen_edit")
+
+
+# ==================================================================================================
+# The wan family arm
+# ==================================================================================================
+
+
+def test_wan_without_sources_is_refused_rather_than_derived_from_the_root() -> None:
+    payload = _wan_payload()
+    payload["data"].pop("sources")
+    with pytest.raises((ValidationError, ValueError), match="data.sources is absent"):
+        SignetConfig.model_validate(payload)
+
+
+def test_wan_refuses_a_declared_resolution_bucket_list() -> None:
+    """musubi buckets from each source's own area budget; this list would be read by nobody."""
+    payload = _wan_payload()
+    payload["data"]["resolution_buckets"] = ["1280x720x21"]
+    with pytest.raises((ValidationError, ValueError), match="resolution_buckets"):
+        SignetConfig.model_validate(payload)
+
+
+def test_wan_accepts_the_default_bucket_list_because_silence_is_not_a_declaration() -> None:
+    """The reverse guard must not fire on a default the operator never wrote."""
+    assert load_config(_EXAMPLE).data.resolution_buckets == (
+        DataConfig.model_fields["resolution_buckets"].default_factory()
+    )
+
+
+def test_wan_dims_law_is_musubis_not_ltxs() -> None:
+    """1280x720x21 loads on wan and on nothing else — the third dims branch, exercised."""
+    assert list(load_config(_EXAMPLE).training_dims) == [1280, 720, 21]
+    ltx = _wan_payload()
+    ltx["model"] = {"family": "ltx"}
+    ltx["data"].pop("sources")
+    for key in ("caption_extension", "enable_bucket", "bucket_no_upscale"):
+        ltx["data"].pop(key, None)
+    with pytest.raises((ValidationError, ValueError), match="720|frame count 21"):
+        SignetConfig.model_validate(ltx)
+
+
+@pytest.mark.parametrize("frames", [20, 22, 24])
+def test_wan_refuses_a_clip_length_musubi_would_silently_floor(frames: int) -> None:
+    payload = _wan_payload()
+    payload["training_dims"] = [1280, 720, frames]
+    with pytest.raises((ValidationError, ValueError)):
+        SignetConfig.model_validate(payload)
+
+
+def test_a_full_mode_source_is_priced_at_max_frames_not_at_one() -> None:
+    """``full`` ignores target_frames — its extent lives in ``max_frames``.
+
+    Reading the view's F off ``max(target_frames, default=1)`` would price a 129-frame clip as a
+    single frame, which is not a rounding error: it would silently let the largest-view law accept a
+    training_dims that under-prices the run by two orders of magnitude. Asserted from both sides —
+    the correct triple loads, and a 1-frame restatement of it is refused.
+    """
+    full = {
+        "id": "whole",
+        "kind": "video",
+        "directory": "/d/Videos",
+        "resolution": [640, 352],
+        "extraction": "full",
+        "max_frames": 129,
+    }
+    payload = _with_sources(full)
+    payload["training_dims"] = [640, 352, 129]
+    assert list(load_config_from_text(yaml.safe_dump(payload)).training_dims) == [640, 352, 129]
+
+    payload["training_dims"] = [640, 352, 1]
+    with pytest.raises((ValidationError, ValueError), match="largest view declared"):
+        load_config_from_text(yaml.safe_dump(payload))
+
+
+# ==================================================================================================
+# Cross-source refusals — at CONFIG LOAD, delegated, not reimplemented
+# ==================================================================================================
+
+
+def test_a_cache_collision_dies_at_config_load_not_at_render_time() -> None:
+    """The $0 position. Same function ``render_musubi_toml`` raises on, so they cannot disagree."""
+    payload = _with_sources(
+        {**_STILLS, "id": "a", "cache_root": "/d/shared"},
+        {**_STILLS, "id": "b", "cache_root": "/d/shared/"},  # one directory, two spellings
+    )
+    with pytest.raises((ValidationError, ValueError), match="cache collision"):
+        SignetConfig.model_validate(payload)
+
+
+def test_duplicate_ids_are_refused_even_when_the_caches_differ() -> None:
+    """Distinct caches make this pass the collision gate; the id is still the census label."""
+    payload = _with_sources(
+        {**_STILLS, "id": "twin", "cache_root": "/d/one"},
+        {**_STILLS, "id": "twin", "cache_root": "/d/two"},
+    )
+    with pytest.raises((ValidationError, ValueError), match="duplicate source id"):
+        SignetConfig.model_validate(payload)
+
+
+def test_an_empty_source_list_is_refused() -> None:
+    payload = _wan_payload()
+    payload["data"]["sources"] = []
+    with pytest.raises((ValidationError, ValueError), match="present but EMPTY"):
+        SignetConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ({"kind": "image", "extraction": "head"}, "requires extraction: image"),
+        ({"target_frames": [30]}, "are not N\\*4\\+1"),
+        ({"extraction": "uniform", "target_frames": [45], "frame_sample": 1}, "rewritten to 'head'"),
+        ({"num_repeats": 0}, "greater than or equal to 1"),
+        ({"frame_stride": 3}, "read ONLY by slide"),
+    ],
+)
+def test_per_source_rules_fire_THROUGH_config_load(mutation: dict, expected: str) -> None:
+    """The per-source validators are not bypassed by the nesting — they ARE the config-load gate.
+
+    Deliberately asserted from the OUTSIDE (whole YAML -> ``SignetConfig``) rather than by
+    constructing a ``SourceSpec`` directly, which ``test_musubi_toml_render.py`` already covers.
+    The question here is whether an operator editing a YAML file gets these refusals, and a nested
+    model that silently coerced instead of validating would pass the direct test and fail this one.
+    """
+    base = {
+        "id": "x",
+        "kind": "video",
+        "directory": "/d/Videos",
+        "resolution": [640, 352],
+        "extraction": "head",
+        "target_frames": [21],
+    }
+    payload = _with_sources({**base, **mutation})
+    payload["training_dims"] = [1280, 720, 21]
+    with pytest.raises((ValidationError, ValueError), match=expected):
+        SignetConfig.model_validate(payload)
+
+
+def test_a_windows_path_in_a_source_dies_locally_rather_than_contributing_zero_clips() -> None:
+    payload = _with_sources({**_STILLS, "directory": "C:\\datasets\\Images"})
+    with pytest.raises((ValidationError, ValueError), match="contains a backslash"):
+        SignetConfig.model_validate(payload)
+
+
+def test_data_caption_extension_must_start_with_a_dot() -> None:
+    """A missing dot loses EVERY caption at once, which reads as an empty-caption run."""
+    payload = _wan_payload()
+    payload["data"]["caption_extension"] = "txt"
+    with pytest.raises((ValidationError, ValueError), match="must start with"):
+        SignetConfig.model_validate(payload)
+
+
+# ==================================================================================================
+# The dispatch fence — a wan config is config-valid and dispatch-REFUSED
+# ==================================================================================================
+
+
+def test_the_dryrun_gate_refuses_wan_by_name_instead_of_printing_an_ltx_banner(capsys) -> None:
+    """The money-safe half of the slice.
+
+    ``modal/entrypoint.main`` runs ``run_dryrun`` at step (2) and raises ``SystemExit`` on a
+    non-zero return, BEFORE the cost print and long before ``.spawn()``. So this return value is
+    what stops a ``family: wan`` train dispatch from falling through the router's LTX ``else:`` arm
+    — which is exactly what a merely-ABSENT dry-run arm would have allowed.
+    """
+    from signet_trainer.dryrun.shapes import run_dryrun
+
+    assert run_dryrun(load_config(_EXAMPLE)) == 1
+    err = capsys.readouterr().err
+    assert "assert_wan_dryrun_geometry" in err, "the refusal must name the symbol that lands it"
+    assert "OK" not in capsys.readouterr().out
+
+
+def test_the_wan_arm_is_reached_before_the_ltx_synthetic_batch() -> None:
+    """Named-symbol form, so the gap is a callable rather than a branch nobody can point at."""
+    from signet_trainer.dryrun.shapes import assert_wan_dryrun_geometry
+
+    with pytest.raises(NotImplementedError, match="MANIFEST gate"):
+        assert_wan_dryrun_geometry(load_config(_EXAMPLE))

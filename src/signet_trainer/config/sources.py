@@ -31,12 +31,21 @@ WHY THIS IS ITS OWN MODULE, and not fields typed inline in ``schema.py``:
   * ``config -> runners`` is the wrong dependency direction, so the type cannot live in the
     runner either. It is a config concept: h3 and ltx consume the same list without musubi.
 
-⚠ WIRING NOT YET LANDED. ``DataConfig`` has no ``sources`` field on this tree
-(``config/schema.py:125-183``), so nothing constructs these from YAML yet. The landing edit is one
-optional sibling field — ``sources: list[SourceSpec] | None = None``, importing this class rather
-than redeclaring it — and ``None`` MUST remain the default so the absence of the key, not a
-re-expressed one-element list, is the byte-identical path for all 18 shipped configs (none of
-which contains ``sources:``; ``grep -ln "sources:" configs/*.yaml`` returns nothing).
+✅ WIRING LANDED (slice A). ``DataConfig.sources`` is exactly the optional sibling field this
+docstring specified — ``sources: list[SourceSpec] | None = None``, importing this class rather than
+redeclaring it — and ``None`` remains the default, so the ABSENCE of the key (not a re-expressed
+one-element list) is the byte-identical path for all 18 pre-existing configs. The one config that
+does declare it, ``configs/wan21_kaboom.example.yaml``, is new and opt-in;
+``tests/test_multisource_verifier_gaps.py`` pins that allowlist so a 20th cannot appear by accident.
+
+WHICH FAMILIES HONOUR IT. Only ``model.family == "wan"`` (the musubi-tuner RUNNER). ``sources`` is
+REFUSED at config load on every signet-NATIVE family — see ``config/schema.py``'s wan arm and
+``data/multisource.build_native_source_datasets``, the named symbol that would land native support.
+The refusal is not squeamishness about video vocabulary on an image family: signet's native loop
+reads ``DataConfig.preprocessed_data_root`` through ``data/precomputed.py`` and has NO consumer for
+a source LIST at all, so accepting one would be accepting a config nothing honours — including the
+corpus-balancing use (``num_repeats`` on ``kind: image``) that this module's own design notes
+describe as the natural first native application.
 
 CRITICAL — Anti-Pattern 6 / Pitfall 1: pydantic + stdlib only. No ``modal``, no ``torch``, no
 filesystem touch during validation. ``directory`` and ``cache_root`` are carried as DATA and
@@ -48,7 +57,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Literal
+from typing import Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -56,6 +65,18 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 #: floor is SILENT, so signet refuses a non-conforming value rather than inheriting the repair —
 #: an accepted ``30`` trains at ``29`` and the config then describes a run nobody performed.
 MUSUBI_FRAME_MULTIPLE = 4
+
+#: musubi floors each resolution edge to a multiple of this before bucketing (the Wan step). A
+#: declared ``[640, 360]`` therefore TRAINS at 640x352.
+#:
+#: MOVED HERE from ``runners/musubi_toml.py`` in slice A, and the direction of the move is the
+#: point: this is one of musubi's LAWS, and ``config/validators.validate_wan_training_dims`` (the
+#: family's dims pre-screen) needs it at CONFIG-LOAD time. A ``config -> runners`` import is the
+#: wrong dependency direction — the reason stated at the top of this module for why ``SourceSpec``
+#: cannot live in the renderer either. The renderer re-exports it, so its own import path and every
+#: message it prints are unchanged. Split of responsibility: this module owns musubi's LAWS, and
+#: ``runners/musubi_toml.py`` owns musubi's SYNTAX.
+MUSUBI_RESOLUTION_STEP = 16
 
 #: musubi's own default for ``max_frames`` (``full`` mode only). Carried so a set-but-ignored
 #: value is distinguishable from an unset one.
@@ -329,3 +350,60 @@ class SourceSpec(BaseModel):
         if self.cache_root is not None:
             return self.cache_root.rstrip("/")
         return f"{data_root.rstrip('/')}/cache/{self.id}"
+
+
+# --------------------------------------------------------------------------------------------------
+# Cross-source checks — pure, list-returning, $0
+# --------------------------------------------------------------------------------------------------
+
+
+def check_cache_collisions(sources: Sequence[SourceSpec], *, data_root: str) -> list[str]:
+    """Return one message per pair of sources resolving to the SAME cache directory (empty = clean).
+
+    Exposed as a pure list-returning check, not only as the renderer's exception, so the config-gap
+    layer can report it BESIDE the other gaps at $0 rather than as a traceback out of a renderer
+    the operator did not know was running. musubi raises on duplicate cache dirs anyway; sharing
+    one would cross-claim, overwrite, and — with musubi's default cache pruning — mutually delete.
+
+    MOVED HERE from ``runners/musubi_toml.py`` in slice A, unchanged line for line, for the reason
+    :data:`MUSUBI_RESOLUTION_STEP` records: ``DataConfig`` must run this refusal at CONFIG LOAD and
+    ``config -> runners`` is the wrong direction. It is the ONE declaration — the renderer imports
+    it from here and keeps re-exporting it, so ``from signet_trainer.runners.musubi_toml import
+    check_cache_collisions`` still resolves and both existing call sites are untouched. A second
+    copy on the config side would be the ``SourceSpec``-declared-twice failure in miniature: two
+    implementations of one refusal, diverging silently.
+    """
+    seen: dict[str, str] = {}
+    collisions: list[str] = []
+    for source in sources:
+        resolved = source.resolve_cache_root(data_root)
+        first = seen.get(resolved)
+        if first is None:
+            seen[resolved] = source.id
+            continue
+        collisions.append(
+            f"cache collision: source {source.id!r} and {first!r} both resolve to {resolved!r}"
+        )
+    return collisions
+
+
+def check_duplicate_ids(sources: Sequence[SourceSpec]) -> list[str]:
+    """Return one message per repeated source ``id`` (empty = clean).
+
+    A SEPARATE check from :func:`check_cache_collisions` even though duplicate ids usually produce a
+    cache collision too, because they do not ALWAYS: two sources sharing ``id: motion`` while naming
+    DIFFERENT explicit ``cache_root``s pass the collision gate cleanly and then make the id — which
+    ``SourceSpec.id`` documents as "the provenance tag on a sample, and the label on the per-source
+    census" — ambiguous in every artifact that carries it. The census would report one line for two
+    corpora and no gate would have said anything.
+    """
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for source in sources:
+        if source.id in seen:
+            duplicates.append(
+                f"duplicate source id {source.id!r}: ids are the provenance tag and the census "
+                f"label, so two sources cannot share one"
+            )
+        seen.add(source.id)
+    return duplicates

@@ -45,9 +45,30 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from signet_trainer.config.sources import (
+    MUSUBI_RESOLUTION_STEP,
     ExtractionMode,
     SourceSpec,
+    check_cache_collisions,
 )
+
+# ⚠ ``MUSUBI_RESOLUTION_STEP`` and ``check_cache_collisions`` MOVED to ``config/sources.py`` in
+# slice A and are RE-EXPORTED here — imported, never redeclared. Both are musubi LAWS that
+# ``DataConfig`` must apply at CONFIG LOAD (``config -> runners`` is the wrong dependency
+# direction, per ``sources.py``'s own module docstring); this module owns musubi's SYNTAX. The
+# names stay in this namespace deliberately, so every existing
+# ``from signet_trainer.runners.musubi_toml import check_cache_collisions`` still resolves and no
+# call site or message changed.
+__all__ = [
+    "MUSUBI_DATASET_KEYS",
+    "MUSUBI_RESOLUTION_STEP",
+    "ParsedMusubiConfig",
+    "check_cache_collisions",
+    "musubi_resolution_warnings",
+    "parse_musubi_toml",
+    "render_control_directories",
+    "render_from_config",
+    "render_musubi_toml",
+]
 
 # --------------------------------------------------------------------------------------------------
 # The upstream key vocabulary
@@ -82,10 +103,6 @@ MUSUBI_DATASET_KEYS: frozenset[str] = frozenset(
         "multiple_target",
     }
 )
-
-#: musubi floors each resolution edge to a multiple of this before bucketing (the Wan step). A
-#: declared ``[640, 360]`` therefore TRAINS at 640x352.
-MUSUBI_RESOLUTION_STEP = 16
 
 # Fixed emission order. Determinism lives here: the renderer walks these tuples, never a dict built
 # from user input. Order is not semantically meaningful to TOML — it is meaningful to an operator
@@ -131,29 +148,10 @@ _MODE_KEYS: dict[ExtractionMode, tuple[str, ...]] = {
 
 # --------------------------------------------------------------------------------------------------
 # $0 checks the gate layer hoists out of the renderer
+#
+# ``check_cache_collisions`` used to be declared here; it now lives in ``config/sources.py`` and is
+# re-exported above. See the note beside that import.
 # --------------------------------------------------------------------------------------------------
-
-
-def check_cache_collisions(sources: Sequence[SourceSpec], *, data_root: str) -> list[str]:
-    """Return one message per pair of sources resolving to the SAME cache directory (empty = clean).
-
-    Exposed as a pure list-returning check, not only as the renderer's exception, so the config-gap
-    layer can report it BESIDE the other gaps at $0 rather than as a traceback out of a renderer
-    the operator did not know was running. musubi raises on duplicate cache dirs anyway; sharing
-    one would cross-claim, overwrite, and — with musubi's default cache pruning — mutually delete.
-    """
-    seen: dict[str, str] = {}
-    collisions: list[str] = []
-    for source in sources:
-        resolved = source.resolve_cache_root(data_root)
-        first = seen.get(resolved)
-        if first is None:
-            seen[resolved] = source.id
-            continue
-        collisions.append(
-            f"cache collision: source {source.id!r} and {first!r} both resolve to {resolved!r}"
-        )
-    return collisions
 
 
 def musubi_resolution_warnings(sources: Sequence[SourceSpec]) -> list[str]:
@@ -407,31 +405,38 @@ def parse_musubi_toml(text: str) -> ParsedMusubiConfig:
 
 
 def render_from_config(cfg: object) -> str:
-    """Render the TOML straight from a ``SignetConfig``. NOT LANDED — the schema field is missing.
+    """Render the TOML straight from a ``SignetConfig``. LANDED in slice A.
 
-    ``DataConfig`` has no ``sources`` field on this tree (``config/schema.py:125-183``), so there is
-    nothing to read. What lands this, in one additive edit:
+    ``cfg`` is typed ``object`` and read by ATTRIBUTE rather than annotated ``SignetConfig``, and
+    that is the Anti-Pattern-6 discipline, not laziness: importing ``config.schema`` here would put
+    a 2268-line config surface behind every consumer of this renderer, and the reverse import
+    (``config -> runners``) is the direction ``config/sources.py`` exists to avoid. The five
+    ``cfg.data`` attributes read below are the contract.
 
-        ``sources: list[SourceSpec] | None = None`` on ``DataConfig``, importing ``SourceSpec``
-        from ``signet_trainer.config.sources`` rather than redeclaring it, with ``None`` kept as
-        the default so the ABSENCE of the key stays the byte-identical path for all 18 shipped
-        configs; plus ``"wan"`` in ``ModelConfig.family`` (``schema.py:244``).
+    A ``sources``-less config is REFUSED rather than defaulted into a one-element list. musubi needs
+    at least one ``[[datasets]]`` block, and synthesising one out of
+    ``preprocessed_data_root`` would invent a geometry, an extraction mode and a cache identity that
+    no operator wrote — the class of guess every refusal in ``SourceSpec`` exists to stop.
 
-    This function then becomes::
-
-        return render_musubi_toml(
-            cfg.data.sources,
-            data_root=cfg.data.preprocessed_data_root,
-            caption_extension=cfg.data.caption_extension,
-        )
-
-    Until then, callers build the source list explicitly and call :func:`render_musubi_toml`.
+    The ``[general]`` table comes from the three ``DataConfig`` siblings that carry it; they default
+    to this function's own defaults, so a wan config that omits them renders the same file it would
+    have rendered by naming them.
     """
-    raise NotImplementedError(
-        "render_from_config: DataConfig has no `sources` field yet (config/schema.py:125-183). "
-        "Land `sources: list[SourceSpec] | None = None` on DataConfig (importing SourceSpec from "
-        "signet_trainer.config.sources) and `wan` in ModelConfig.family (schema.py:244); until "
-        "then call render_musubi_toml(sources, data_root=..., caption_extension=...) directly."
+    sources = getattr(cfg.data, "sources", None)
+    if not sources:
+        raise ValueError(
+            "render_from_config: data.sources is empty or absent. The musubi dataset TOML IS the "
+            "source list — there is no single-source form to fall back on, and deriving one block "
+            "from data.preprocessed_data_root would invent a resolution, an extraction mode and a "
+            "cache identity nobody declared. Declare data.sources (see "
+            "configs/wan21_kaboom.example.yaml)."
+        )
+    return render_musubi_toml(
+        sources,
+        data_root=cfg.data.preprocessed_data_root,
+        caption_extension=cfg.data.caption_extension,
+        enable_bucket=cfg.data.enable_bucket,
+        bucket_no_upscale=cfg.data.bucket_no_upscale,
     )
 
 
