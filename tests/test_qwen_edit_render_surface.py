@@ -681,24 +681,48 @@ def test_shipped_video_galleries_still_render_video(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# The one remaining gap is a NAMED symbol with an actionable message.
+# The last gap has LANDED — the inverted form of the assertion that guarded it.
 # --------------------------------------------------------------------------------------------------
 
 
-def test_render_call_is_a_declared_stub_naming_what_lands_it() -> None:
-    with pytest.raises(NotImplementedError) as excinfo:
-        render_qwen_edit_sample(checkpoint="step-4000", seed=42)
-    msg = str(excinfo.value)
-    assert "DECLARED STUB" in msg
-    for expected in (
-        "load_qwen_edit_transformer",
-        "qwen_edit_encode",
-        "aspect-ratio",
-        "true_cfg",
-        "scheduler reparameterisation",
-    ):
-        assert expected in msg, f"the stub message must name {expected!r} as blocking work"
-    # ...and it must surface the OPEN RULING, not just the missing code: a reader who starts writing
-    # the sampler needs to know item (3) is blocked by a contract conflict before, not after.
-    assert "CONTRACT CONFLICT" in msg
-    assert "test_no_wan_params.py" in msg
+def test_the_render_call_has_landed_and_is_no_longer_a_stub() -> None:
+    """RETIRED-AND-REPLACED 2026-08-09.
+
+    The predecessor (``test_render_call_is_a_declared_stub_naming_what_lands_it``) asserted that
+    ``render_qwen_edit_sample`` raised ``NotImplementedError`` naming the three things that would
+    land it. All three landed — ``models/qwen_edit_loader``'s loaders and arch gate with the
+    training leg, ``prep/qwen_edit_encode`` likewise (and the control-image orientation fork it was
+    blocked on was ruled diffusers-correct at ``conditioning/qwen_edit_geometry.py:252-263``), and
+    the §8 inference settings in ``models/qwen_edit_pipeline`` — so this is the inverted form that
+    keeps the property the original was really protecting.
+
+    What mattered was never the raise. It was that this symbol must never return a PLACEHOLDER
+    path: a placeholder lets a grid build, look complete, and be judged. So the property asserted
+    now is that the entry point is a real call which REFUSES bad input rather than fabricating an
+    output — checked here on the cheapest refusal (an empty prompt), with the full behavioural set
+    in ``tests/test_qwen_edit_sampler.py``.
+
+    The contract conflict the old message carried is unresolved and deliberately NOT resolved by
+    this landing: ``tests/test_no_wan_params.py``'s ``_WAN_TOKENS`` still bans the scheduler token
+    from every ``*.py`` under ``inference/``, still covers a family where that setting is mandatory,
+    and narrowing it is still a ruling on a shipped money-safe guard. The scheduler construction
+    lives in ``models/``, which the guard's non-recursive glob does not scan.
+    """
+    import inspect
+
+    assert not isinstance(render_qwen_edit_sample, type)
+    signature = inspect.signature(render_qwen_edit_sample)
+    for required in ("pipeline", "control_images", "prompt", "out_path", "seed", "adapter"):
+        assert required in signature.parameters, f"the landed sampler must take {required!r}"
+
+    # It refuses rather than returning a path it did not render.
+    with pytest.raises(ValueError, match="empty prompt"):
+        render_qwen_edit_sample(
+            pipeline=object(),
+            control_images=[],
+            prompt="",
+            out_path="unused.png",
+            seed=42,
+            width=64,
+            height=64,
+        )

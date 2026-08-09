@@ -730,8 +730,14 @@ def write_qwen_edit_gallery(
             ``criteria_line`` override, and one image path per column keyed by the column's
             ``row_key`` (relative to ``out_path``'s parent; a falsy path → 'generation failed').
         out_path: destination ``index.html`` path (parent dirs are created).
-        params: banner values — ``steps``, ``true_cfg``, ``cfg_norm``, ``shift``, ``width``,
-            ``height``, ``lora_scale``, ``checkpoint_band`` (``CheckpointBand.describe()``).
+        params: banner values — EXACTLY the ``_QWEN_EDIT_BANNER_FIELDS`` allowlist: ``steps``,
+            ``true_cfg``, ``cfg_norm``, ``width``, ``height``, ``lora_scale``, ``checkpoint_band``
+            (``CheckpointBand.describe()``). ⚠ This list previously also advertised the static
+            scheduler-reparameterisation field (the 3.0 one); that was a documentation bug, not a
+            supported key — ``_qwen_edit_params_banner`` REFUSES it, so a caller following the old
+            docstring got a ``ValueError`` rather than a banner. The field is blocked by
+            ``tests/test_no_wan_params.py``'s directory-wide token ban and its restoration is a
+            ruling; see ``_qwen_edit_params_banner``'s docstring for the full statement.
         columns: the ordered ``QwenEditColumn`` list from ``plan_qwen_edit_columns``.
 
     Returns:

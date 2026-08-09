@@ -27,9 +27,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
 
-#: The five modules family #3 added. Every one is new in this working tree; none exists at ea48def.
+#: The modules family #3 added. Every one is new in this working tree; none exists at ea48def.
+#: ``models/qwen_edit_pipeline.py`` joined 2026-08-09 with the render slice — it holds the generation
+#: pipeline assembly, the §8 inference recipe and the scheduler pin, and it is registered here so the
+#: silent-no-op scan, the actionable-refusal scan and the co-import probe all cover it too.
 QWEN_NEW_MODULES = (
     "src/signet_trainer/models/qwen_edit_loader.py",
+    "src/signet_trainer/models/qwen_edit_pipeline.py",
     "src/signet_trainer/prep/qwen_edit_encode.py",
     "src/signet_trainer/train/qwen_edit_step.py",
     "src/signet_trainer/train/family_hooks.py",
@@ -49,6 +53,7 @@ QWEN_TOUCHED_MODULES = (
 
 QWEN_MODULE_DOTTED = (
     "signet_trainer.models.qwen_edit_loader",
+    "signet_trainer.models.qwen_edit_pipeline",
     "signet_trainer.prep.qwen_edit_encode",
     "signet_trainer.train.qwen_edit_step",
     "signet_trainer.train.family_hooks",
@@ -391,24 +396,63 @@ def test_every_remaining_qwen_gap_names_what_lands_it() -> None:
     print(f"[verifier] surviving declared gaps in the qwen surface: {len(stubs)}")
 
 
-def test_the_declared_render_stub_is_still_the_only_unlanded_qwen_entry_point() -> None:
-    """``render_qwen_edit_sample`` is the one entry point the brief listed that still raises.
+def test_no_qwen_entry_point_the_brief_named_still_raises_not_implemented() -> None:
+    """RETIRED-AND-REPLACED 2026-08-09 — the fourth and last of the brief's stubs landed.
 
-    The brief named four stubs this phase must replace. Three were replaced
-    (``models/qwen_edit_loader``'s loaders, ``train/qwen_edit_step.build_qwen_edit_step_fn``,
-    ``prep/qwen_edit_encode``, which did not exist). The render surface's generate call was not,
-    and it says so by name rather than returning an empty gallery. Pinned here so the remaining
-    gap has a test that goes green the day it lands.
+    The predecessor asserted ``render_qwen_edit_sample`` still raised ``NotImplementedError``, and
+    said in its own docstring that it was "pinned here so the remaining gap has a test that goes
+    green the day it lands". It landed (``models/qwen_edit_pipeline.qwen_edit_generate``, with the
+    layout symbol delegating), so this is the inverted form: none of the four entry points the brief
+    named may raise ``NotImplementedError`` any more, and the check is by AST over the modules that
+    own them rather than by calling them, so it cannot be satisfied by an exception that merely
+    changed type.
+
+    Note ``train/family_hooks.py``'s H3 arm and ``prep/h3_vae_contract.py``'s two test stubs are NOT
+    qwen entry points and are deliberately out of scope here; ``modal/fns.py``'s two are unreachable
+    defence-in-depth for ``backup.destination='cloud'``.
     """
+    owners = {
+        "src/signet_trainer/models/qwen_edit_loader.py": (
+            "load_qwen_edit_transformer",
+            "assert_qwen_edit_arch",
+            "quantize_qwen_edit",
+        ),
+        "src/signet_trainer/prep/qwen_edit_encode.py": ("prepare_qwen_edit_image",),
+        "src/signet_trainer/train/qwen_edit_step.py": ("build_qwen_edit_step_fn",),
+        "src/signet_trainer/inference/qwen_edit_layout.py": ("render_qwen_edit_sample",),
+    }
+    unlanded: list[str] = []
+    for rel, names in owners.items():
+        path = REPO_ROOT / rel
+        assert path.exists(), f"{rel} is missing entirely"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        by_name = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in names:
+            node = by_name.get(name)
+            if node is None:
+                unlanded.append(f"{rel}::{name} does not exist")
+                continue
+            raises = [
+                child
+                for child in ast.walk(node)
+                if isinstance(child, ast.Raise)
+                and isinstance(child.exc, ast.Call)
+                and getattr(child.exc.func, "id", "") == "NotImplementedError"
+            ]
+            if raises:
+                unlanded.append(f"{rel}::{name} still raises at line(s) {[r.lineno for r in raises]}")
+    assert not unlanded, "declared qwen entry point(s) still unlanded:\n  " + "\n  ".join(unlanded)
+
+    # The generate call must be a real delegation, not a renamed placeholder.
     from signet_trainer.inference import qwen_edit_layout
 
-    with pytest.raises(NotImplementedError) as excinfo:
-        qwen_edit_layout.render_qwen_edit_sample(checkpoint="step-4000", seed=42)
-    message = str(excinfo.value)
-    assert "render_qwen_edit_sample" in message
-    assert "DECLARED STUB" in message
-    for landing in ("load_qwen_edit_transformer", "prep/qwen_edit_encode"):
-        assert landing in message, f"the stub message does not name {landing}"
+    import inspect
+
+    assert "pipeline" in inspect.signature(qwen_edit_layout.render_qwen_edit_sample).parameters
 
 
 def test_the_packing_module_is_landed_and_is_the_single_transcription() -> None:

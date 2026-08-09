@@ -942,8 +942,25 @@ def quantize_qwen_edit(
     # re-walked here and SKIPPED by the ``Q_MODULES`` guard — see the docstring for what happens
     # without it.
     converted = _quantize_leaves(model, weights, what=what)
-    logger.info(
-        "[qwen-edit-quantize] %s: quantized %d remaining module(s) to %s", what, converted, qtype
-    )
     freeze(model)
+
+    # PRINTED, not logger.info'd, and that distinction is the whole point of this line.
+    #
+    # qfloat8 on the transformer AND the text encoder is a LOCKED recipe parameter — locked hard
+    # enough that ``QwenEditConfig`` deliberately refuses to expose it as a field. A locked
+    # parameter whose application leaves no trace in a metered run's log is unauditable: the first
+    # 250-step run on live weights completed, committed a correct-looking adapter, and produced no
+    # evidence either way that quantization had happened. It had; the report was simply at INFO,
+    # and Modal shows stdout at the default WARNING level. The arch gate's fields are ``print``ed
+    # for exactly this reason ("the print is the artifact an operator diffs against"), and a
+    # recipe-lock event deserves the same standing as an architecture assertion.
+    #
+    # Numbers, not an adjective: a silently-skipped pass would still print, and print a ZERO.
+    blocks_note = f"{len(list(blocks))} {QWEN_EDIT_BLOCK_LIST_ATTR} + " if blocks is not None else ""
+    banner = (
+        f"[qwen-edit-quantize] {what}: {blocks_note}{converted} extra module(s) -> {qtype} "
+        f"(house recipe lock; optimum-quanto). frozen."
+    )
+    print(banner)
+    logger.info(banner)
     return model
