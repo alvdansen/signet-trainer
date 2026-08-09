@@ -201,7 +201,19 @@ class CheckpointManager:
         """
         latest = self.find_latest()
         if latest is None:
-            logger.info("No checkpoint in %s — cold start at step 0.", self.output_dir)
+            # PRINTED, not logger.info'd. "Did this run CONTINUE or RESTART?" is the single most
+            # consequential line in a long run's log, and it was invisible: Modal shows stdout at
+            # the default WARNING level, so an INFO-level report leaves no trace in a metered run.
+            # A silent restart burns the whole budget from step 0 and looks exactly like progress.
+            # Same reasoning as the qfloat8 report — a load-bearing event needs an artifact, and the
+            # artifact carries NUMBERS so the wrong answer is visible rather than merely absent.
+            banner = (
+                f"[checkpoint] COLD START at step 0 — no complete checkpoint found in "
+                f"{self.output_dir}. If a prior run should have left one, STOP: this run is about "
+                f"to retrain from scratch, not continue."
+            )
+            print(banner)
+            logger.info(banner)
             return 0
 
         # ── LANDMINE #1: re-inject the adapter weights resume() historically did NOT restore ──────
@@ -274,12 +286,13 @@ class CheckpointManager:
                     f"a PARTIAL adapter is worse than refusing — the run would continue from a "
                     f"half-restored state at a plausible loss."
                 )
-            logger.info(
-                "Resumed a QUANTIZED model by direct parameter assignment: %d/%d adapter tensors "
-                "(set_peft_model_state_dict is unusable here — see LANDMINE #1b).",
-                loaded,
-                len(adapter_weights),
+            qbanner = (
+                f"[checkpoint] quantized resume: {loaded}/{len(adapter_weights)} adapter tensors "
+                f"assigned directly (set_peft_model_state_dict is unusable on a quanto model — "
+                f"see LANDMINE #1b)."
             )
+            print(qbanner)
+            logger.info(qbanner)
 
         # ── restore optimizer / scheduler / step / RNG from training_state.pt ────────────────────
         state = torch.load(
@@ -295,5 +308,10 @@ class CheckpointManager:
             torch.cuda.set_rng_state(state["rng_torch_cuda"])
 
         step = int(state["step"])
-        logger.info("Resumed from %s at step %d (adapter re-injected).", latest.name, step)
+        banner = (
+            f"[checkpoint] RESUMED from {latest.name} at step {step} — adapter re-injected, "
+            f"optimizer/scheduler/RNG restored. Training CONTINUES from {step}, it does not restart."
+        )
+        print(banner)
+        logger.info(banner)
         return step

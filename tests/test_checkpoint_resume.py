@@ -205,3 +205,29 @@ def test_a_rank_change_between_rounds_is_refused_not_silently_partial() -> None:
     assert "PARTIAL adapter is worse than refusing" in source, (
         "the partial-load refusal was removed — a partial resume is silent corruption"
     )
+
+
+def test_the_resume_decision_is_printed_not_only_logged() -> None:
+    """"Continue or restart?" must reach stdout, not just the logger.
+
+    Modal shows container stdout at the default WARNING level, so a ``logger.info`` report leaves
+    NO trace in a metered run. That is not cosmetic here: a silent restart burns the entire budget
+    from step 0 and is indistinguishable from progress in the log. This was found the expensive
+    way — after the quantized-resume fix, the relaunched 5000-step phase-1 run gave no answer to
+    "did it resume from 500?" at all, because every branch reported at INFO.
+
+    Both branches are asserted, because only reporting the happy path is the same defect: an
+    unreported COLD START is exactly the case you need to see.
+    """
+    source = (
+        Path(__file__).resolve().parents[1] / "src/signet_trainer/train/checkpoint.py"
+    ).read_text(encoding="utf-8")
+    assert "COLD START at step 0" in source, "the cold-start branch must announce itself on stdout"
+    assert "RESUMED from" in source, "the resume branch must announce itself on stdout"
+    assert source.count("print(banner)") >= 2, (
+        "both resume branches must print; a logger-only report is invisible at Modal's default level"
+    )
+    assert "it does not restart" in source, (
+        "the resume banner must state the CONSEQUENCE, not just the step number — the reader is "
+        "checking whether they are about to pay for a silent restart"
+    )
