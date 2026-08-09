@@ -89,6 +89,7 @@ _ALLOWED_SHIFT_VALUES = {
 _EXTRA_SCANNED = (
     "src/signet_trainer/models/qwen_edit_pipeline.py",
     "src/signet_trainer/runners/wan_musubi.py",
+    "src/signet_trainer/runners/musubi_toml.py",
 )
 
 
@@ -405,3 +406,33 @@ def test_reference_video_has_no_module_level_heavy_import() -> None:
     code = _strip_comments_and_docstrings(_REFERENCE_VIDEO_SRC.read_text(encoding="utf-8"))
     hits = _MODULE_LEVEL_HEAVY_IMPORT.findall(code)
     assert not hits, f"Anti-Pattern-6 violation: module-level heavy import in reference_video.py: {hits}"
+
+
+def test_every_runner_module_is_reached_by_some_scan() -> None:
+    """No module under runners/ may sit outside BOTH the family scoping and the extra scan.
+
+    ``runners/musubi_toml.py`` did exactly that: it is not under ``inference/``, carries no
+    ``wan_`` prefix so ``_family_of`` returns None for it, and was absent from ``_EXTRA_SCANNED``.
+    It is clean today, but nothing kept it so — and it is the module that WRITES the sampling
+    config, which makes it the single most valuable place for a Wan token to land unnoticed.
+
+    A gate that happens to be satisfied is not a gate. This asserts coverage rather than
+    cleanliness, so a new runner module cannot be added into the blind spot.
+    """
+    runners = sorted(
+        (Path(__file__).resolve().parents[1] / "src/signet_trainer/runners").glob("*.py")
+    )
+    assert runners, "no runner modules found — did the package move?"
+    uncovered = []
+    for path in runners:
+        if path.name == "__init__.py":
+            continue
+        rel = f"src/signet_trainer/runners/{path.name}"
+        covered = rel in _EXTRA_SCANNED or _family_of(path.name) is not None
+        if not covered:
+            uncovered.append(rel)
+    assert not uncovered, (
+        f"runner module(s) reached by no Wan-token scan: {uncovered}. Either give the module a "
+        f"family prefix from {_FAMILY_PREFIXES} so the family scoping applies, or add it to "
+        f"_EXTRA_SCANNED."
+    )
