@@ -1079,13 +1079,38 @@ def _target_stem(batch: Any) -> str:
         value = batch.get(key)
         if value is not None:
             return str(value)
+
+    # NESTED form — the one PrecomputedDataset actually produces. ``__getitem__`` stores each
+    # source's whole payload dict under that source's OUTPUT KEY (``result[output_key] = data``,
+    # data/precomputed.py:288), and prep writes ``payload["stem"]``
+    # (prep/qwen_edit_encode.py:923), so the stem arrives nested rather than at the top level.
+    #
+    # The lookup uses the module's own ``QWEN_EDIT_*_BATCH_KEYS`` tuples rather than the directory
+    # names. Those are NOT the same string: ``fns.py:5828`` builds ``data_sources`` as
+    # ``{dir_name: _PRECOMPUTED_SOURCE_OUTPUT_KEYS[dir_name]}``, so the batch is keyed by the output
+    # key (``qwen_edit_latent_conditions``) while the on-disk directory is ``qwen_edit_latents``.
+    # Both spellings are already enumerated in those tuples, in lookup order, for exactly this
+    # reason — and a hand-written list here would drift from them the moment either changes.
+    #
+    # TARGET first, control only as a fallback: the two agreeing is what this stem is used to
+    # verify, so reading the control's copy preferentially would compare a value against itself and
+    # pass unconditionally.
+    for source in (*QWEN_EDIT_TARGET_BATCH_KEYS, *QWEN_EDIT_CONTROL_BATCH_KEYS):
+        payload = batch.get(source)
+        if isinstance(payload, dict):
+            value = payload.get("stem")
+            if value is not None:
+                return str(value)
+
     path = batch.get("path")
     if path is not None:
         name = str(path).replace("\\", "/").rsplit("/", 1)[-1]
         return name.rsplit(".", 1)[0] if "." in name else name
     raise ValueError(
-        "batch carries no 'stem'/'target_stem'/'sample_id'/'path': control images are matched to "
-        "targets BY STEM (dataloader_mixins.py:979-985), so without the target's stem the 1:1 check "
-        "cannot run and would silently pass on a control set belonging to another sample. Carry the "
-        "stem through prep."
+        "batch carries no 'stem'/'target_stem'/'sample_id'/'path', and neither "
+        "batch['qwen_edit_latents'] nor batch['qwen_edit_control_latents'] carries a 'stem': "
+        "control images are matched to targets BY STEM (dataloader_mixins.py:979-985), so without "
+        "the target's stem the 1:1 check cannot run and would silently pass on a control set "
+        "belonging to another sample. prep/qwen_edit_encode writes 'stem' into every payload it "
+        "commits; a batch missing it was pre-encoded by something else, or by an older prep."
     )

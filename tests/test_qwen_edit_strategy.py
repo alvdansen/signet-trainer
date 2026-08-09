@@ -446,3 +446,85 @@ def test_module_imports_without_modal_or_ltx_core() -> None:
     snapshot = json.loads(out.stdout.strip().splitlines()[-1])
     assert snapshot["ok"] is True, "the purity probe never actually imported the module"
     assert snapshot["bad"] == [], snapshot["bad"]
+
+
+# ==================================================================================================
+# The batch shape PrecomputedDataset ACTUALLY produces (2026-08-08 live-run defect).
+# ==================================================================================================
+
+
+def test_the_stem_is_read_from_the_nested_precomputed_payload() -> None:
+    """``_target_stem`` must find the stem where PrecomputedDataset puts it: NESTED.
+
+    ``PrecomputedDataset.__getitem__`` stores each source's whole payload dict under that source's
+    key (``result[output_key] = data``, data/precomputed.py:288). prep writes ``payload["stem"]``
+    (prep/qwen_edit_encode.py:923), so at training time the stem lives at
+    ``batch["qwen_edit_latents"]["stem"]`` — never at the top level. The first live train dispatch
+    died here after the arch gate had already passed and the adapter had already been injected
+    (1680 tensors, 387,072,000 params), which is the most expensive place this could have surfaced.
+    """
+    from signet_trainer.conditioning.qwen_edit import _target_stem
+
+    # BOTH spellings must work. fns.py:5828 keys the batch by the OUTPUT KEY
+    # (qwen_edit_latent_conditions) while the on-disk directory is qwen_edit_latents; the
+    # module's QWEN_EDIT_*_BATCH_KEYS tuples enumerate both, and this reads from those rather
+    # than from a hand-written list that would drift from them.
+    assert _target_stem({"qwen_edit_latents": {"stem": "img_3404"}}) == "img_3404"
+    assert _target_stem({"qwen_edit_latent_conditions": {"stem": "img_3404"}}) == "img_3404"
+
+
+def test_a_top_level_stem_still_wins() -> None:
+    """Back-compat: an explicit top-level stem takes precedence over the nested one."""
+    from signet_trainer.conditioning.qwen_edit import _target_stem
+
+    batch = {"stem": "explicit", "qwen_edit_latents": {"stem": "nested"}}
+    assert _target_stem(batch) == "explicit"
+
+
+def test_the_target_source_is_preferred_over_the_control_source() -> None:
+    """Read the TARGET's stem, not the control's.
+
+    The stem exists to verify that a sample's controls belong to that sample. Preferring the
+    control payload's copy would compare a value against itself and pass unconditionally — the
+    check would still run, still be green, and mean nothing.
+    """
+    from signet_trainer.conditioning.qwen_edit import _target_stem
+
+    batch = {
+        "qwen_edit_latent_conditions": {"stem": "the_target"},
+        "qwen_edit_control_latent_conditions": {"stem": "a_different_sample"},
+    }
+    assert _target_stem(batch) == "the_target"
+
+
+def test_a_batch_with_no_stem_anywhere_is_still_refused() -> None:
+    """The refusal must survive: a missing stem makes the 1:1 check unfalsifiable."""
+    import pytest as _pytest
+
+    from signet_trainer.conditioning.qwen_edit import _target_stem
+
+    with _pytest.raises(ValueError, match="matched to targets BY STEM"):
+        _target_stem({"qwen_edit_latent_conditions": {"latents": None}})
+
+
+def test_the_stem_lookup_is_single_sourced_from_the_batch_key_tuples() -> None:
+    """``_target_stem`` must read the module's key tuples, not a hand-written list.
+
+    The live failure this pins: the batch is keyed by the OUTPUT KEY, not the directory name
+    (``fns.py:5828`` maps ``{dir_name: _PRECOMPUTED_SOURCE_OUTPUT_KEYS[dir_name]}``). A hardcoded
+    ``"qwen_edit_latents"`` looked right, matched the on-disk directory, and found nothing — twice,
+    on two separate metered dispatches, each after the arch gate had passed and the adapter had
+    been injected. The tuples already enumerated both spellings.
+    """
+    import inspect
+
+    from signet_trainer.conditioning import qwen_edit
+
+    src = inspect.getsource(qwen_edit._target_stem)
+    assert "QWEN_EDIT_TARGET_BATCH_KEYS" in src and "QWEN_EDIT_CONTROL_BATCH_KEYS" in src, (
+        "_target_stem must iterate QWEN_EDIT_TARGET_BATCH_KEYS / QWEN_EDIT_CONTROL_BATCH_KEYS so "
+        "the accepted batch keys stay single-sourced with the rest of the module"
+    )
+    # Every spelling the tuples promise actually resolves.
+    for key in (*qwen_edit.QWEN_EDIT_TARGET_BATCH_KEYS, *qwen_edit.QWEN_EDIT_CONTROL_BATCH_KEYS):
+        assert qwen_edit._target_stem({key: {"stem": "s"}}) == "s", f"{key} not honoured"
