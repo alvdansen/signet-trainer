@@ -79,6 +79,31 @@ qwen_edit:
   # Slots with no source directory, blank-filled on every sample. control_dirs + blank_slots
   # must account for exactly control_slots; the schema refuses any other arrangement.
   blank_slots: []
+  #
+  # ── `--mode sample` ONLY: the two DECLARED GAPS ────────────────────────────────────────────
+  # This config drives `--mode preprocess` and `--mode train` as-is. A RENDER additionally needs
+  # the checkpoint BAND and the HELD-OUT inputs, and neither field exists in the schema yet —
+  # `modal/entrypoint.py::_qwen_edit_config_gaps` refuses a sample dispatch at $0 and names them.
+  # The shape below is what lands them (commented out because the schema is extra="forbid" and
+  # would reject the keys today); `modal/fns.py::qwen_edit_sample` already reads both names.
+  #
+  # render_checkpoint_band:            # ordered band-member dir names under <output_dir>/.
+  #   - checkpoint-step-04000          # §8: "checkpoint selection = a band, not a winner" — the
+  #   - checkpoint-step-04200          # shipped JPM deliverable was three checkpoints. find_latest
+  #   - checkpoint-step-05000          # is NOT the fallback: it moves while a run commits.
+  # render_inputs:                     # one entry per HELD-OUT input = one grid ROW.
+  #   - id: train_icon                 # the render key's conditioning slot AND the file stem.
+  #     images: ["heldout/train_1.png", "heldout/train_2.png", "heldout/train_3.png"]
+  #     prompts:                       # keyed by the QWEN_EDIT_PROMPT_MODES ids — §8's A/B pair.
+  #       a_style: "reimagine the reference icon in the style"     # subject NOT named
+  #       b_content: "reimagine the train icon in the style"       # subject named
+  #
+  # The §8 INFERENCE settings are deliberately NOT config: steps 30, true_cfg 4.0, CFGNorm, the
+  # static scheduler reparameterisation, LoRA strength 1.0 and the negative prompt are locked in
+  # models/qwen_edit_pipeline.QWEN_EDIT_RENDER_RECIPE, the same way quantize_qwen_edit's qfloat8
+  # is locked. validation.guidance_scale / num_inference_steps below must AGREE with the recipe
+  # (4.0 / 30) or the sample arm refuses — a banner printing one number while the grid rendered
+  # at another describes a render nobody performed.
   blank_slot_fill: black
   control_area_px: 1048576     # VAE_IMAGE_SIZE   — pipeline_qwenimage_edit_plus.py:67
   condition_area_px: 147456    # CONDITION_IMAGE_SIZE — same file, :66 (the VL channel, NOT the VAE)

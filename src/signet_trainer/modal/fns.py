@@ -5945,6 +5945,42 @@ def qwen_edit_train(config_yaml: str) -> None:
     )
 
 
+def _qwen_edit_adapter_is_live(model: Any) -> tuple[int, int]:
+    """Count the adapter's ``lora_B`` tensors and how many are NON-ZERO. The cheap render floor.
+
+    §8's convergence check is a base-vs-LoRA comparison — *"if the sample is essentially the base
+    render, it isn't converging"* — and the degenerate case of that is an adapter which cannot move
+    the model at all. PEFT initialises every ``lora_B`` to ZERO precisely so an injected-but-untrained
+    adapter is the identity, so a band member whose weights never loaded (a wrong directory, a
+    silently-empty ``set_peft_model_state_dict``) renders pixel-identical to the base column under a
+    checkpoint's label: a grid that reports "not converging" for a checkpoint that was never
+    consulted.
+
+    ⚠ WHAT THIS DOES AND DOES NOT PROVE. It reads WEIGHTS, not outputs: a non-zero ``lora_B`` means
+    the adapter is not the identity by construction, NOT that it changes this render's pixels
+    perceptibly. H3's ``h3_adapter_delta`` measures the stronger property (max|delta velocity| across
+    a real forward) and this is deliberately not that — the qwen forward needs a packed batch out of
+    the training cache, which a render has no reason to mount. The strong floor stays H3's; this one
+    is free, runs on the model already in memory, and catches the failure that actually happens.
+
+    Returns:
+        ``(lora_b_tensors, non_zero_tensors)`` — printed by the caller, so the number is in the
+        container log whether or not anybody looks at the grid.
+    """
+    import torch  # noqa: PLC0415
+
+    total = 0
+    live = 0
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if "lora_B" not in name:
+                continue
+            total += 1
+            if bool(torch.any(param != 0)):
+                live += 1
+    return total, live
+
+
 @app.function(
     # Same shape as ``qwen_edit_train`` MINUS the retries — the ``h3_sample`` precedent, and the same
     # judgement: re-enabling them is a COST decision (it multiplies the worst-case spend by
@@ -5986,39 +6022,94 @@ def qwen_edit_sample(config_yaml: str) -> None:
     ``plan_qwen_edit_columns`` own that layout; ``expected_qwen_edit_band_keys`` is what a watcher
     asks "did the whole band land?" with.
 
-    ⛔ **THE GENERATE CALL IS A DECLARED STUB.** Everything around it is real and CPU-tested — the
-    render identity (``render_key.qwen_edit_render_key``), the landed-check
-    (``samples_layout.landed_render_ids``), the band, the column plan and the HTML surface
-    (``grid.write_qwen_edit_gallery``). ``inference/qwen_edit_layout.render_qwen_edit_sample`` raises
-    ``NotImplementedError`` naming precisely what lands it — chiefly the §8 INFERENCE SETTINGS, which
-    are a documented trap and not defaults: steps 30, true_cfg 4.0 with CFGNorm ON, **static** shift
-    3.0 overridden onto ``pipeline.scheduler`` AFTER ``get_generation_pipeline()`` rebuilds it with a
-    default-shift one, LoRA strength 1.0, and the reference fed into BOTH the positive and the
-    negative encode. A sampler written without those produces muddy renders that read as a bad
-    adapter, which is the most expensive way to be wrong on this family.
+    **ONE model renders every column.** The base row is the SAME PEFT-wrapped transformer under
+    ``disable_adapter()`` (``qwen_edit_render_context``), and each band member is that same wrapper
+    with the next checkpoint loaded into it — never a second transformer and never a second load.
+    That is H3's reason (``fns.py:4356-4359``) applied to a family where it is if anything stronger:
+    §8 reads convergence as base-vs-LoRA DIVERGENCE, so "identical seed, identical everything except
+    the adapter" has to be a fact rather than a claim.
 
-    This stage therefore reaches that named refusal at SECOND ZERO — after the probes and the config
-    revalidation, before any weight load — rather than after two multi-GiB loads. It is wired now, in
-    full, because the day the generate call lands NOTHING in the Modal layer should need to change:
-    the image, the volumes, the secrets, the egress guard, the timeout and the gate are all already
-    correct, and the entrypoint already routes ``--mode sample`` here by family.
+    Body order, and every step is load-bearing:
+
+      0. ``_qwen_edit_require_backend`` — the signet-side modules, named before anything loads;
+      1. the cold-path probe (diffusers / transformers / peft / PIL / optimum.quanto);
+      2. config re-parse + family assert, in-container, before any spend;
+      3. THE RENDER REQUEST — the band and the held-out inputs, both DECLARED. Nothing here is
+         inferred: ``entrypoint._qwen_edit_config_gaps`` refuses the same two absences at $0 before
+         dispatch, and this is the in-container mirror of that refusal (a passing local gate proves
+         nothing about what actually reached the container);
+      4. the band members are resolved against the CHECKPOINTS Volume and each one must be a
+         COMPLETE checkpoint dir — the same completeness filter ``find_latest`` applies, so a
+         half-written directory can never be pinned into a render either;
+      5. the arch gate, UNCONDITIONAL and FIRST among the loads. No flag skips it and none stops
+         after it; it hands back the very transformer this render uses, so the run pays for one load;
+      6. ``quantize_qwen_edit`` on the UN-WRAPPED transformer (the recipe's order — ``assert_qwen_
+         edit_not_peft_wrapped`` enforces it) then ``inject_lora`` over the 14-leaf path regex;
+      7. the other four pipeline components from the mounted Volume, and ``build_qwen_edit_pipeline``,
+         which pins the static scheduler AFTER construction and verifies the pin before returning;
+      8. render — base columns first, then each band member in band order, resuming any cell already
+         on the Volume and committing per image;
+      9. the gallery + the §8 divergence read, then commit-or-vanish.
+
+    ⚠ ``validation.prompts`` is NOT this grid's prompt source and is deliberately not read here. §8's
+    A/B pair belongs to its held-out INPUT (same input, two prompts, side by side), so the prompts
+    travel with the control images in ``qwen_edit.render_inputs``; a flat list cannot say which entry
+    is A, which is B, or which input either belongs to. Refusing on ``validation.prompts`` would be
+    refusing on a field the render never reads. ``validation.seed`` / ``width`` / ``height`` ARE read.
+
+    ⚠ ``validation.guidance_scale`` and ``validation.num_inference_steps`` are also NOT read: the §8
+    inference settings are locked in ``models/qwen_edit_pipeline.QWEN_EDIT_RENDER_RECIPE`` (30 steps,
+    true_cfg 4.0, CFGNorm, the static scheduler reparameterisation, LoRA strength 1.0, a non-empty
+    negative prompt) in the same sense that ``quantize_qwen_edit``'s qfloat8 is locked. The
+    entrypoint refuses a config that CONTRADICTS the recipe, so nothing is silently overridden — and
+    ``guidance_scale`` would in any case map to ``true_cfg_scale`` and never to the pipeline's
+    ``guidance_scale=``, which this checkpoint ignores for want of a guidance embedder.
     """
     # ── (0) the signet-side modules, named before anything is loaded ──────────────────────────────
     _qwen_edit_require_backend(
         "signet_trainer.inference.qwen_edit_layout",
         "signet_trainer.models.qwen_edit_loader",
+        "signet_trainer.models.qwen_edit_pipeline",
     )
 
     # ── (1) COLD-PATH IMPORT PROBE ────────────────────────────────────────────────────────────────
     _qwen_edit_cold_path_probe("qwen_edit_sample")
 
+    import hashlib  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    import torch  # noqa: PLC0415
+    from PIL import Image  # noqa: PLC0415
+
     from signet_trainer.config.load import load_config_from_text  # noqa: PLC0415
+    from signet_trainer.inference.grid import write_qwen_edit_gallery  # noqa: PLC0415
     from signet_trainer.inference.qwen_edit_layout import (  # noqa: PLC0415
         CheckpointBand,
+        QwenEditHeldOutInput,
         plan_qwen_edit_columns,
+        plan_qwen_edit_rows,
+        qwen_edit_cell_relpath,
+        qwen_edit_control_ids,
         render_qwen_edit_sample,
     )
     from signet_trainer.inference.samples_layout import samples_root  # noqa: PLC0415
+    from signet_trainer.lora.peft import (  # noqa: PLC0415
+        build_lora_config,
+        inject_lora,
+        load_adapter_into,
+    )
+    from signet_trainer.models.qwen_edit_loader import (  # noqa: PLC0415
+        assert_qwen_edit_text_encoder_vision,
+        load_qwen_edit_text_encoder,
+        load_qwen_edit_vae,
+        quantize_qwen_edit,
+    )
+    from signet_trainer.models.qwen_edit_pipeline import (  # noqa: PLC0415
+        QWEN_EDIT_RENDER_RECIPE,
+        build_qwen_edit_pipeline,
+    )
+    from signet_trainer.train.checkpoint import CheckpointManager  # noqa: PLC0415
 
     # ── (2) load + revalidate the config in-container ─────────────────────────────────────────────
     config = load_config_from_text(config_yaml)
@@ -6027,38 +6118,336 @@ def qwen_edit_sample(config_yaml: str) -> None:
             f"[qwen_edit_sample] model.family is {config.model.family!r}, not 'qwen_edit' — this "
             "stage drives the diffusers Qwen-Image-Edit workflow, not the LTX pipelines."
         )
-    prompts = list(config.validation.prompts)
-    if not prompts:
+    if not config.model.pipeline_root_id:
         raise RuntimeError(
-            "[qwen_edit_sample] config.validation.prompts is empty — nothing to render. The eval "
-            "prompt set is FIRST-CLASS setup, settled at the session gate and never presumed, so "
-            "this is a config error rather than something to default."
+            "[qwen_edit_sample] config.model.pipeline_root_id is unset. The render needs the "
+            "pipeline ROOT because the Qwen2.5-VL PROCESSOR lives at <root>/processor — NOT beside "
+            "the text encoder, and NOT at the root itself; both were tried on live hardware and "
+            "both failed. Add to the config's `model:` block:\n"
+            "    pipeline_root_id: qwen-image-edit-2511"
+        )
+    seed = int(config.validation.seed)
+    width, height = int(config.validation.width), int(config.validation.height)
+    device, dtype = "cuda", torch.bfloat16
+    recipe = QWEN_EDIT_RENDER_RECIPE
+
+    # ── (3) THE RENDER REQUEST — declared, never inferred ─────────────────────────────────────────
+    # The in-container mirror of ``entrypoint._qwen_edit_config_gaps``' sample arm. Both exist for
+    # the reason ``modal/app.py``'s download_image banner states in one sentence: a passing local
+    # gate proves nothing about what reached the container. ``getattr`` with a default rather than
+    # attribute access, exactly as the entrypoint does, because these are DECLARED GAPS in the
+    # schema today — a plain read would raise AttributeError instead of naming the missing field.
+    declared_band = tuple(getattr(config.qwen_edit, "render_checkpoint_band", ()) or ())
+    declared_inputs = tuple(getattr(config.qwen_edit, "render_inputs", ()) or ())
+    if not declared_band:
+        raise RuntimeError(
+            "[qwen_edit_sample] qwen_edit.render_checkpoint_band is unset or empty — there is no "
+            "adapter to render. §8 makes the BAND the deliverable unit ('checkpoint selection = a "
+            "band, not a winner'), and find_latest() is deliberately NOT the fallback: it is a "
+            "moving target while a training run commits, and since the render directory is keyed on "
+            "the checkpoint NAME every re-dispatch would land in a fresh directory and resume "
+            "nothing (H3's D-10-DEF-19). Declare the ordered band-member directory names."
+        )
+    if not declared_inputs:
+        raise RuntimeError(
+            "[qwen_edit_sample] qwen_edit.render_inputs is unset or empty — there is nothing "
+            "held-out to render. §8 renders every held-out input under BOTH prompt modes (A "
+            "style-only, B content-named) side by side; the pair IS the trace-vs-reinterpret "
+            "measurement. Declare one entry per input: {id, images (one per control slot, in slot "
+            "order), prompts (keyed by the QWEN_EDIT_PROMPT_MODES ids)}."
         )
 
-    # The render ROOT is resolved through the shared registry rather than composed here, because a
-    # watcher that verifies the wrong directory books the full per-render estimate on every poll
-    # while never marking the render done — the phantom-spend failure that module exists to prevent.
-    render_root = samples_root(config.output_dir, config.model.family)
+    band = CheckpointBand.of(declared_band)
+    columns = plan_qwen_edit_columns(band)
+    # The manifest-free control resolution: each entry names its own images, in SLOT ORDER, so no
+    # directory-scan convention is invented here (the pre-encode's positional rule, one layer up).
+    # A path is Volume-relative by convention but an absolute one is accepted, the same way
+    # ``h3_sample`` treats ``data.metadata_path`` — silently resolving an absolute path under the
+    # mount would 404 for a reason nobody could read.
+    control_slots = int(config.qwen_edit.control_slots)
+    held_out: list[QwenEditHeldOutInput] = []
+    control_images: dict[str, list[Any]] = {}
+    staged_thumbs: dict[str, list[tuple[Path, str]]] = {}
+    for index, entry in enumerate(declared_inputs):
+        input_id = str(getattr(entry, "id", "") or "")
+        images = tuple(getattr(entry, "images", ()) or ())
+        prompts = dict(getattr(entry, "prompts", {}) or {})
+        if not input_id or not images or not prompts:
+            raise RuntimeError(
+                f"[qwen_edit_sample] qwen_edit.render_inputs[{index}] is incomplete (id="
+                f"{input_id!r}, {len(images)} image(s), {len(prompts)} prompt(s)). Every held-out "
+                "input needs an id — it is the render key's conditioning slot AND the stem of every "
+                "file it renders — its ordered per-slot images, and a prompt for both §8 modes."
+            )
+        if len(images) != control_slots:
+            raise RuntimeError(
+                f"[qwen_edit_sample] qwen_edit.render_inputs[{index}] ({input_id!r}) declares "
+                f"{len(images)} control image(s) but qwen_edit.control_slots is {control_slots}. "
+                "The mapping is POSITIONAL — image i fills slot i, which is what the prompt's "
+                "ctrl_img_{i+1} addresses — so a short list does not render a smaller grid, it "
+                "renders the WRONG request under the right label."
+            )
+        opened: list[Any] = []
+        thumbs: list[tuple[Path, str]] = []
+        for slot, raw in enumerate(images):
+            declared_path = Path(str(raw))
+            source = declared_path if declared_path.is_absolute() else DATASET_DIR / declared_path
+            if not source.exists():
+                raise RuntimeError(
+                    f"[qwen_edit_sample] control image for {input_id!r} slot {slot} does not exist: "
+                    f"{source}. Declared as {raw!r}; a relative path resolves under the dataset "
+                    "Volume mount. Refusing before the arch gate rather than after ~40 GiB of "
+                    "loads — the missing file is the cheapest thing in this stage to discover."
+                )
+            # RGB, explicitly: the VAE encodes three channels, and an RGBA or paletted control would
+            # either raise deep inside the pipeline's own preprocessing or silently drop its alpha.
+            # This is the one image transform performed here — the SIZE stays the source's, because
+            # the pipeline resizes it itself at both budgets and
+            # ``assert_qwen_edit_control_geometry`` proves those two resizes equal signet's geometry.
+            # Pre-resizing here would resample every image twice.
+            opened.append(Image.open(source).convert("RGB"))
+            thumbs.append((source, f"controls/{input_id}_slot{slot}{source.suffix or '.png'}"))
+        held_out.append(
+            QwenEditHeldOutInput(
+                input_id=input_id,
+                prompts=prompts,  # refuses a missing/blank/unknown mode id in __post_init__
+                control_imgs=tuple(rel for _src, rel in thumbs),
+                label=str(getattr(entry, "label", "") or "") or None,
+            )
+        )
+        control_images[input_id] = opened
+        staged_thumbs[input_id] = thumbs
+
+    control_ids = qwen_edit_control_ids(held_out)  # refuses a duplicate id; order PRESERVED
+    render_root = CHECKPOINTS_DIR / samples_root(config.output_dir, config.model.family)
     print(
-        f"[qwen_edit_sample] {len(prompts)} prompt(s), seed {config.validation.seed}, renders under "
-        f"{render_root}/ (A/B prompt modes are SUBDIRS of one render dir, not two dirs — the mode is "
-        "not an identity axis, so a row whose A half landed can never read as a complete render)."
+        f"[qwen_edit_sample] {len(held_out)} held-out input(s) x {len(columns)} column(s) "
+        f"= {len(held_out) * len(columns)} image(s) at seed {seed}, {width}x{height}; "
+        f"{band.describe()}; recipe {recipe.describe()}. Renders land under {render_root} "
+        "(A/B prompt modes are SUBDIRS of one render dir, not two dirs — the mode is not an "
+        "identity axis, so a row whose A half landed can never read as a complete render)."
     )
 
-    # ── (3) THE DECLARED STUB. Raises here, naming what lands it, before any weight load. ─────────
-    render_qwen_edit_sample(
-        config_yaml=config_yaml,
-        render_root=render_root,
-        band=CheckpointBand,
-        columns=plan_qwen_edit_columns,
-        prompts=prompts,
-        seed=int(config.validation.seed),
-        width=int(config.validation.width),
-        height=int(config.validation.height),
-        checkpoints_dir=str(CHECKPOINTS_DIR / config.output_dir),
-        weights_dir=str(WEIGHTS_DIR),
-        model_id=config.model.model_id,
-        vae_id=config.model.vae_id,
-        text_encoder_id=config.model.text_encoder_id,
-        pipeline_root_id=config.model.pipeline_root_id,
+    # ── (4) the band, resolved against the checkpoints Volume ─────────────────────────────────────
+    checkpoints_vol.reload()
+    ckpt_root = CHECKPOINTS_DIR / config.output_dir
+    member_dirs: dict[str, Any] = {}
+    for member in band.members:
+        candidate = ckpt_root / member
+        if not CheckpointManager.is_complete(candidate):
+            available = sorted(p.name for p in ckpt_root.glob("checkpoint-step-*") if p.is_dir())
+            raise RuntimeError(
+                f"[qwen_edit_sample] band member {member!r} is not a COMPLETE checkpoint dir at "
+                f"{candidate} (it needs both the adapter and training_state.pt — the same "
+                f"completeness filter find_latest applies, so a half-written dir can never be "
+                f"rendered either). Available: {available}. The whole band is checked BEFORE the "
+                "arch gate: discovering member 3 is missing after two members have rendered wastes "
+                "the expensive half of this stage."
+            )
+        member_dirs[member] = candidate
+    print(
+        f"[qwen_edit_sample] band verified on the Volume: "
+        f"{', '.join(str(member_dirs[m].name) for m in band.members)}."
+    )
+
+    # ── (5) THE ARCH GATE — unconditional, first, and it hands back the model this render uses ────
+    gate_line, transformer = run_qwen_edit_arch_gate(
+        str(WEIGHTS_DIR / config.model.model_id),
+        device=device,
+        dtype=dtype,
+        config_source=str(WEIGHTS_DIR / config.model.pipeline_root_id),
+        text_embed_dim=config.qwen_edit.text_embed_dim,
+    )
+    print(f"[qwen_edit_sample] {gate_line}")
+    if transformer is None:  # defensive: release=False must always return the proved model
+        raise RuntimeError(
+            "[qwen_edit_sample] the arch gate returned no model. This stage must render with the "
+            "very transformer the gate just proved — re-loading would pay for 40.9 GiB twice and "
+            "would render with a model the gate never inspected."
+        )
+
+    # ── (6) qfloat8 on the UN-WRAPPED transformer, then the 14-leaf adapter ───────────────────────
+    # Order is the recipe's and it is enforced rather than remembered: ``quantize_qwen_edit`` calls
+    # ``assert_qwen_edit_not_peft_wrapped``. ``resolved_lora_targets()`` (never ``x or FALLBACK``):
+    # on this family the value is a bare regex ``str``, and the idiom would substitute the
+    # list-shaped LTX default for an empty one — matching zero modules here.
+    quantize_qwen_edit(transformer, what="the Qwen-Image-Edit transformer")
+    adapted = inject_lora(
+        transformer,
+        build_lora_config(
+            rank=config.lora.rank,
+            alpha=config.lora.alpha,
+            dropout=0.0,  # a render is not a training step; dropout would randomise the comparison
+            targets=config.resolved_lora_targets(),
+        ),
+    )
+    del transformer
+    adapted.eval()  # inject_lora leaves the model in train mode + grad checkpointing (TRAIN-06)
+    print(
+        f"[qwen_edit_sample] adapter injected over "
+        f"{'a path regex' if isinstance(config.resolved_lora_targets(), str) else 'a suffix list'} "
+        f"— rank={config.lora.rank} alpha={config.lora.alpha} (PEFT scale "
+        f"{config.lora.alpha / config.lora.rank:.1f}, which IS §8's LoRA strength "
+        f"{recipe.lora_scale}). ONE wrapper renders every column: the base row is this model under "
+        "disable_adapter(), each band member is this model with the next checkpoint loaded in."
+    )
+
+    # ── (7) the other four components, and the pipeline ───────────────────────────────────────────
+    text_encoder = load_qwen_edit_text_encoder(
+        str(WEIGHTS_DIR / config.model.text_encoder_id), device=device, dtype=dtype
+    )
+    # The VISION half is not optional: the pipeline passes pixel_values + image_grid_thw, and a
+    # text-only LLM in this slot fails with "mat1 and mat2 shapes cannot be multiplied
+    # (5376x1280 and 3840x1280)" — a real failure this house already hit and fixed.
+    print(assert_qwen_edit_text_encoder_vision(text_encoder)["summary"])
+    quantize_qwen_edit(text_encoder, what="the Qwen2.5-VL text encoder")
+    vae = load_qwen_edit_vae(str(WEIGHTS_DIR / config.model.vae_id), device=device, dtype=dtype)
+    processor = _qwen_edit_load_processor(
+        str(WEIGHTS_DIR / config.model.pipeline_root_id / "processor")
+    )
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError(
+            "[qwen_edit_sample] the loaded processor exposes no .tokenizer, and "
+            "QwenImageEditPlusPipeline takes the tokenizer and the processor as SEPARATE "
+            f"components ({type(processor).__name__!r} was loaded from "
+            f"{WEIGHTS_DIR / config.model.pipeline_root_id / 'processor'}). AutoProcessor resolves "
+            "the concrete class from the checkpoint's own processor_class, so an unexpected class "
+            "here means the mounted snapshot is not a Qwen2.5-VL processor."
+        )
+    pipeline = build_qwen_edit_pipeline(
+        transformer=adapted,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        processor=processor,
+    )
+    print(
+        f"[qwen_edit_sample] pipeline assembled ({type(pipeline).__name__}); scheduler pinned to "
+        "the §8 STATIC reparameterisation AFTER construction and verified — the trap on this "
+        "family is that a pipeline factory rebuilds its own default-shift scheduler, and the "
+        "symptom is a muddy render that reads as a bad adapter."
+    )
+
+    # ── (8) render — base first, then each band member, resuming and committing per image ─────────
+    # Stage the control thumbnails INTO the render root so the gallery is self-contained: the
+    # sources live on the dataset Volume, and a page committed to the checkpoints Volume that linked
+    # back to them would show broken control tiles wherever it is actually read.
+    for input_id, thumbs in staged_thumbs.items():
+        for source, rel in thumbs:
+            destination = render_root / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.exists() or destination.stat().st_size == 0:
+                shutil.copyfile(source, destination)
+
+    rendered, resumed = 0, 0
+
+    def _cell(column: Any, item: QwenEditHeldOutInput, *, adapter: bool) -> Path:
+        """Render ONE cell, or resume it. The path comes from the SINGLE column->file join.
+
+        ``qwen_edit_cell_relpath`` is the one transcription of ``<render dir>/<render_subdir>/
+        <input>_s<seed>.png``, and the gallery reads the same function's answer back through
+        ``row[column.row_key]``. Composing a second spelling here is how a grid comes to reference
+        files that exist under different names — every tile falls back to 'generation failed' on a
+        render that succeeded, or one column's file is found under another column's key.
+        """
+        nonlocal rendered, resumed
+        out_path = render_root / qwen_edit_cell_relpath(
+            column, input_id=item.input_id, seed=seed, control_ids=control_ids
+        )
+        if out_path.exists() and out_path.stat().st_size > 0:
+            # Non-empty, not merely present: a container killed mid-save leaves a 0-byte file, and
+            # skipping THAT would put a corrupt cell in the grid rather than re-render it.
+            resumed += 1
+            print(f"[qwen_edit_sample] resume — {column.row_key} / {item.input_id} already rendered.")
+            return out_path
+        render_qwen_edit_sample(
+            pipeline=pipeline,
+            control_images=control_images[item.input_id],
+            prompt=item.prompts[column.mode.id],
+            out_path=out_path,
+            seed=seed,
+            width=width,
+            height=height,
+            adapter=adapter,
+        )
+        # COMMIT-OR-VANISH, per image (h3_sample's per-clip commit): a render that is not on the
+        # Volume did not happen, and a preemption at cell 11 of 12 must not lose the other eleven.
+        checkpoints_vol.commit()
+        rendered += 1
+        return out_path
+
+    # The BASE columns, once for the whole band — ``qwen_edit_render_dir`` keys them on the reserved
+    # ``base`` token precisely so they are not re-rendered per member into byte-identical files.
+    base_paths: dict[tuple[str, str], Path] = {}
+    for column in (col for col in columns if col.is_base):
+        for item in held_out:
+            base_paths[(item.input_id, column.mode.id)] = _cell(column, item, adapter=False)
+    print(f"[qwen_edit_sample] BASE columns done — the §8 divergence reference, at seed {seed}.")
+
+    member_paths: dict[tuple[str, str, str], Path] = {}
+    for member in band.members:
+        load_adapter_into(adapted, member_dirs[member])
+        lora_b, live = _qwen_edit_adapter_is_live(adapted)
+        if live == 0:
+            raise RuntimeError(
+                f"[qwen_edit_sample] band member {member!r} loaded {lora_b} lora_B tensor(s) and "
+                "EVERY ONE is zero, so this adapter is the identity by construction: its columns "
+                "would be the base column's pixels under a checkpoint's label, and §8's divergence "
+                "read would report 'not converging' for a checkpoint that never participated. PEFT "
+                "initialises lora_B to zero, so this is what an adapter that failed to load looks "
+                f"like — check {member_dirs[member]}. Refusing before the member's renders."
+            )
+        print(
+            f"[qwen_edit_sample] loaded {member} — {live}/{lora_b} lora_B tensor(s) non-zero. This "
+            "reads WEIGHTS, not outputs: it proves the adapter is not the identity, not that it "
+            "moves this render perceptibly (that is the grid's job, and §8 says read samples)."
+        )
+        for column in (col for col in columns if col.checkpoint == member):
+            for item in held_out:
+                member_paths[(member, item.input_id, column.mode.id)] = _cell(
+                    column, item, adapter=True
+                )
+
+    # ── (9) the gallery, the §8 divergence read, and commit-or-vanish ─────────────────────────────
+    # The rows come from the planner, so the render loop assembles no dict of its own and the page
+    # can only reference paths the join above produced.
+    index_path = write_qwen_edit_gallery(
+        plan_qwen_edit_rows(held_out, columns, seed=seed),
+        render_root / "index.html",
+        {
+            # EXACTLY the banner's allowlist, every value from the LOCKED recipe rather than from a
+            # config field the render does not read — a banner that describes a render nobody
+            # performed is the failure h3_sample records for its own width/height (fns.py:4808).
+            "steps": recipe.steps,
+            "true_cfg": recipe.true_cfg,
+            "cfg_norm": recipe.cfg_norm,
+            "width": width,
+            "height": height,
+            "lora_scale": recipe.lora_scale,
+            "checkpoint_band": band.describe(),
+        },
+        columns=columns,
+    )
+
+    # §8: *"convergence is read as base-vs-LoRA divergence … if the sample is essentially the base
+    # render, it isn't converging."* Byte-identity is the strongest possible form of "essentially
+    # the base render" and the only one measurable without a perceptual metric, so it is REPORTED
+    # rather than judged: a non-zero count is a finding for the operator reading the grid, and the
+    # hard refusal for the degenerate cause (an adapter that never loaded) already fired above.
+    def _digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else ""
+
+    identical = [
+        f"{member}/{input_id}/{mode_id}"
+        for (member, input_id, mode_id), path in member_paths.items()
+        if _digest(path) and _digest(path) == _digest(base_paths.get((input_id, mode_id), path))
+    ]
+    checkpoints_vol.commit()
+    print(
+        f"[qwen_edit_sample] done — {rendered} image(s) rendered, {resumed} resumed from the "
+        f"Volume, gallery at {index_path} (committed to signe-trainer-checkpoints). §8 divergence "
+        f"read: {len(identical)} of {len(member_paths)} adapter cell(s) are BYTE-IDENTICAL to their "
+        f"base cell{': ' + ', '.join(identical) if identical else ''}. Zero is the expected result; "
+        "anything else means those cells are the base render under a checkpoint's label."
     )
