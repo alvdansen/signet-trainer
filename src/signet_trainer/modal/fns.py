@@ -6299,7 +6299,21 @@ def qwen_edit_sample(config_yaml: str) -> None:
     # The VISION half is not optional: the pipeline passes pixel_values + image_grid_thw, and a
     # text-only LLM in this slot fails with "mat1 and mat2 shapes cannot be multiplied
     # (5376x1280 and 3840x1280)" — a real failure this house already hit and fixed.
-    print(assert_qwen_edit_text_encoder_vision(text_encoder)["summary"])
+    # ``qwen_vl_vision_census`` returns {"total", "vision", "examples"} and never a "summary" — the
+    # line here subscripted one, so this stage died with KeyError AFTER the arch gate, qfloat8, the
+    # adapter injection and a ~40.9 GiB load, i.e. at the most expensive possible moment and only
+    # ever on real weights. Measured on the live encoder: 1446 tensors / 714 vision; a text-only
+    # impostor reads 339 / ZERO, loads clean, and dies deep in the forward instead.
+    vision_census = assert_qwen_edit_text_encoder_vision(
+        text_encoder, what="the Qwen2.5-VL text encoder"
+    )
+    print(
+        f"[qwen_edit_sample] the Qwen2.5-VL text encoder carries its VISION tower — "
+        f"{vision_census['vision']} vision tensor(s) of {vision_census['total']} total "
+        f"(e.g. {', '.join(vision_census['examples'])}). Counts rather than a bare OK: a text-only "
+        f"encoder in this slot loads without complaint and fails as an unattributed matmul shape "
+        f"error once the pipeline feeds it pixel_values."
+    )
     quantize_qwen_edit(text_encoder, what="the Qwen2.5-VL text encoder")
     vae = load_qwen_edit_vae(str(WEIGHTS_DIR / config.model.vae_id), device=device, dtype=dtype)
     processor = _qwen_edit_load_processor(

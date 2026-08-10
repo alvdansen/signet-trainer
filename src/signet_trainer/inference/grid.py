@@ -497,9 +497,18 @@ def _qwen_edit_params_banner(params: dict) -> str:
     guard weakened, because narrowing a shipped money-safe guard is a ruling and quietly renaming the
     field to slip past a scanner would be worse than either — it would leave the guard falsely green
     while stripping §8's most trap-prone number out of the artifact an operator diagnoses from.
-    Nothing is lost today: ``qwen_edit_layout.render_qwen_edit_sample`` raises, so no real render
-    exists whose scheduler setting needs reporting. The field becomes necessary on exactly the day
-    the sampler lands, which is the day the ruling is needed. See that stub's docstring.
+    ⚠ THE DAY HAS ARRIVED — FOR REVIEW, not silently resolved here. When this was written,
+    ``render_qwen_edit_sample`` raised, so no real render existed whose scheduler setting needed
+    reporting and omitting the field cost nothing. The sampler landed at e132b30 and real renders
+    now exist, so the deferred ruling is live: this gallery is the artifact an operator diagnoses a
+    muddy render from, and §8's most trap-prone number is the one it cannot show.
+
+    It is not UNVERIFIED, which is why this is a reporting gap and not a safety one:
+    ``assert_qwen_edit_scheduler_pinned`` re-checks the pin before every single render and its
+    report goes into the per-cell log line — the value is proven, just not surfaced in the HTML.
+    The two options remain what they were (narrow ``_WAN_TOKENS``' directory-wide scope, or move
+    this writer out from under it), both are rulings on a shipped money-safe guard, and neither is
+    the sort of thing to slip into an unrelated commit.
 
     Missing keys render ``?`` — the same honest-placeholder convention ``_params_banner`` uses. This
     writer never invents a sampling value. An UNRECOGNISED key is REFUSED rather than dropped, so a
@@ -719,8 +728,9 @@ def write_qwen_edit_gallery(
 
     Reuses ``_image_tile`` / ``_qwen_edit_params_banner`` / ``_STYLE`` — every input label, prompt,
     seed and image ``src`` flows through ``html.escape`` (T-04-03). Stdlib-only, torch-free,
-    CPU/Windows-testable (mirrors ``write_reskin_gallery``). The generate call that populates it is a
-    declared stub — ``inference/qwen_edit_layout.render_qwen_edit_sample``.
+    CPU/Windows-testable (mirrors ``write_reskin_gallery``). The generate call that populates it is
+    ``inference/qwen_edit_layout.render_qwen_edit_sample``, which landed at e132b30 and delegates to
+    ``models/qwen_edit_pipeline.qwen_edit_generate``.
 
     Args:
         rows: one dict per HELD-OUT INPUT with ``input_label`` (or ``input_name``), ``seed``,

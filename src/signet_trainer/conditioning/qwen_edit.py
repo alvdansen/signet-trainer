@@ -77,9 +77,10 @@ CRITICAL — Anti-Pattern 6 / Pitfall 6 (import-confinement):
     (``conditioning/strategy``, ``conditioning/qwen_edit_geometry`` — the latter is stdlib +
     ``dataclasses`` only, so it adds no third-party root). There is no ``modal``, no ``ltx_core``,
     no ``diffusers``, no ``config/schema`` and — deliberately — no
-    ``train/qwen_edit_step`` import: that module is a declared stub this pass, and a strategy that
-    could not be constructed without it would make the whole family untestable until the forward
-    lands. Every heavy seam (the 2×2 packing transcription, the blank-fill encode, the sigma draw)
+    ``train/qwen_edit_step`` import. That module was a declared stub when this file was written and
+    has since landed, but the absence stays deliberate and is not an oversight to tidy up: a
+    strategy that could not be constructed without the training step would drag the forward — and
+    torch's whole training surface — into every CPU unit test of this family. Every heavy seam (the 2×2 packing transcription, the blank-fill encode, the sigma draw)
     arrives INJECTED, the ``ic_lora.py`` / ``h3_ref.py`` precedent. That is what keeps this file
     CPU-unit-testable on Windows with zero GPU and zero Modal spend.
 

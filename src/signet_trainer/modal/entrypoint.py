@@ -278,8 +278,11 @@ _QWEN_EDIT_STAGE_MODULES: dict[str, tuple[str, ...]] = {
     "sample": (
         "signet_trainer.inference.qwen_edit_layout",
         "signet_trainer.models.qwen_edit_loader",
-        # ⛔ NOT LANDED YET, and named here for exactly that reason. The render assembles a
-        # ``QwenImageEditPlusPipeline`` whose scheduler carries the §8 STATIC reparameterisation
+        # LANDED (e132b30). Still named here, because the readiness list is a contract about what
+        # this stage IMPORTS, not a to-do list — it is what turns a future deletion or rename into
+        # a $0 abort instead of a ModuleNotFoundError inside a metered container. The render
+        # assembles a ``QwenImageEditPlusPipeline`` whose scheduler carries the §8 STATIC
+        # reparameterisation
         # value, and that construction lives OUTSIDE ``inference/`` because
         # ``tests/test_no_wan_params.py``'s ``_WAN_TOKENS`` bans the bare token from every ``*.py``
         # under that directory — a guard written for LTX paths whose directory-wide scope now also

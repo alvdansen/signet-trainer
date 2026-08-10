@@ -261,3 +261,50 @@ def test_the_shipped_example_config_declares_every_component() -> None:
             f"{cfg.model.pipeline_root_id!r} — a component from a different snapshot than the "
             f"processor is an arch mismatch that loads clean"
         )
+
+
+# ── the fourth live-dispatch failure, 2026-08-10 ───────────────────────────────────────────────────
+# ``qwen_edit_sample`` read ``assert_qwen_edit_text_encoder_vision(text_encoder)["summary"]``. The
+# census has no such key, so the stage raised KeyError AFTER the arch gate, qfloat8, the adapter
+# injection and a ~40.9 GiB load — the most expensive line in the stage at which to discover a typo,
+# and one that can only ever fire on real weights. Same shape as the three above, same remedy: pin
+# the CONTRACT at the cheapest point that can see it.
+
+#: Every key ``qwen_vl_vision_census`` documents and returns. Anything a caller subscripts that is
+#: not in here is a KeyError waiting for a metered container.
+CENSUS_KEYS: frozenset[str] = frozenset({"total", "vision", "examples"})
+
+
+def test_vision_census_returns_exactly_its_documented_keys() -> None:
+    """The census contract, driven by tensor NAMES — no weights, no torch, no GPU."""
+    import sys
+
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
+    from signet_trainer.models.qwen_edit_loader import qwen_vl_vision_census
+
+    census = qwen_vl_vision_census(
+        ["visual.blocks.0.attn.qkv.weight", "model.layers.0.self_attn.q_proj.weight"]
+    )
+    assert set(census) == CENSUS_KEYS, (
+        f"qwen_vl_vision_census returned keys {sorted(census)}; the documented contract is "
+        f"{sorted(CENSUS_KEYS)}. Callers subscript this dict by literal key."
+    )
+
+
+def test_no_call_site_subscripts_an_undocumented_census_key() -> None:
+    """No ``assert_qwen_edit_text_encoder_vision(...)[...]`` may read a key the census lacks.
+
+    A source scan rather than a call, deliberately: the defect was at the CALL SITE, inside a Modal
+    stage that cannot be executed without ~40.9 GiB of weights. The cheapest thing that can see it
+    is the text.
+    """
+    source = _FNS.read_text(encoding="utf-8")
+    subscripts = re.findall(
+        r"assert_qwen_edit_text_encoder_vision\([^)]*\)\s*\[\s*[\"']([^\"']+)[\"']\s*\]", source
+    )
+    bad = sorted({key for key in subscripts if key not in CENSUS_KEYS})
+    assert not bad, (
+        f"modal/fns.py subscripts assert_qwen_edit_text_encoder_vision(...) with {bad}, which the "
+        f"census never returns (it has {sorted(CENSUS_KEYS)}). This raises KeyError only on real "
+        f"weights, after the arch gate and a ~40.9 GiB load."
+    )
