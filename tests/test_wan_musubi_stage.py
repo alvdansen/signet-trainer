@@ -337,10 +337,15 @@ def test_the_stage_checks_every_subprocess_return_code() -> None:
 def _stub_model(**overrides):
     """A ``model:`` block with all four Wan components DECLARED. Not a ModelConfig.
 
-    ``ModelConfig`` is ``extra="forbid"`` and has no ``clip_id`` field at all, so the
-    fully-declared case is UNEXPRESSIBLE as a real config today — which is the gap being reported,
-    not a limitation of this test. Every consumer reads the block by ``getattr`` precisely so it
-    works before and after the fields land, and this stub is that contract exercised.
+    A SimpleNamespace, still, now for a different reason than when it was written. It used to be a
+    workaround: ``ModelConfig`` had no ``clip_id`` field, so under ``extra="forbid"`` the
+    fully-declared case was unexpressible as a real config. ``clip_id`` landed 2026-08-10 and
+    ``test_a_real_model_config_can_now_declare_all_four`` covers that path with the genuine article.
+
+    This stub stays because it exercises the OTHER half of the contract: every consumer reads the
+    block by ``getattr`` with a default, so the resolver must work on anything block-shaped and must
+    not quietly acquire a dependency on pydantic — ``runners/wan_musubi`` has to stay importable on
+    an interpreter that has none (see the module docstring).
     """
     fields = {
         "model_id": "wan/wan2.1_t2v_14B_bf16.safetensors",
@@ -678,3 +683,48 @@ def test_the_stage_is_reachable_only_through_the_gate_and_declares_no_warm_gpu()
     assert "image=wan_musubi_image" in decorator
     assert "gpu=" in decorator
     assert "checkpoints_vol.commit()" in block, "commit-or-vanish (Pitfall 3) is missing"
+
+
+def test_a_real_model_config_can_now_declare_all_four() -> None:
+    """The gap the stub above used to stand in for, closed 2026-08-10 and pinned here.
+
+    Two things had to change before a ``family: wan`` config could name its own weights, and both
+    are the sort that fail SILENTLY if they regress: ``clip_id`` did not exist on ``ModelConfig``
+    (Wan 2.1 is the first signet family with two text-side encoders), and ``vae_id`` was fenced to
+    ``{"h3", "qwen_edit"}``, so declaring it under ``family: wan`` failed at config LOAD.
+
+    Driven through a real ``ModelConfig`` rather than the SimpleNamespace stub, because
+    ``extra="forbid"`` and ``_FAMILY_ONLY_MODEL_IDS`` are exactly what this asserts and a stub sees
+    neither.
+    """
+    from signet_trainer.config.schema import ModelConfig
+
+    cfg = ModelConfig(
+        family="wan",
+        model_id="wan/wan2.1_t2v_14B_bf16.safetensors",
+        vae_id="wan/wan_2.1_vae.safetensors",
+        text_encoder_id="wan/models_t5_umt5-xxl-enc-bf16.pth",
+        clip_id="wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+    )
+    components = wan_resolve_component_ids(
+        cfg,
+        schema_defaults={
+            field: ModelConfig.model_fields[field].default
+            for field in WAN_COMPONENT_CONFIG_FIELDS.values()
+        },
+    )
+    assert components.clip.endswith("open-clip-xlm-roberta-large-vit-huge-14.pth")
+    assert components.vae.endswith("wan_2.1_vae.safetensors")
+
+
+def test_clip_id_is_fenced_to_wan_and_refused_elsewhere() -> None:
+    """An unfenced knob is one a config can set while nothing reads it.
+
+    ``clip_id`` has exactly one consumer (musubi's ``--clip``, wan only), so every other family must
+    refuse it at config load rather than accept a value it will silently ignore — the same rule that
+    put ``vae_id`` and ``pipeline_root_id`` in ``_FAMILY_ONLY_MODEL_IDS``.
+    """
+    from signet_trainer.config.schema import _FAMILY_ONLY_MODEL_IDS
+
+    assert _FAMILY_ONLY_MODEL_IDS["clip_id"] == frozenset({"wan"})
+    assert "wan" in _FAMILY_ONLY_MODEL_IDS["vae_id"]

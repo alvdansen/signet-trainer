@@ -111,8 +111,17 @@ LTX_DEFAULT_LORA_TARGETS: tuple[str, ...] = (
 # config could set it with no error and no consumer (``modal/fns.py:4432`` reads it only on the h3
 # sample path).
 _FAMILY_ONLY_MODEL_IDS: dict[str, frozenset[str]] = {
-    "vae_id": frozenset({"h3", "qwen_edit"}),
+    # wan added 2026-08-10, by the same rule qwen_edit was: the field now has a consumer on this
+    # family. musubi takes the Wan 2.1 VAE as its own ``--vae`` argument
+    # (runners/wan_musubi.WAN_COMPONENT_CONFIG_FIELDS), so a `family: wan` config MUST be able to
+    # name it — and until now setting it failed at config load with "that ID is only read under
+    # family {'h3','qwen_edit'} and would be silently ignored here", which was correct only while
+    # the field had no consumer here.
+    "vae_id": frozenset({"h3", "qwen_edit", "wan"}),
     "audio_vae_id": frozenset({"h3"}),
+    # The second text-side encoder, and the reason it is fenced rather than free: no other family
+    # reads --clip, and an unfenced knob is one a config can set while nothing consumes it.
+    "clip_id": frozenset({"wan"}),
     # qwen_edit added 2026-08-08: the field now has a consumer on this family, which is the exact
     # condition the comment above records for inclusion. The Qwen2.5-VL PROCESSOR is a pipeline-root
     # component — a Qwen-Image-Edit-2511 snapshot puts preprocessor_config.json in `processor/`,
@@ -385,6 +394,22 @@ class ModelConfig(_Base):
         default=None,
         description="H3-only: audio VAE dir under WEIGHTS_DIR (e.g. 'minimax-h3/audio_vae'). None "
         "for LTX. DATA only — never FS-checked here (Pitfall 1).",
+    )
+    # Wan 2.1 is the first signet family with TWO text-side encoders. musubi loads an open-CLIP
+    # XLM-RoBERTa-Large ViT-H/14 ALONGSIDE the umT5 text encoder (``train_kohya.py:78-82,139``), so
+    # there is no existing slot to reuse and none to derive from.
+    #
+    # ⛔ Composing this from ``text_encoder_id`` is the one tempting shortcut and it is wrong in the
+    # way that costs money: musubi would be handed a umT5 checkpoint where it expects open-CLIP,
+    # inside a metered container, AFTER the latent cache pass has already run — and the failure
+    # reads as a musubi bug rather than as a config that never named a CLIP encoder.
+    clip_id: str | None = Field(
+        default=None,
+        description="wan-only: the open-CLIP XLM-RoBERTa-Large ViT-H/14 encoder under WEIGHTS_DIR "
+        "(musubi's --clip). Wan 2.1 needs it ALONGSIDE the umT5 text encoder named by "
+        "text_encoder_id — it is a second encoder, never a substitute and never derivable from the "
+        "first. None for every other family. Legal families are declared in _FAMILY_ONLY_MODEL_IDS. "
+        "DATA only — never FS-checked here (Pitfall 1).",
     )
     # D-10-DEF-14. A DISTINCT field, deliberately NOT a second meaning for ``model_id`` and
     # deliberately NOT derived from it. ``model_id`` names the transformer PARTITION

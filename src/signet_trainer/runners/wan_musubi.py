@@ -152,7 +152,14 @@ WAN_COMPONENT_CONFIG_FIELDS: dict[str, str] = {
 def wan_resolve_component_ids(
     model_cfg: object, *, schema_defaults: Mapping[str, object] | None = None
 ) -> WanComponents:
-    """Read the four component ids off a ``model:`` block. NOT LANDED — refuses, naming each gap.
+    """Read the four component ids off a ``model:`` block. Refuses, naming each gap.
+
+    As of 2026-08-10 every one of the four is DECLARABLE — ``clip_id`` landed on ``ModelConfig`` and
+    ``vae_id``'s family fence gained ``"wan"`` — so this resolves cleanly on a config that names
+    them. It still refuses on the shipped example, and correctly: no Wan components are on the
+    weights Volume and no ``download_wan_weights`` stage writes them, so there is no honest value to
+    put in that config yet. The refusal below is the thing standing between that and a metered
+    container full of the wrong weights.
 
     ``model_cfg`` is typed ``object`` and read by ``getattr`` with a default rather than annotated
     ``ModelConfig``, the ``_qwen_edit_render_request`` idiom: this module must stay importable on an
