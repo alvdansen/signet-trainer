@@ -122,3 +122,93 @@ def test_build_lora_config_is_overridable() -> None:
     assert cfg.lora_alpha == 8
     assert cfg.lora_dropout == 0.1
     assert set(cfg.target_modules) == {"a", "b"}
+
+
+# ── the §8 band render died here, 2026-08-10 ───────────────────────────────────────────────────────
+# The KeyError that cost 4500 steps of phase 1 as a broken crash-resume came back as a broken BAND
+# RENDER: the base column rendered (it loads no checkpoint — it is disable_adapter() on the freshly
+# injected wrapper), then the first band member went through load_adapter_into ->
+# set_peft_model_state_dict and raised
+#     KeyError: 'base_model.model.time_text_embed.timestep_embedder.linear_1.weight._data'
+# f8f2815 fixed this for resume() ONLY. The property belongs to loading an adapter onto a QUANTIZED
+# MODEL, not to resuming, so it now lives in lora/peft and every load_adapter_into caller gets it.
+#
+# torch and the fakes are imported/defined INSIDE each test on purpose: this module keeps its
+# collection free of heavy imports so the dry-run purity guards in test_dryrun_*.py stay meaningful.
+
+
+def _quantized_with_adapter(rank: int = 2):
+    """A fake quanto base Linear plus an ordinary (NEVER quantized) LoRA parameter beside it.
+
+    The class NAME must start with "Q": is_quanto_quantized keys on the ``Q`` prefix plus a
+    "quanto" ``__module__``, matching optimum.quanto's real ``QLinear``. A fake named anything
+    else is simply not detected, and every assertion below would pass vacuously against the
+    non-quantized branch.
+
+    Reproduces quanto's shape without quanto or a GPU: ``_load_from_state_dict`` pops its own
+    ``_data`` key unconditionally and never consults ``strict``, which is the entire defect.
+    """
+    import torch
+
+    class QFakeLinear(torch.nn.Module):
+        __module__ = "optimum.quanto.nn.qmodule"  # is_quanto_quantized sniffs the module path
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+
+        def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):  # noqa: ANN001
+            state_dict.pop(prefix + "weight._data")
+
+    class _QuantizedWithAdapter(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.base = QFakeLinear()
+            self.lora_A = torch.nn.Parameter(torch.zeros(rank, 2))
+
+    return _QuantizedWithAdapter()
+
+
+def test_is_quanto_quantized_detects_the_layer_that_breaks_load_state_dict() -> None:
+    import torch
+
+    from signet_trainer.lora.peft import is_quanto_quantized
+
+    assert is_quanto_quantized(_quantized_with_adapter()) is True
+    assert is_quanto_quantized(torch.nn.Sequential(torch.nn.Linear(2, 2))) is False
+
+
+def test_a_quantized_adapter_load_assigns_directly_and_never_touches_load_state_dict() -> None:
+    """The positive path. Without it every refusal below could be a feature that never works."""
+    import torch
+
+    from signet_trainer.lora.peft import load_adapter_state_into
+
+    model = _quantized_with_adapter()
+    load_adapter_state_into(model, {"lora_A": torch.ones(2, 2)}, what="test")
+    assert torch.equal(model.lora_A.detach(), torch.ones(2, 2)), (
+        "the adapter tensor was not assigned — a silently-empty load renders a band column "
+        "pixel-identical to base, which reads as 'the adapter did nothing'"
+    )
+
+
+def test_a_partial_quantized_adapter_load_is_refused_not_half_applied() -> None:
+    import torch
+
+    from signet_trainer.lora.peft import load_adapter_state_into
+
+    with pytest.raises(RuntimeError, match="PARTIAL adapter is worse than refusing"):
+        load_adapter_state_into(
+            _quantized_with_adapter(),
+            {"lora_A": torch.ones(2, 2), "nope.not_a_live_param": torch.ones(1)},
+            what="test",
+        )
+
+
+def test_a_rank_change_is_refused_and_names_the_lock() -> None:
+    import torch
+
+    from signet_trainer.lora.peft import load_adapter_state_into
+
+    with pytest.raises(RuntimeError, match="HARD LOCK"):
+        load_adapter_state_into(_quantized_with_adapter(rank=2), {"lora_A": torch.ones(8, 2)}, what="test")

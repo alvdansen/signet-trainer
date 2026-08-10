@@ -508,7 +508,108 @@ def load_adapter_into(
     if adapter_name != "default":
         adapter_dir = adapter_dir / adapter_name
     weights = load_file(str(adapter_dir / ADAPTER_FILENAME))
-    return set_peft_model_state_dict(model, weights, adapter_name=adapter_name)
+    return load_adapter_state_into(model, weights, adapter_name=adapter_name, what=str(adapter_dir))
+
+
+def is_quanto_quantized(model: nn.Module) -> bool:
+    """Does this model carry quanto ``QModuleMixin`` layers? Decides which load path is usable."""
+    return any(
+        type(module).__name__.startswith("Q")
+        and hasattr(module, "weight")
+        and hasattr(type(module), "_load_from_state_dict")
+        and "quanto" in type(module).__module__
+        for module in model.modules()
+    )
+
+
+def load_adapter_state_into(
+    model: nn.Module,
+    adapter_weights: dict[str, Any],
+    *,
+    adapter_name: str = "default",
+    what: str = "adapter",
+) -> Any:
+    """Assign a PEFT adapter state dict into ``model``, by whichever path the model can survive.
+
+    ⛔ ``set_peft_model_state_dict`` IS UNUSABLE ON A QUANTIZED MODEL, and this is the fourth
+    instance of the house pattern *the flag is not the behaviour*. It ends in
+    ``model.load_state_dict(peft_state_dict, strict=False)``, and ``load_state_dict`` walks EVERY
+    submodule — not only the ones the incoming dict names. On a quanto-quantized transformer the
+    base Linears are ``QModuleMixin``, whose ``_load_from_state_dict`` does an UNCONDITIONAL
+    ``state_dict.pop(prefix + name)`` for its own ``_data`` internals. A LoRA adapter dict carries no
+    base weights, so the pop raises — and ``strict=False`` does not save you, because quanto's
+    override never consults it::
+
+        KeyError: 'base_model.model.time_text_embed.timestep_embedder.linear_1.weight._data'
+
+    That exact line has now killed a run TWICE: once as the crash-resume that cost 4500 steps of
+    phase 1 (fixed in ``train/checkpoint.py`` at f8f2815), and once as the §8 band render, which got
+    its base column out and died on the first band member. The second time is why this lives here
+    rather than inline in ``resume()``: it is a property of loading an adapter onto a quantized
+    model, not a property of resuming, and every caller of :func:`load_adapter_into` needs it.
+
+    ⚠ ``CheckpointManager.resume`` STILL CARRIES ITS OWN TWIN of this logic and was deliberately not
+    switched over. Two reasons, both about risk rather than taste: that path is the one proven on a
+    live 5000-step run and cannot be re-verified without another one, and
+    ``tests/test_checkpoint_resume.py`` asserts on ``checkpoint.py``'s SOURCE TEXT (it greps for
+    "HARD LOCK across a chain" and "PARTIAL adapter is worse than refusing"), so delegating would
+    move the strings out from under its own guard. Consolidating the two — and moving those source
+    assertions onto this function — is a clean follow-up, not a deadline change. Until then the
+    refusal wording here is kept deliberately parallel so a reader can diff them by eye.
+
+    THE SAFE PATH. The adapter parameters are NOT quantized — quantization runs on the un-wrapped
+    transformer BEFORE ``inject_lora``, so quanto converts the base Linears and the LoRA tensors are
+    added afterwards as ordinary parameters. They can therefore be assigned DIRECTLY, which never
+    visits a quantized module. The only transform PEFT applies to a saved key is inserting the
+    adapter name before the final component; verified against the real 1680-tensor checkpoint, all
+    1680 keys map. Non-quantized models keep the original ``set_peft_model_state_dict`` path
+    untouched.
+
+    Two refusals rather than a best-effort load:
+
+      * a SHAPE MISMATCH names the rank lock — ``rank == alpha`` is a HARD LOCK across a chain
+        precisely because changing either re-shapes ``lora_A`` / ``lora_B``;
+      * a PARTIAL match refuses outright. Continuing from a half-restored adapter at a plausible
+        loss, or rendering a band column from one, is the worst available outcome: nothing looks
+        wrong.
+    """
+    if not is_quanto_quantized(model):
+        return set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
+
+    live = dict(model.named_parameters())
+    missing: list[str] = []
+    loaded = 0
+    with torch.no_grad():
+        for key, tensor in adapter_weights.items():
+            target = live.get(key)
+            if target is None:
+                head, sep, tail = key.rpartition(".")
+                target = live.get(f"{head}.{adapter_name}{sep}{tail}") if sep else None
+            if target is None:
+                missing.append(key)
+                continue
+            if tuple(target.shape) != tuple(tensor.shape):
+                raise RuntimeError(
+                    f"Adapter load aborted ({what}): {key} is {tuple(tensor.shape)} on disk but "
+                    f"{tuple(target.shape)} in the live model. A rank/alpha change between rounds "
+                    f"re-shapes lora_A/lora_B — that is why rank == alpha is a HARD LOCK across a "
+                    f"chain."
+                )
+            target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+            loaded += 1
+    if missing or loaded != len(adapter_weights):
+        raise RuntimeError(
+            f"Adapter load aborted ({what}): {loaded}/{len(adapter_weights)} adapter tensor(s) "
+            f"matched a live parameter; {len(missing)} unmatched, first few: {missing[:4]}. Loading "
+            f"a PARTIAL adapter is worse than refusing — the caller would continue from a "
+            f"half-restored state at a plausible loss."
+        )
+    banner = (
+        f"[lora] quantized adapter load ({what}): {loaded}/{len(adapter_weights)} tensors assigned "
+        f"directly — set_peft_model_state_dict is unusable on a quanto model (LANDMINE #1b)."
+    )
+    print(banner)
+    return banner
 
 
 # --------------------------------------------------------------------------------------------------
