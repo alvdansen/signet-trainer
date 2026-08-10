@@ -535,6 +535,111 @@ class H3Config(_Base):
         return v
 
 
+class QwenEditRenderInput(_Base):
+    """One HELD-OUT control input for the §8 render grid: its images and its A/B prompts travel TOGETHER.
+
+    An OBJECT, for the ``ValidationSample`` / ``ConditioningItem`` reason (D-6-ITEMS) and one more
+    that is specific to this grid. §8's read is the A-vs-B delta at a fixed checkpoint — (A) the
+    subject withheld from the prompt, (B) the subject named — so a mis-pairing does not degrade the
+    measurement, it INVERTS it: the trace-vs-reinterpret verdict gets attributed to the adapter when
+    it belongs to the prompt. Parallel ``images`` / ``prompt_a`` / ``prompt_b`` lists can desync
+    across a config edit and produce exactly that, at a grid that looks perfectly ordinary.
+
+    The field names are the reader's, not this file's preference: ``modal/fns.py::qwen_edit_sample``
+    and ``modal/entrypoint.py::_qwen_edit_config_gaps`` both reach for ``id`` / ``images`` /
+    ``prompts`` / ``label`` by ATTRIBUTE (``getattr(entry, "images", ())``), and
+    ``inference/qwen_edit_layout.QwenEditHeldOutInput`` consumes the same four. Nothing translates
+    between the config and the planner, which is the property that keeps a rename from producing a
+    config the entrypoint accepts and the container refuses.
+    """
+
+    id: str = Field(
+        ...,
+        min_length=1,
+        description="Stable id for this held-out input. Load-bearing TWICE: it is one slot of the "
+        "render key's control axis, and it is the stem of every file this input renders — so two "
+        "inputs sharing an id overwrite each other inside one render directory and the grid shows "
+        "one input's pixels twice under two labels.",
+    )
+    images: tuple[str, ...] = Field(
+        ...,
+        min_length=1,
+        description="The control images for this input, one per control slot, IN SLOT ORDER. "
+        "POSITIONAL: image i fills slot i, which is what the prompt's ctrl_img_{i+1} addresses. "
+        "Relative paths resolve under the dataset Volume mount; an absolute path is accepted as-is "
+        "(the h3_sample treatment of data.metadata_path). The count must equal "
+        "qwen_edit.control_slots — enforced by QwenEditConfig._check_render_input_slot_count, where "
+        "both values are visible, and mirrored by the entrypoint gap check and the container.",
+    )
+    prompts: dict[str, str] = Field(
+        ...,
+        description="Mode id -> prompt text, for EVERY mode in "
+        "inference/qwen_edit_layout.QWEN_EDIT_PROMPT_MODES (a_style, b_content). Keyed by mode id "
+        "rather than carried as two fields so that tuple stays the single place a mode is declared.",
+    )
+    label: str | None = Field(
+        default=None,
+        description="Optional row header an operator reads in the gallery. Defaults to the id.",
+    )
+
+    @field_validator("images")
+    @classmethod
+    def _check_images(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        # WR-09: a relative path is joined onto the dataset mount, so '..' escapes it. Absolute is
+        # deliberately allowed (the reader tests is_absolute() and honours it) — silently resolving
+        # an absolute path under the mount would 404 for a reason nobody could read.
+        for raw in v:
+            if not str(raw).strip():
+                raise ValueError(
+                    "qwen_edit.render_inputs[].images carries an empty path. Every control slot "
+                    "names a real file; a blank entry would fill slot i with nothing and shift "
+                    "every later image one slot left, rendering the WRONG request under the right "
+                    "label."
+                )
+            if ".." in Path(str(raw)).parts:
+                raise ValueError(
+                    f"qwen_edit.render_inputs[].images entry {raw!r} contains '..'. Relative "
+                    "control paths are joined onto the dataset Volume mount, and pathlib join "
+                    "semantics let '..' escape it."
+                )
+        return v
+
+    @field_validator("prompts")
+    @classmethod
+    def _check_prompts(cls, v: dict[str, str]) -> dict[str, str]:
+        # Function-local: config must not take a module-scope dependency on the inference tier, and
+        # this keeps QWEN_EDIT_PROMPT_MODES the single declaration site rather than re-typing the
+        # ids here. qwen_edit_layout is stdlib-only at module scope, so this costs nothing.
+        from signet_trainer.inference.qwen_edit_layout import (  # noqa: PLC0415
+            QWEN_EDIT_PROMPT_MODES,
+        )
+
+        expected = {mode.id for mode in QWEN_EDIT_PROMPT_MODES}
+        missing = sorted(expected - {str(k) for k in v})
+        if missing:
+            raise ValueError(
+                f"qwen_edit.render_inputs[].prompts has no prompt for mode(s) {missing}. §8 renders "
+                f"every held-out input under BOTH modes side by side and the A-vs-B delta IS the "
+                f"measurement; with one half absent the delta gets read as an adapter property. "
+                f"Expected keys: {sorted(expected)}."
+            )
+        unknown = sorted({str(k) for k in v} - expected)
+        if unknown:
+            raise ValueError(
+                f"qwen_edit.render_inputs[].prompts carries unknown mode id(s) {unknown}. The modes "
+                f"are declared once, in inference/qwen_edit_layout.QWEN_EDIT_PROMPT_MODES: "
+                f"{sorted(expected)}. An unknown key is silently never rendered."
+            )
+        blank = sorted(k for k, text in v.items() if not str(text).strip())
+        if blank:
+            raise ValueError(
+                f"qwen_edit.render_inputs[].prompts is blank for mode(s) {blank}. A blank cell is "
+                f"not a render with less text — the grid prints it as an em dash and the A/B "
+                f"comparison it belongs to cannot be read."
+            )
+        return v
+
+
 class QwenEditConfig(_Base):
     """Qwen-Image-Edit-2511 tunables — family #3, the chained-edit family.
 
@@ -684,6 +789,105 @@ class QwenEditConfig(_Base):
         "workflow this family is for. 'content' (the default) hashes the file BYTES and is correct "
         "for any chain; choose 'path' only when bug-compatibility with ai-toolkit is the goal.",
     )
+
+    # ── the §8 RENDER request. Read only under mode 'sample'; empty is legal for the other modes ──
+    # These two are the config surface of a sampler that already landed (feat/qwen_edit e132b30):
+    # ``modal/fns.py::qwen_edit_sample`` and ``modal/entrypoint.py::_qwen_edit_config_gaps`` both
+    # read them through tolerant ``getattr(..., default)`` so the stage could land before its schema
+    # did. Under ``extra="forbid"`` that tolerance is not a soft landing — until the fields exist
+    # here, a YAML declaring them is REJECTED at load, so the render cannot be configured at all.
+    # Defaulting empty (rather than required) is deliberate: preprocess and train configs are legal
+    # without a render request, and ``_qwen_edit_config_gaps`` owns the per-MODE refusal.
+    render_checkpoint_band: tuple[str, ...] = Field(
+        default=(),
+        description="The ordered band-member checkpoint DIRECTORY NAMES under <output_dir>/ — H3's "
+        "render_checkpoint_name pin made PLURAL, because on this family the deliverable is a band, "
+        "not a winner (§8: 'checkpoint selection = a band, not a winner'). Never a path, and never "
+        "left to CheckpointManager.find_latest(): the render directory is keyed on the render's "
+        "identity and the checkpoint name is part of that key, so against a live run every "
+        "re-dispatch would resolve a different adapter, land in a fresh directory and resume "
+        "nothing (H3's D-10-DEF-19). Empty is legal here and refused per-mode by the entrypoint.",
+    )
+    render_inputs: tuple[QwenEditRenderInput, ...] = Field(
+        default=(),
+        description="The held-out control inputs, each carrying its ordered per-slot images and its "
+        "A/B prompt pair. Neither half can be borrowed from what already exists: control_dirs names "
+        "the TRAINING controls (a different question than a held-out probe), and validation.prompts "
+        "is a flat list that cannot say which entry is A, which is B, or which input either belongs "
+        "to. Empty is legal here and refused per-mode by the entrypoint.",
+    )
+
+    @field_validator("render_checkpoint_band")
+    @classmethod
+    def _check_render_checkpoint_band(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        # A NAME per member, never a path — the WR-09 pathlib-join contract every operator-authored
+        # path in this schema obeys: ``ckpt_root / <value>`` with an absolute value REPLACES the
+        # Volume prefix and '..' escapes the mount. CheckpointBand.__post_init__ already refuses an
+        # empty band and a repeated member; it does NOT inspect path shape, and it runs in the
+        # container. This runs at config load, on a laptop, for free.
+        for name in v:
+            if not str(name).strip():
+                raise ValueError(
+                    "qwen_edit.render_checkpoint_band carries an empty member name. Each member is "
+                    "a checkpoint directory under <output_dir>/ and is part of the render key."
+                )
+            if name != Path(name).name or name in {".", ".."}:
+                raise ValueError(
+                    f"qwen_edit.render_checkpoint_band member {name!r} must be a bare directory "
+                    "NAME under CHECKPOINTS_DIR/<output_dir> (e.g. "
+                    "'checkpoint-step-00250-loss-0.0194'), never a path. pathlib join semantics let "
+                    "an absolute value replace the Volume prefix and '..' escape it."
+                )
+        return v
+
+    @field_validator("render_inputs")
+    @classmethod
+    def _check_render_input_ids(
+        cls, v: tuple[QwenEditRenderInput, ...]
+    ) -> tuple[QwenEditRenderInput, ...]:
+        # The one refusal NOTHING else can make. QwenEditHeldOutInput validates an input in
+        # isolation and cannot see its siblings; _qwen_edit_config_gaps checks presence and image
+        # COUNT but not identity; qwen_edit_sample mirrors those two. So a duplicated id survives
+        # every existing gate — and because the id is the file stem AND a slot of the render key,
+        # the duplicate does not collide loudly: the second input silently overwrites the first
+        # inside one render directory, and the gallery shows one input's pixels under two labels.
+        seen: dict[str, int] = {}
+        for i, entry in enumerate(v):
+            key = str(entry.id)
+            if key in seen:
+                raise ValueError(
+                    f"qwen_edit.render_inputs[{i}].id is {key!r}, already used by entry "
+                    f"[{seen[key]}]. The id is the stem of every file an input renders and one slot "
+                    f"of the render key's control axis, so two inputs sharing it write the SAME "
+                    f"filenames into the SAME render directory — the later silently overwrites the "
+                    f"earlier and the grid shows one input twice under two labels."
+                )
+            seen[key] = i
+        return v
+
+    @model_validator(mode="after")
+    def _check_render_input_slot_count(self) -> "QwenEditConfig":
+        """Every held-out input must name EXACTLY ``control_slots`` images, in slot order.
+
+        Separate from ``_check_control_slot_coverage`` rather than folded into it, because that one
+        early-returns when neither ``control_dirs`` nor ``blank_slots`` is declared — which is
+        precisely the shape of a ``sample`` config. Folding this in would make it dead code in the
+        only mode that reads these fields.
+
+        A short list does not render a smaller grid: the mapping is positional, image i fills slot
+        i, so a missing entry re-points what every later ``ctrl_img_{i+1}`` addresses and the render
+        answers a request nobody wrote — under the right label, at an ordinary-looking grid.
+        """
+        for i, entry in enumerate(self.render_inputs):
+            if len(entry.images) != self.control_slots:
+                raise ValueError(
+                    f"qwen_edit.render_inputs[{i}] ({entry.id!r}) declares {len(entry.images)} "
+                    f"control image(s) but qwen_edit.control_slots is {self.control_slots}. The "
+                    f"mapping is POSITIONAL — image i fills slot i, which is what the prompt's "
+                    f"ctrl_img_{{i+1}} addresses — so a short list does not render a smaller grid, "
+                    f"it renders the WRONG request under the right label."
+                )
+        return self
 
     @model_validator(mode="after")
     def _check_control_slot_coverage(self) -> "QwenEditConfig":
