@@ -403,6 +403,12 @@ def train_loop(
                 if checkpoints_vol is not None:
                     checkpoints_vol.commit()  # first commit: land the checkpoint before rendering
                     last_commit = time.monotonic()  # #11: refresh the liveness clock
+                else:
+                    # Off-Modal (checkpoints_vol=None — the local runner): the SAVE is the liveness
+                    # event; without this refresh the watchdog clock freezes at loop start and an
+                    # armed checkpoint_expected_minutes deterministically kills a HEALTHY local run
+                    # (local-beta parity review, 2026-08-11). Modal-path semantics byte-unchanged.
+                    last_commit = time.monotonic()
                 if on_checkpoint is not None:
                     # In-loop sample (OFFL-02) renders here — mid-run, REAL step number. The
                     # checkpoint above is ALREADY durable; the mp4 this writes rides the SECOND

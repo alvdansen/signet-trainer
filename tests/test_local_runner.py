@@ -79,6 +79,44 @@ def test_supported_ltx_example_has_no_refusals():
     assert refusals(_ltx_config()) == []
 
 
+def test_refuses_multi_frame_training_with_conditioning_items():
+    # WR-04 parity: the Modal arm raises on sample-only conditioning_items in a training config;
+    # the local gate must refuse the same shape (items would be SILENTLY ignored by training).
+    cfg = _ltx_config().model_copy(deep=True)
+    object.__setattr__(cfg.conditioning, "mode", "multi_frame")
+    object.__setattr__(cfg.conditioning, "conditioning_items", [{"frame": 0, "strength": 1.0}])
+    assert any("sample-only" in b and "WR-04" in b for b in refusals(cfg))
+
+
+def test_failed_dryrun_gate_refuses_and_never_claims_passed(monkeypatch, capsys):
+    # Parity-review BLOCKER regression: run_dryrun returns non-zero and NEVER raises; a discarded
+    # rc printed 'PASSED' over a failed gate. The gate must be the rc check.
+    import signet_trainer.dryrun.shapes as shapes
+
+    monkeypatch.setattr(shapes, "run_dryrun", lambda cfg: 1)
+    from signet_trainer.local.runner import EXIT_REFUSED as rc_refused
+    from signet_trainer.local.runner import run as run_fn
+
+    cfg = _ltx_config()
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        w = Path(td)
+        (w / cfg.model.model_id).parent.mkdir(parents=True, exist_ok=True)
+        (w / cfg.model.model_id).touch()
+        (w / cfg.model.text_encoder_id).mkdir(parents=True, exist_ok=True)
+        data = w / "data"; data.mkdir()
+        import yaml
+        doc = yaml.safe_load(LTX_EXAMPLE.read_text(encoding="utf-8"))
+        doc["data"]["preprocessed_data_root"] = str(data)
+        patched_cfg = w / "cfg.yaml"
+        patched_cfg.write_text(yaml.safe_dump(doc), encoding="utf-8")
+        rc = run_fn(str(patched_cfg), weights_root=str(w), output_root=td)
+    out = capsys.readouterr().out
+    assert rc == rc_refused
+    assert "shape gate FAILED" in out
+    assert "PASSED" not in out
+
+
 # ---- path resolution: existence-checked BEFORE any load, with actionable messages --------------
 
 

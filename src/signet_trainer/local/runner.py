@@ -65,6 +65,15 @@ def refusals(config: Any) -> list[str]:
             "embeddings dance (Gemma pre-encode before the free) which is untested locally. Turn "
             f"it off for local runs; sample after training instead -- {ROADMAP_ISSUE}"
         )
+    if mode == "multi_frame" and getattr(config.conditioning, "conditioning_items", None):
+        # WR-04 parity with the Modal arm (fns.py): items are SAMPLE-only -- training
+        # self-conditions (MultiFrameStrategy samples its own keyframes) and would silently
+        # ignore them, the exact silently-ignored-config-block class the schema doctrine forbids.
+        out.append(
+            "conditioning_items are sample-only for multi_frame training (WR-04): training "
+            "self-conditions and would silently ignore them. Remove conditioning_items from the "
+            "training config (keyframe items belong in the sample config)."
+        )
     return out
 
 
@@ -163,10 +172,14 @@ def run(
     paths = resolve_paths(config, weights_root, output_root)
 
     # The same CPU-pure shape gate the Modal entrypoint runs (CONF-03) -- free, catches config
-    # errors before any weight touches memory.
+    # errors before any weight touches memory. run_dryrun NEVER raises: it returns non-zero and
+    # prints its reason to stderr, so the rc check IS the gate (parity-review blocker, 2026-08-11).
     from signet_trainer.dryrun.shapes import run_dryrun
 
-    run_dryrun(config)
+    if run_dryrun(config) != 0:
+        print("[signet-local] REFUSED -- dry-run shape gate FAILED (reason printed above); "
+              "nothing was loaded, nothing ran.")
+        return EXIT_REFUSED
     print("[signet-local] dry-run shape gate PASSED (CPU, zero spend).")
 
     import torch  # heavy imports start here, AFTER refusals + path checks + dryrun
@@ -175,6 +188,17 @@ def run(
         print("[signet-local] REFUSED -- torch.cuda.is_available() is False; local training "
               "requires a CUDA GPU.")
         return EXIT_REFUSED
+    # Cold-path dependency probe (parity review): surface a missing training dep NOW, with an
+    # install hint -- not after the user approves and the 22B spends 20 minutes loading.
+    for dep, hint in (("peft", "pip install 'peft>=0.14'"),
+                      ("bitsandbytes", "pip install bitsandbytes"),
+                      ("ltx_trainer", "see README 'Model weights' + the pinned LTX-2 install"),):
+        try:
+            __import__(dep)
+        except ImportError:
+            print(f"[signet-local] REFUSED -- required training dependency {dep!r} is not "
+                  f"importable ({hint}). Nothing was loaded.")
+            return EXIT_REFUSED
     free_b, total_b = torch.cuda.mem_get_info()
     free_gib, total_gib = free_b / 2**30, total_b / 2**30
     vram_line = (
