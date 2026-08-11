@@ -101,16 +101,110 @@ def h3_renderable_frame_bounds() -> tuple[int, int]:
     return int(H3_MIN_DURATION_S * H3_FPS), int(H3_MAX_DURATION_S * H3_FPS)
 
 
-def assert_h3_frame_count_is_renderable(num_frames: int, *, where: str) -> str:
+# The video VAE's own temporal geometry, transcribed from the pinned
+# ``models/autoencoders/autoencoder_kl_minimax_h3.py``::``AutoencoderKLMiniMaxH3.__init__``
+# (``clip_length`` 17, ``token_drop`` 3, ``temporal_compression_ratio`` 4 from the temporal
+# downsample factors, so ``tokens_chunk_size`` = ceil(17/4) = 5).
+H3_VAE_TOKEN_DROP = 3
+H3_VAE_TEMPORAL_RATIO = 4
+H3_VAE_TOKENS_CHUNK = 5
+
+
+def h3_video_latent_num_frames(num_frames: int) -> int:
+    """Latent frames the video VAE ENCODER emits for an aligned ``17n + 5`` count.
+
+    Transcribed from ``minimax_h3/modular_pipeline.video_latent_num_frames``. It lives next to the
+    decoder arithmetic below because the two DISAGREE at the bottom of the range, and that
+    disagreement is the whole reason ``H3_DECODE_FLOOR_FRAMES`` exists.
+    """
+    if num_frames % H3_FRAMES_PER_CHUNK != H3_LATENTS_PER_CHUNK:
+        raise ValueError(
+            f"`num_frames` must be of the form {H3_FRAMES_PER_CHUNK} * n + "
+            f"{H3_LATENTS_PER_CHUNK}, got {num_frames}."
+        )
+    return (num_frames - H3_LATENTS_PER_CHUNK) // H3_FRAMES_PER_CHUNK * H3_LATENTS_PER_CHUNK + 2
+
+
+def h3_decoder_num_chunks(num_frames: int) -> int:
+    """Chunks ``AutoencoderKLMiniMaxH3._decode`` iterates for an aligned frame count.
+
+    ZERO means the decoder builds an EMPTY chunk list and its closing ``torch.cat([])`` raises.
+    Transcribed from the pinned ``_decode``; a function rather than a comment so a test can pin the
+    floor against the arithmetic instead of against a remembered number.
+    """
+    num_tokens = h3_video_latent_num_frames(num_frames) + H3_VAE_TOKEN_DROP
+    pad_tokens = (-num_tokens) % H3_VAE_TOKENS_CHUNK
+    return (num_tokens + pad_tokens) // H3_VAE_TOKENS_CHUNK - int(H3_VAE_TOKEN_DROP > 0)
+
+
+# ── The VIDEO VAE's DECODE FLOOR — a THIRD law, and the only one no flag may waive ───────────────
+#
+# ⛔ NOT the duration band and NOT the 17n+5 training law. At 5 frames the ENCODER is happy — it
+# pads 5 -> 17, drops 3 trailing tokens and emits 2 latent frames, which is what this campaign
+# trains on. The DECODER then computes ``num_chunks = (2 + 3)//5 - 1 = 0``, never enters its chunk
+# loop, and ``torch.cat([])`` raises. **This port will encode a latent it cannot decode.**
+#
+# 22 frames -> 7 latents -> 1 chunk is the shortest count that survives the round trip.
+#
+# So a sub-22 render is not an off-band request a policy waiver can allow: it is a guaranteed
+# crash, and it fires in the DECODER — i.e. after the whole denoise loop has been paid for, which
+# is precisely the cost this module's pre-flight exists to avoid.
+H3_DECODE_FLOOR_FRAMES = 22
+
+
+def assert_h3_frame_count_is_renderable(
+    num_frames: int, *, where: str, allow_offband: bool = False
+) -> str:
     """Refuse an unrenderable ``validation.frame_count`` BEFORE anything is loaded.
 
     ``where`` names the config field so the message is actionable. Returns a one-line confirmation
     when the count is legal, so the log records the band that was checked rather than its silence.
+
+    ``allow_offband`` (``validation.allow_offband_frame_count``) waives the 5-15 s **generation
+    band** — a POLICY the pipeline reads off two ``@property``, which a render can widen for
+    itself. It deliberately does NOT waive ``H3_DECODE_FLOOR_FRAMES``, which is arithmetic in the
+    VAE: waiving that buys a ``torch.cat([])`` after a paid denoise rather than a shorter clip.
+
+    Why the waiver exists: a campaign that trains STILLS stages each one as the shortest legal
+    ``17n + 5`` clip, so its trained length is below the band BY CONSTRUCTION and every evaluation
+    it will ever run is off-band. Rendering ~18x longer than trained is not a neutral substitute —
+    it is a different question about the same weights.
     """
     low, high = h3_renderable_frame_bounds()
     aligned = h3_aligned_num_frames(num_frames)
+
+    # Checked FIRST and unconditionally: it is the failure that costs the most to discover late,
+    # and no flag reaches it.
+    if aligned < H3_DECODE_FLOOR_FRAMES:
+        latents = h3_video_latent_num_frames(aligned)
+        raise RuntimeError(
+            f"[h3] {where}={num_frames} rounds up to {aligned} frames, below MiniMax-H3's VIDEO "
+            f"VAE DECODE FLOOR of {H3_DECODE_FLOOR_FRAMES}. This is a THIRD law, distinct from "
+            f"both the {H3_MIN_DURATION_S}-{H3_MAX_DURATION_S} s generation band and the 17n+5 "
+            f"training law: {aligned} frames encodes to {latents} latent frame(s), and the "
+            f"decoder's chunk count is then ({latents} + {H3_VAE_TOKEN_DROP})//"
+            f"{H3_VAE_TOKENS_CHUNK} - 1 = {h3_decoder_num_chunks(aligned)} — an empty chunk list, "
+            "so `torch.cat([])` raises INSIDE THE DECODER, after the whole denoise loop has been "
+            "paid for. The ENCODER does not refuse this length (training at it is legal), so the "
+            "round trip is asymmetric and only the decode side fails. `allow_offband_frame_count` "
+            "does not waive this: a native render this short needs an explicit decode shim, which "
+            "is a separate design decision, not a flag."
+        )
+
     if not low <= aligned <= high:
         legal = [n for n in range(low, high + 1) if n % H3_FRAMES_PER_CHUNK == H3_LATENTS_PER_CHUNK]
+        if allow_offband:
+            return (
+                f"[h3] ⚠ OFF-BAND RENDER, ALLOWED BY validation.allow_offband_frame_count. "
+                f"{where}={num_frames} -> {aligned} aligned frames = {aligned / H3_FPS:.3f} s, "
+                f"OUTSIDE MiniMax-H3's {H3_MIN_DURATION_S}-{H3_MAX_DURATION_S} s generation band "
+                f"(num_frames {low}-{high}). That band is a POLICY read off `min_duration`/"
+                f"`max_duration`, and this render widens those two properties for itself. It "
+                f"clears the {H3_DECODE_FLOOR_FRAMES}-frame VAE decode floor, so it will decode. "
+                f"⚠ The checkpoint was RELEASED for {H3_MIN_DURATION_S}-{H3_MAX_DURATION_S} s: "
+                "quality outside that band is unwarranted by anything upstream, and is exactly "
+                "what a render like this is measuring."
+            )
         raise RuntimeError(
             f"[h3] {where}={num_frames} rounds up to {aligned} frames = "
             f"{aligned / H3_FPS:.3f} s, outside the {H3_MIN_DURATION_S}-{H3_MAX_DURATION_S} s "
@@ -119,7 +213,9 @@ def assert_h3_frame_count_is_renderable(num_frames: int, *, where: str) -> str:
             "injection — so it is refused here instead, before any of that is paid for. "
             f"Renderable counts: {legal}. ⚠ This is NOT the 17n+5 training law: a legal TRAINING "
             "bucket (this campaign trained at 22) can be unrenderable, and choosing a render length "
-            "is an eval-design decision, not a mechanical bump."
+            "is an eval-design decision, not a mechanical bump. To evaluate a model AT ITS TRAINED "
+            "LENGTH when that length is off-band, set `validation.allow_offband_frame_count: true` "
+            f"— which waives this band but not the {H3_DECODE_FLOOR_FRAMES}-frame decode floor."
         )
     return (
         f"[h3] {where}={num_frames} -> {aligned} aligned frames = {aligned / H3_FPS:.3f} s, "

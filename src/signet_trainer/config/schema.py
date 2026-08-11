@@ -946,6 +946,29 @@ class ValidationConfig(_Base):
     two_stage_upscale: bool = Field(
         default=False, description="D-DEPTH-1: two-stage spatial upscaler, default OFF"
     )
+    # Phase 10 (H3) — waive MiniMax-H3's 5-15 s GENERATION band for this render.
+    #
+    # WHY A WAIVER EXISTS. A campaign that trains STILLS stages each one as the shortest legal
+    # `17n + 5` clip, so its trained length sits BELOW the band by construction and every
+    # evaluation it will ever run is off-band. Rendering ~18x longer than trained is not a
+    # neutral substitute for rendering at the trained length — it is a different question about
+    # the same weights, and telling those two apart is the whole point.
+    #
+    # WHAT IT WAIVES, AND WHAT IT CANNOT. The band is a POLICY: the pipeline reads it off two
+    # `@property` on `MiniMaxH3ModularPipeline`, and the render widens them for itself. It does
+    # NOT waive the video VAE's 22-frame DECODE FLOOR (`H3_DECODE_FLOOR_FRAMES`), which is
+    # arithmetic — below it the decoder's chunk list is empty and `torch.cat([])` raises AFTER
+    # the whole denoise has been paid for. Nor does it waive the `17n + 5` law.
+    #
+    # Config-first per D-NOHARDCODE, default False so every existing config renders
+    # byte-identically and still gets the pre-flight refusal.
+    allow_offband_frame_count: bool = Field(
+        default=False,
+        description="H3: allow validation.frame_count outside MiniMax-H3's 5-15 s generation "
+        "band, to evaluate a model AT ITS TRAINED LENGTH when that length is off-band. Widens "
+        "the pipeline's min/max duration for this render only. Does NOT waive the 22-frame VAE "
+        "decode floor or the 17n+5 law. Default False = historical behaviour.",
+    )
     # Phase 10 (H3 / ref2v) — WHICH manifest row supplies the reference slots this render conditions
     # on. Named by the config's own declared subject-id vocabulary
     # (``h3.character_reference_sizes`` / ``h3.environment_reference_sizes``, third tuple element),

@@ -4353,12 +4353,19 @@ def h3_sample(config_yaml: str) -> None:
     # 17n+5 the training dims satisfy, so a legal training bucket (this campaign's 22) can be
     # unrenderable, and the fix is an eval-design decision rather than a bump.
     from signet_trainer.inference.h3_pipeline_source import (  # noqa: PLC0415
+        H3_FPS,
         assert_h3_frame_count_is_renderable,
+        h3_aligned_num_frames,
     )
 
     print(
         assert_h3_frame_count_is_renderable(
-            int(config.validation.frame_count), where="validation.frame_count"
+            int(config.validation.frame_count),
+            where="validation.frame_count",
+            # The waiver reaches the BAND only. The 22-frame VAE decode floor is enforced inside
+            # regardless, because below it the failure is a `torch.cat([])` in the DECODER — i.e.
+            # after the denoise loop this pre-flight exists to avoid paying for.
+            allow_offband=bool(config.validation.allow_offband_frame_count),
         )
     )
 
@@ -4442,12 +4449,55 @@ def h3_sample(config_yaml: str) -> None:
     print(f"[h3_sample] pipeline index read from {index_path} (the mounted Volume, not the Hub).")
 
     manager = ComponentsManager()
+
+    # ── The OFF-BAND render class (validation.allow_offband_frame_count) ─────────────────────────
+    #
+    # ⛔ THE BAND IS ENFORCED ON THE PIPELINE, NOT IN THE BLOCK. `MiniMaxH3Ref2VASetupStep` does
+    # `if not components.min_duration <= duration <= components.max_duration` — reading two
+    # `@property` off the pipeline object (pinned `minimax_h3/modular_pipeline.py`: 5.0 and 15.0).
+    # A second, identical copy of that check lives in the t2va/fl2va setup step. So the ONE place
+    # that defeats both is the property itself, and overriding a property needs a class.
+    #
+    # A SUBCLASS, NOT A MONKEYPATCH, and specifically not `type(pipe).min_duration = ...`: these
+    # are class-level data descriptors, so instance assignment raises; and patching the imported
+    # class would mutate diffusers' own class for everything else in the container and have to be
+    # unwound on every exit path, including an OOM. signet constructs this class itself (right
+    # below), so choosing a different class is a seam that already exists.
+    #
+    # It WIDENS rather than replaces, so a render already inside 5-15 s behaves identically whether
+    # or not the flag is set — the flag cannot change a legal render's meaning.
+    class _OffbandDurationH3Pipeline(MiniMaxH3ModularPipeline):
+        """``MiniMaxH3ModularPipeline`` with the generation band widened to this render's span."""
+
+        # A plain attribute set after construction: the base `__init__` takes no extra kwargs, and
+        # this must not depend on diffusers' signature staying stable across the pin.
+        _offband_span_s: float = 0.0
+
+        @property
+        def min_duration(self) -> float:
+            return min(self._offband_span_s, MiniMaxH3ModularPipeline.min_duration.fget(self))
+
+        @property
+        def max_duration(self) -> float:
+            return max(self._offband_span_s, MiniMaxH3ModularPipeline.max_duration.fget(self))
+
+    offband = bool(config.validation.allow_offband_frame_count)
+    pipeline_cls = _OffbandDurationH3Pipeline if offband else MiniMaxH3ModularPipeline
     # No `pretrained_model_name_or_path=`: passing the root would re-introduce the Hub-sourced
     # specs. The blocks are the authority for WHICH components `ref2va` needs and WHAT class each
     # one is; the Volume is the authority for where they live.
-    pipe = MiniMaxH3ModularPipeline(
-        blocks=MiniMaxH3Blocks(), workflow="ref2va", components_manager=manager
-    )
+    pipe = pipeline_cls(blocks=MiniMaxH3Blocks(), workflow="ref2va", components_manager=manager)
+    if offband:
+        # The ALIGNED count, because the pipeline checks the duration of what it will actually
+        # generate, not of what was asked for.
+        pipe._offband_span_s = h3_aligned_num_frames(int(config.validation.frame_count)) / H3_FPS
+        print(
+            f"[h3_sample] ⚠ OFF-BAND RENDER: generation band widened to include "
+            f"{pipe._offband_span_s:.3f} s ({config.validation.frame_count} frames) via "
+            f"validation.allow_offband_frame_count. min_duration={pipe.min_duration}, "
+            f"max_duration={pipe.max_duration}. The 17n+5 law and the 22-frame VAE decode floor "
+            "were both enforced at the pre-flight above and are NOT waived by this flag."
+        )
     needed = list(pipe.pretrained_component_names)
     sources = resolve_h3_component_sources(index, pipeline_root, needed)
     print(assert_h3_sources_are_local(sources, pipeline_root))
