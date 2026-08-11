@@ -119,11 +119,23 @@ def _watch_dispatch(fc: object, watch_seconds: float, label: str) -> None:
     try:
         fc.get(timeout=watch_seconds)
     except TimeoutError:
-        print(
-            f"[signet-entrypoint] {label} still RUNNING after {watch_seconds:g}s — this client is "
-            f"disengaging, the run is NOT cancelled (async dispatch). Track it via FunctionCall id "
-            f"{fc.object_id}, `modal app logs <app-id>`, or the output Volume."
-        )
+        if "--detach" in sys.argv:
+            print(
+                f"[signet-entrypoint] {label} still RUNNING after {watch_seconds:g}s — this client "
+                f"is disengaging, the run is NOT cancelled (async dispatch). Track it via "
+                f"FunctionCall id {fc.object_id}, `modal app logs <app-id>`, or the output Volume."
+            )
+        else:
+            # Honesty fix (audit 2026-08-11): without --detach the ephemeral app STOPS when this
+            # client exits and the spawned call is stopped with it — the old unconditional "NOT
+            # cancelled" print was FALSE in exactly the case the startup warning above describes.
+            print(
+                f"[signet-entrypoint] {label} still RUNNING after {watch_seconds:g}s — this client "
+                f"is disengaging WITHOUT --detach, so the ephemeral app (and this call, "
+                f"FunctionCall id {fc.object_id}) will be STOPPED with it. Treat this run as LOST "
+                "and re-launch with --detach.",
+                file=sys.stderr,
+            )
         return
     print(f"[signet-entrypoint] {label} COMPLETED inside the {watch_seconds:g}s watch window.")
 
