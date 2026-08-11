@@ -655,7 +655,10 @@ def test_the_two_new_stages_are_the_only_h3_app_functions_added(code: str) -> No
         f"unexpected H3 stage set {sorted(h3_stages)} — a new @app.function is a new ungated "
         "launch path unless the entrypoint threads it."
     )
-    assert "smoke" not in code[code.index("def h3_train") :].lower()
+    # No smoke ENTRY POINT after h3_train (arch_smoke / h3_*_smoke / smoke_test...). The one
+    # sanctioned appearance is the NO-REFERENCE ALPHA banner's "smoke-tested only" wording — a
+    # runtime warning string, not a launch path — hence the lookahead.
+    assert not re.search(r"smoke(?!-tested)", code[code.index("def h3_train") :], re.IGNORECASE)
 
 
 def test_this_file_never_imports_modal() -> None:
