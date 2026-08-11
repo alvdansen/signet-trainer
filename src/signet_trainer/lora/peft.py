@@ -548,14 +548,15 @@ def load_adapter_state_into(
     rather than inline in ``resume()``: it is a property of loading an adapter onto a quantized
     model, not a property of resuming, and every caller of :func:`load_adapter_into` needs it.
 
-    ⚠ ``CheckpointManager.resume`` STILL CARRIES ITS OWN TWIN of this logic and was deliberately not
-    switched over. Two reasons, both about risk rather than taste: that path is the one proven on a
-    live 5000-step run and cannot be re-verified without another one, and
-    ``tests/test_checkpoint_resume.py`` asserts on ``checkpoint.py``'s SOURCE TEXT (it greps for
-    "HARD LOCK across a chain" and "PARTIAL adapter is worse than refusing"), so delegating would
-    move the strings out from under its own guard. Consolidating the two — and moving those source
-    assertions onto this function — is a clean follow-up, not a deadline change. Until then the
-    refusal wording here is kept deliberately parallel so a reader can diff them by eye.
+    ``CheckpointManager.resume`` now DELEGATES here rather than carrying its own copy. It briefly
+    did carry one — the resume fix landed first and the render walked into the identical failure
+    through :func:`load_adapter_into` — which is the whole argument for one implementation: a
+    duplicated money-critical routine is fixed in one place and stays broken in the other.
+
+    ⚠ THIS FUNCTION IS NOW SOURCE-TEXT ASSERTED. ``tests/test_checkpoint_resume.py`` greps THIS FILE
+    for "HARD LOCK across a chain" and "PARTIAL adapter is worse than refusing", because a refusal
+    that stops explaining WHY has lost the part that makes it actionable. Reword them and that test
+    fails on purpose; it is not being brittle about formatting, it is holding the reasoning in place.
 
     THE SAFE PATH. The adapter parameters are NOT quantized — quantization runs on the un-wrapped
     transformer BEFORE ``inject_lora``, so quanto converts the base Linears and the LoRA tensors are

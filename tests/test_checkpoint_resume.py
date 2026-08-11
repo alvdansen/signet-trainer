@@ -193,9 +193,15 @@ def test_a_rank_change_between_rounds_is_refused_not_silently_partial() -> None:
     lora_A/lora_B. Resuming across such a change cannot work, and the failure a partial load
     produces is a run continuing from a half-restored state at a plausible loss — the worst
     available outcome, because nothing looks wrong.
+
+    ⚠ READS lora/peft.py, NOT checkpoint.py. The refusals moved when the quantized-adapter load was
+    consolidated: resume() had the fix and load_adapter_into did not, so the §8 band render walked
+    into the same KeyError from the other side. ``resume`` now delegates, and this assertion follows
+    the implementation rather than the caller — pinning the caller would have gone quietly vacuous
+    the moment the logic moved, which is the failure mode a source-text test exists to avoid.
     """
     source = (
-        Path(__file__).resolve().parents[1] / "src/signet_trainer/train/checkpoint.py"
+        Path(__file__).resolve().parents[1] / "src/signet_trainer/lora/peft.py"
     ).read_text(encoding="utf-8")
     # Short, contiguous phrases only: an f-string wraps across lines, so a long literal
     # asserts the FORMATTING as much as the content.
@@ -231,3 +237,61 @@ def test_the_resume_decision_is_printed_not_only_logged() -> None:
         "the resume banner must state the CONSEQUENCE, not just the step number — the reader is "
         "checking whether they are about to pay for a silent restart"
     )
+
+
+def test_resume_ACTUALLY_restores_the_adapter_on_a_quantized_model(tmp_path) -> None:
+    """End-to-end through the quantized branch: save, wipe, resume, compare weights.
+
+    The gap this closes. ``test_resume_on_a_quantized_model_bypasses_load_state_dict`` asserts only
+    that the fake QModule raises the way quanto does — it never drives ``resume``. So the assertion
+    that mattered ("resume works on a quantized model") was never actually made, and the failure it
+    was written after was found on a metered container rather than here.
+
+    That gap had consequences twice. The fix landed in ``resume`` and NOT in ``load_adapter_into``,
+    so the §8 band render hit the identical KeyError from the other side; the logic is now shared in
+    ``lora/peft.load_adapter_state_into`` and this drives the caller that has already broken once.
+
+    The model is PEFT-wrapped AND carries a quanto-shaped module, so ``is_quanto_quantized`` returns
+    True and ``resume`` must take the direct-assignment path. If it ever routes back through
+    ``load_state_dict``, the fake's unconditional ``pop`` raises KeyError and this fails loudly.
+    """
+    from signet_trainer.lora.peft import is_quanto_quantized
+
+    class QFakeLinear(nn.Module):
+        __module__ = "optimum.quanto.nn.qmodule"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2, 2))
+
+        def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):  # noqa: ANN001
+            state_dict.pop(prefix + "weight._data")
+
+    model = _wrapped()
+    _randomize_adapter(model)
+    opt, sched = _opt_and_sched(model)
+    mgr = CheckpointManager(tmp_path)
+    mgr.save(model, opt, sched, step=200, loss=0.1234)
+    saved = {n: p.detach().clone() for n, p in model.named_parameters() if "lora_B" in n}
+    assert any(t.abs().sum() > 0 for t in saved.values()), "fixture wrote an all-zero adapter"
+
+    # A fresh wrapper (lora_B back to zero) that is ALSO quantized, exactly as the trainer's is.
+    revived = _wrapped()
+    revived.quantized_stub = QFakeLinear()
+    assert is_quanto_quantized(revived), "the fixture is not detected as quantized — test is vacuous"
+    for name, p in revived.named_parameters():
+        if "lora_B" in name:
+            with torch.no_grad():
+                p.zero_()
+
+    step = mgr.resume(revived)
+
+    assert step == 200
+    restored = {n: p.detach() for n, p in revived.named_parameters() if "lora_B" in n}
+    assert set(restored) == set(saved), "the restored parameter set does not match what was saved"
+    for name, want in saved.items():
+        assert torch.allclose(restored[name], want), (
+            f"{name} was not restored — a resume that silently leaves lora_B at zero continues "
+            f"from a ZERO adapter against an optimizer pointing at step 200, which is landmine #1 "
+            f"wearing the quantized branch as a disguise"
+        )
