@@ -510,7 +510,10 @@ def test_three_reference_slots_are_still_refused_and_the_refusal_says_why() -> N
     assert "OOM" in message
 
 
-def test_zero_reference_slots_are_refused() -> None:
-    """`ref2va` needs at least one reference; text-only is a different workflow entirely."""
+def test_zero_reference_slots_are_alpha_no_reference() -> None:
+    """SUPERSEDED premise (this test once refused 0): 0 is now NO-REFERENCE training (ALPHA,
+    2026-08-11) — text-only is a supported workflow on the same packing, with the ref-only
+    fields reverse-guarded. The bound that still carries weight is 3 (never priced)."""
+    assert H3Config(references_per_sample=0).references_per_sample == 0
     with pytest.raises(ValidationError):
-        H3Config(references_per_sample=0)
+        H3Config(references_per_sample=3)

@@ -177,9 +177,10 @@ def test_schema_accepts_zero_references_per_sample() -> None:
 
 
 def test_schema_still_defaults_to_two_and_rejects_the_rest() -> None:
-    """The exactly-2 Ref2VA path is byte-unchanged: same default, same substitution-rule refusal."""
+    """Default 2 unchanged; the union {0, 1, 2} is LIVE (#6 merged 2026-08-11), 3/-1 still die
+    on the substitution rule."""
     assert H3Config().references_per_sample == 2
-    for bad in (1, 3, -1):
+    for bad in (3, -1):
         with pytest.raises(ValidationError) as exc:
             H3Config(references_per_sample=bad)
         msg = str(exc.value)
@@ -187,13 +188,15 @@ def test_schema_still_defaults_to_two_and_rejects_the_rest() -> None:
         assert "substitut" in msg.lower()
 
 
-def test_the_refusal_names_no_reference_alpha_and_the_pr6_union() -> None:
-    """The message documents 0 = no-reference (ALPHA) and that PR #6 adds 1 (one-token union)."""
+def test_the_refusal_names_the_full_union() -> None:
+    """The refusal documents all three legal counts: 0 = no-reference (ALPHA), 1 = single-control
+    (#6, merged), 2 = Ref2VA — the one-token union, now live."""
     with pytest.raises(ValidationError) as exc:
         H3Config(references_per_sample=3)
     msg = str(exc.value)
     assert "0" in msg and "ALPHA" in msg
-    assert "PR #6" in msg
+    assert "single-control" in msg
+    assert "Ref2VA" in msg
 
 
 def test_the_field_description_carries_the_alpha_marking() -> None:
