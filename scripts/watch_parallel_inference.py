@@ -66,13 +66,24 @@ SAMPLES_ROOT = samples_root(OUTPUT_DIR, FAMILY)
 POLL_SECONDS = 240
 RENDER_EST_USD = round(_cfg.modal.est_hours * _cfg.modal.hourly_rate_usd, 2)
 DEADLINE_HOURS = 12.0
+# Wave 2 #6 LANDED (audit 2026-08-11): the coupled detach+freshness pair, ported from the campaign
+# fork. Dispatch is DETACHED (`modal run --detach` — a client death or the entrypoint's normal
+# `dispatch_watch_seconds` disengage can no longer tear down the render app, the who-holds-the-client
+# rule), so the `modal run` subprocess returning is DISPATCH-ACCEPTED, never render-complete.
+# Completion is ARTIFACT-gated: a dispatched render stays "pending" until its identity-keyed dir
+# commits to the Volume, or until it has produced nothing for render_stall_minutes — only then is it
+# declared stalled and re-dispatch (still cap-gated, still ledgered) becomes eligible. This is what
+# kills the re-dispatch-and-re-bill-every-poll failure the attached assumption caused once the
+# entrypoint moved to .spawn() (D-10-DEF-17).
+RENDER_STALL_MIN = float(_cfg.modal.render_stall_minutes)
 # AUDIT #4 — cumulative session-cap ledger (WR-02 authoritative chain, config-first). The dispatch
 # loop reads this before EVERY render and stops when the cap would be breached.
 LEDGER_PATH = _cfg.modal.session_spend_ledger_path
 # OBS-01 (D-OBS-4, config-first): READ-ONLY volume-op timeout so a hung `modal volume ls/get` can't
 # wedge the single-threaded loop. sh() defaults to this + CATCHES TimeoutExpired; dispatch_render
-# OPTS OUT (timeout=None) — this watcher's render is ATTACHED and BLOCKS for the full ~60-90 min
-# render, so it must NEVER be timed out (that would be a client-kill, the AUDIT-#1 regression).
+# still OPTS OUT (timeout=None) — with --detach the dispatch returns at the entrypoint's
+# dispatch_watch_seconds window, and the no-client-kill invariant (AUDIT-#1) says the dispatch
+# subprocess is never timed out from here regardless.
 VOLUME_OP_TIMEOUT_S = _cfg.modal.volume_op_timeout_s
 # OBS-01 exit-code PROTOCOL (contract, not a tunable): DISTINCT cap-stop code the supervisor treats
 # as "session cap reached — do NOT relaunch"; a clean complete exits 0 (+ sentinel).
@@ -110,8 +121,8 @@ def sh(args: list[str], *, timeout: float | None = VOLUME_OP_TIMEOUT_S, **kw) ->
     # OBS-01 (D-OBS-4): READ-ONLY volume ops run under timeout=VOLUME_OP_TIMEOUT_S so a hung `modal
     # volume ls/get` can't wedge the single-threaded loop; a TimeoutExpired is CAUGHT and returned as
     # a failed result (empty stdout, rc 124) so the poll just sees "no data" and continues.
-    # dispatch_render passes timeout=None to OPT OUT — the ATTACHED render blocks for the full render
-    # and must never be client-killed (the AUDIT-#1 regression).
+    # dispatch_render passes timeout=None to OPT OUT — the dispatch subprocess (now detached, Wave 2
+    # #6) is never client-killed from here (the AUDIT-#1 regression stays gone).
     try:
         return subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
                               errors="replace", cwd=str(REPO), timeout=timeout, **kw)
@@ -183,14 +194,16 @@ def append_spend(step: int) -> None:
 
 
 def dispatch_render(step: int) -> bool:
-    print(f"[watcher] new checkpoint step {step} -> dispatching gated render", flush=True)
-    # timeout=None (OBS-01): the ATTACHED render dispatch is EXPLICITLY EXEMPT from sh()'s read-only
-    # volume-op timeout. This `modal run` (attached, no detach flag) blocks for the full render;
-    # timing it out would client-kill a healthy render — the forbidden AUDIT-#1 regression.
-    r = sh(["modal", "run", "-m", "signet_trainer.modal.entrypoint",
+    print(f"[watcher] new checkpoint step {step} -> dispatching gated render (detached)", flush=True)
+    # DETACHED dispatch (Wave 2 #6): --detach keeps the ephemeral app alive after this client exits,
+    # so the .spawn()'d render survives the entrypoint's dispatch_watch_seconds disengage. The
+    # subprocess therefore returns ~minutes after launch and its exit code means DISPATCH ACCEPTED,
+    # never render-complete — completion is judged by the artifact gate in main(). timeout=None
+    # (OBS-01): the dispatch subprocess is still never timed out from here (no client-kill).
+    r = sh(["modal", "run", "--detach", "-m", "signet_trainer.modal.entrypoint",
             "--config", SAMPLE_CONFIG, "--mode", "sample", "--approve"], timeout=None)
     ok = r.returncode == 0
-    print(f"[watcher] render step {step}: {'OK' if ok else 'FAILED'}", flush=True)
+    print(f"[watcher] render step {step}: {'DISPATCHED' if ok else 'DISPATCH FAILED'}", flush=True)
     if not ok:
         print((r.stdout or "")[-2000:], flush=True)
         print((r.stderr or "")[-2000:], flush=True)
@@ -239,6 +252,21 @@ def refresh_grid() -> None:
 
 
 def main() -> None:
+    # PIN REFUSAL (audit 2026-08-11): a pinned h3.render_checkpoint_name renders the SAME checkpoint
+    # regardless of training progress, and this watcher's expected render key derives from the
+    # LATEST checkpoint — so under a pin, per-step renders can never be verified (every cadence
+    # boundary would re-render one artifact and the landed-check would key on the wrong identity).
+    # A pinned render is a ONE-SHOT: dispatch it directly through the entrypoint instead.
+    if FAMILY == "h3" and str(getattr(_cfg.h3, "render_checkpoint_name", "") or ""):
+        print(
+            f"[watcher] REFUSING to start: h3.render_checkpoint_name is pinned "
+            f"({_cfg.h3.render_checkpoint_name!r}) in {SAMPLE_CONFIG}. A step-cadence watcher "
+            "cannot verify pinned renders (its landed-check keys on the LATEST checkpoint). "
+            "Clear the pin for watcher use, or dispatch the pinned render one-shot:\n"
+            "  modal run --detach -m signet_trainer.modal.entrypoint --config <cfg> --mode sample --approve",
+            flush=True,
+        )
+        sys.exit(2)
     # OBS-01 (D-OBS-1) crash-resumable seed: derive `rendered` from committed Volume render artifacts
     # so a supervisor relaunch is idempotent (never re-dispatches an already-rendered boundary). If any
     # parallel-render artifact has committed, every checkpoint BELOW the latest is treated as already
@@ -252,8 +280,13 @@ def main() -> None:
         print(f"[watcher] reseed from Volume: treating steps {sorted(rendered)} as already rendered "
               f"(latest={_seed_latest} still renders)", flush=True)
     deadline = time.time() + DEADLINE_HOURS * 3600
-    print(f"[watcher] watching {OUTPUT_DIR} (poll {POLL_SECONDS}s, deadline {DEADLINE_HOURS}h)",
-          flush=True)
+    # Wave 2 #6 single-flight state: at most ONE render in flight. `pending_step` is the step whose
+    # detached render has been dispatched (and ledgered) but whose artifact has not yet committed;
+    # `pending_since` anchors the render_stall_minutes freshness clock.
+    pending_step: int | None = None
+    pending_since = 0.0
+    print(f"[watcher] watching {OUTPUT_DIR} (poll {POLL_SECONDS}s, deadline {DEADLINE_HOURS}h, "
+          f"render stall gate {RENDER_STALL_MIN:g} min)", flush=True)
     while time.time() < deadline:
         # OBS-01 (D-OBS-3): touch the heartbeat file EVERY iteration so the supervisor can detect a
         # frozen loop by heartbeat AGE (watcher_heartbeat_stall_minutes) and kill+relaunch (WATCHER-stall).
@@ -263,8 +296,9 @@ def main() -> None:
         # checkpoint. `checkpoint_every` is a TRAINING knob; how often a metered second container is
         # worth spinning up is an ECONOMIC one. The final step always renders regardless of cadence.
         new = [s for s in steps
-               if s not in rendered and (s % RENDER_EVERY == 0 or s >= MAX_STEPS)]
-        if new:
+               if s not in rendered and s != pending_step
+               and (s % RENDER_EVERY == 0 or s >= MAX_STEPS)]
+        if new and pending_step is None:  # SINGLE-FLIGHT: never dispatch over a pending render
             step = max(new)          # render the NEWEST; skip intermediates if we fell behind
             # AUDIT #4 — cumulative session-cap gate BEFORE dispatch. Refuse to dispatch when the
             # next render would breach the cap (SESSION-STATE override else config house default):
@@ -282,36 +316,46 @@ def main() -> None:
                 CAP_STOP_SENTINEL_FILE.write_text(
                     "cap-stop: session cap reached — do NOT relaunch\n", encoding="utf-8")
                 sys.exit(CAP_STOP_EXIT)
-            # AUDIT #2 — ledger EVERY dispatch (this watcher is ATTACHED: a client death mid-render
-            # still burned A100 time), then success-gate `rendered`: mark rendered ONLY when the
-            # render actually COMPLETED (dispatch_render True), so a killed render re-dispatches next
-            # poll instead of being silently skipped. (find_latest renders the newest anyway.)
+            # AUDIT #2 — ledger EVERY dispatch (a dispatched render is booked A100 time whether or
+            # not it lands), then hand completion to the ARTIFACT gate below. Spend books once per
+            # DISPATCH, and single-flight + the stall gate mean a dispatch happens at most once per
+            # render identity per render_stall_minutes window — never once per poll.
             append_spend(step)
             ok = dispatch_render(step)
-            # ARTIFACT-VERIFIED, not exit-code-verified (`processes lie, artifacts don't`). The modal
-            # CLI can exit non-zero on a `charmap` failure while printing its own success tick AFTER
-            # the bytes are committed, and it can exit 0 on a render that wrote nothing. The render is
-            # done when its identity-keyed dir is ON the Volume — which is also what makes the H3
-            # samples-path fix load-bearing rather than cosmetic: this check reads that path.
-            landed = render_landed(step)
-            if ok and not landed:
-                print(f"[watcher] render step {step}: exit 0 but NO committed artifact at "
-                      f"{SAMPLES_ROOT} — treating as NOT rendered (re-dispatches next poll).",
-                      flush=True)
-            if not ok and landed:
-                print(f"[watcher] render step {step}: non-zero exit but the artifact IS committed at "
-                      f"{SAMPLES_ROOT} — counting it rendered (the CLI can die on its own success "
-                      "tick; never trust the exit code alone).", flush=True)
-            ok = landed
             if ok:
-                rendered.update(new)
+                pending_step, pending_since = step, time.time()
+            else:
+                print(f"[watcher] dispatch for step {step} REFUSED/FAILED before spawn — "
+                      "eligible again next poll (cap-gated).", flush=True)
+        if pending_step is not None:
+            # ARTIFACT-VERIFIED completion (`processes lie, artifacts don't`): the render is done
+            # when its identity-keyed dir is ON the Volume — never when a subprocess exits. The
+            # freshness gate (render_stall_minutes, config-first) is the ONLY path that gives up on
+            # a pending render; only then does re-dispatch (with a fresh, honest booking) become
+            # eligible, and the pre-dispatch session-cap gate above still bounds the total.
+            landed = render_landed(pending_step)
+            age_min = (time.time() - pending_since) / 60.0
+            if landed:
+                ok, step = True, pending_step
+                rendered.update(s for s in steps
+                                if s <= step and (s % RENDER_EVERY == 0 or s >= MAX_STEPS))
                 refresh_grid()
-            if ok and step >= MAX_STEPS:
-                # OBS-01 run-complete: success-gated — write the sentinel + exit 0 so the supervisor
-                # STOPS (does not relaunch).
-                print("[watcher] final checkpoint rendered — done.", flush=True)
-                SENTINEL_FILE.write_text("run-complete: final checkpoint rendered\n", encoding="utf-8")
-                sys.exit(0)
+                pending_step = None
+                if ok and step >= MAX_STEPS:
+                    # OBS-01 run-complete: success-gated — write the sentinel + exit 0 so the
+                    # supervisor STOPS (does not relaunch).
+                    print("[watcher] final checkpoint rendered — done.", flush=True)
+                    SENTINEL_FILE.write_text("run-complete: final checkpoint rendered\n",
+                                             encoding="utf-8")
+                    sys.exit(0)
+            elif age_min > RENDER_STALL_MIN:
+                print(f"[watcher] render step {pending_step}: no new committed render artifact "
+                      f"after {age_min:.0f} min (> render_stall_minutes {RENDER_STALL_MIN:g}) — "
+                      "declaring STALLED; re-dispatch eligible next poll (cap-gated).", flush=True)
+                pending_step = None
+            else:
+                print(f"[watcher] render step {pending_step}: awaiting artifact "
+                      f"({age_min:.0f}/{RENDER_STALL_MIN:g} min)", flush=True)
         time.sleep(POLL_SECONDS)
     # OBS-01 run-complete (deadline): a clean, expected end — write the sentinel + exit 0 so the
     # supervisor STOPS rather than relaunching into an already-finished run.
