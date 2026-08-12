@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # and both the manifest layer here and the runner translator read it from there. The module is
 # pydantic + stdlib only, so this adds nothing to the import closure.
 from signet_trainer.config.sources import (
+    MUSUBI_RESOLUTION_STEP,
     ExtractionMode,
     SourceSpec,
     check_cache_collisions,
@@ -2716,10 +2717,24 @@ class SignetConfig(_Base):
             #     max_frames or it prices as a single frame — a 129-frame view costed as 1/129th of
             #     itself, which is the exact under-pricing this law exists to prevent. An image
             #     source has no temporal axis and is 1.
+            # ⛔ THE VIEW IS FLOORED TO %16, because that is the view musubi will actually build.
+            #
+            # Comparing the DECLARED resolution deadlocked the config against the %16 law three
+            # lines above (validate_wan_training_dims). Whenever the largest view is a non-%16
+            # resolution — the exact case musubi_resolution_warnings exists to PERMIT — no value of
+            # training_dims satisfied both: [640, 360, 45] died on "invalid height 360 … declare
+            # 352", and [640, 352, 45] died here on "not the largest view ([640, 360, 45])". The
+            # operator was handed two errors each demanding what the other forbids, and the only
+            # escape was editing the source resolution — precisely the refusal the warning path was
+            # written not to impose.
+            #
+            # Flooring resolves it in the direction that keeps the number HONEST: training_dims is
+            # the view signet prices, musubi trains the floored one, so the priced number should be
+            # the floored one too. The source keeps [640, 360] with its warning, as designed.
             views = [
                 (
-                    s.resolution[0],
-                    s.resolution[1],
+                    s.resolution[0] - s.resolution[0] % MUSUBI_RESOLUTION_STEP,
+                    s.resolution[1] - s.resolution[1] % MUSUBI_RESOLUTION_STEP,
                     s.max_frames
                     if s.extraction is ExtractionMode.FULL
                     else max(s.target_frames, default=1),

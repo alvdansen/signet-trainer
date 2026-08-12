@@ -399,3 +399,53 @@ def test_the_wan_arm_is_reached_before_the_ltx_synthetic_batch() -> None:
     # ...and it is genuinely REACHED from the synthetic-batch builder, not merely defined beside it.
     with pytest.raises(NotImplementedError, match="MANIFEST gate"):
         build_dryrun_inputs(load_config(_EXAMPLE))
+
+
+def test_the_largest_view_law_and_the_percent16_law_are_mutually_satisfiable() -> None:
+    """A non-%16 source must not deadlock the config. The audit's exact round-2 case.
+
+    Two laws run three lines apart on family 'wan': validate_wan_training_dims requires every
+    training_dims edge to be a multiple of 16, and _cross_field_checks required training_dims to
+    equal the largest DECLARED source view. Whenever the largest view was non-%16 — precisely the
+    case musubi_resolution_warnings exists to PERMIT, with a warning — no value satisfied both:
+
+        [640, 360, 45] -> "invalid height 360 ... declare 352"      (the %16 law)
+        [640, 352, 45] -> "not the largest view ([640, 360, 45])"   (the largest-view law)
+
+    The operator was handed two errors each demanding what the other forbids, and the only escape
+    was editing the source resolution — the refusal the warning path was written not to impose.
+
+    Fixed by comparing the FLOORED view, which is the view musubi actually builds, so the priced
+    number stays honest. This test asserts BOTH directions: the floored value loads, and the
+    declared non-%16 value is still refused. Asserting only the first would pass against a fix that
+    simply deleted the %16 law.
+    """
+    import yaml
+
+    from signet_trainer.config.load import load_config_from_text
+
+    raw = yaml.safe_load(_EXAMPLE.read_text(encoding="utf-8"))
+    raw["data"]["sources"] = [
+        {
+            "id": "stills", "kind": "image", "directory": "/dataset/K/Images",
+            "cache_root": "/dataset/K/Images/cache", "resolution": [1024, 1024],
+            "extraction": "image",
+        },
+        {
+            "id": "motion", "kind": "video", "directory": "/dataset/K/Videos",
+            "cache_root": "/dataset/K/Videos/c1", "resolution": [640, 360],
+            "extraction": "uniform", "target_frames": [45], "frame_sample": 2,
+        },
+    ]
+
+    raw["training_dims"] = [640, 352, 45]  # the FLOORED view — what musubi will build
+    cfg = load_config_from_text(yaml.safe_dump(raw))
+    assert list(cfg.training_dims) == [640, 352, 45]
+    assert list(cfg.data.sources[1].resolution) == [640, 360], (
+        "the source was silently rewritten — the warning path exists so the operator keeps their "
+        "declared resolution and is TOLD about the crop, not edited around"
+    )
+
+    raw["training_dims"] = [640, 360, 45]  # the declared view — still non-%16, still refused
+    with pytest.raises((ValidationError, ValueError)):
+        load_config_from_text(yaml.safe_dump(raw))

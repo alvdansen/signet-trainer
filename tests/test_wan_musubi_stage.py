@@ -799,3 +799,78 @@ def test_clip_id_is_fenced_to_wan_and_refused_elsewhere() -> None:
 
     assert _FAMILY_ONLY_MODEL_IDS["clip_id"] == frozenset({"wan"})
     assert "wan" in _FAMILY_ONLY_MODEL_IDS["vae_id"]
+
+
+# ==================================================================================================
+# (6) The commit cadence — the audit finding that a timeout loses every epoch
+# ==================================================================================================
+
+
+def test_a_first_sighting_is_never_committed_only_a_settled_one_is(tmp_path) -> None:
+    """A file that APPEARED is not a file that is WRITTEN.
+
+    musubi saves an adapter every epoch straight into the mounted Volume, and a Volume commit is
+    explicit — so committing once after the last subprocess returned meant a timeout at epoch 15 of
+    16 landed NOTHING, with no `retries=` and no resume to recover from. Committing on first sight
+    is the obvious fix and the wrong one: a half-flushed safetensors on the Volume under a
+    finished-looking name is worse than a missing one, because the next round of the chain would
+    warm-start from it.
+    """
+    from signet_trainer.modal.fns import wan_settled_adapters
+
+    sizes: dict[str, int] = {}
+    committed: set[str] = set()
+
+    growing = tmp_path / "run-000001.safetensors"
+    growing.write_bytes(b"x" * 100)
+    assert wan_settled_adapters(tmp_path, sizes, committed) == [], (
+        "committed on FIRST sighting — one poll cannot tell 'written' from 'still writing'"
+    )
+
+    growing.write_bytes(b"x" * 400)  # still growing
+    assert wan_settled_adapters(tmp_path, sizes, committed) == []
+
+    # size unchanged across two polls -> settled
+    assert wan_settled_adapters(tmp_path, sizes, committed) == ["run-000001.safetensors"]
+
+
+def test_a_settled_adapter_is_never_committed_twice(tmp_path) -> None:
+    from signet_trainer.modal.fns import wan_settled_adapters
+
+    sizes: dict[str, int] = {}
+    committed: set[str] = set()
+    (tmp_path / "a.safetensors").write_bytes(b"y" * 10)
+    wan_settled_adapters(tmp_path, sizes, committed)
+    landed = wan_settled_adapters(tmp_path, sizes, committed)
+    assert landed == ["a.safetensors"]
+    committed.update(landed)
+    assert wan_settled_adapters(tmp_path, sizes, committed) == [], "committed the same adapter twice"
+
+
+def test_a_zero_byte_adapter_is_never_settled(tmp_path) -> None:
+    """A touched-but-empty file holds still at zero forever; size-equality alone would commit it."""
+    from signet_trainer.modal.fns import wan_settled_adapters
+
+    sizes: dict[str, int] = {}
+    (tmp_path / "empty.safetensors").write_bytes(b"")
+    for _ in range(3):
+        assert wan_settled_adapters(tmp_path, sizes, set()) == []
+
+
+def test_the_training_pass_commits_DURING_the_run_and_on_every_exit_path() -> None:
+    """Structure, source-scanned: the stage cannot be executed without a GPU and musubi.
+
+    Three properties, each of which was absent and each of which loses a metered round:
+      * the training pass runs under Popen (so the Volume can be committed WHILE it runs);
+      * the commit sits in a `finally` (so a timeout or CalledProcessError still lands what exists);
+      * the poll interval is finite and named.
+    """
+    source = _FNS.read_text(encoding="utf-8")
+    stage = source[source.index("def wan_train("):]
+    stage = stage[: stage.index("\n@app.function") if "\n@app.function" in stage else len(stage)]
+    assert "subprocess.Popen(" in stage, "the training pass is not run under Popen"
+    assert "finally:" in stage, "the commit is not on every exit path"
+    assert "WAN_ADAPTER_COMMIT_POLL_SECONDS" in stage
+    assert "wan_settled_adapters(" in stage
+    body = stage[stage.index("finally:"):]
+    assert "checkpoints_vol.commit()" in body, "the finally block does not commit"

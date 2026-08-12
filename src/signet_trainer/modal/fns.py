@@ -2235,6 +2235,52 @@ WAN21_COMPONENTS: dict[str, tuple[str, str]] = {
 #: make ``model.text_encoder_id`` read as if the encoder belonged to the I2V release.
 WAN21_LOCAL_ROOT = "wan2.1"
 
+#: How often ``wan_train`` looks for a newly-settled epoch adapter to commit, in seconds. Sized
+#: against what it is racing: musubi saves once per EPOCH on a multi-hour run, so a minute of
+#: latency costs nothing, while a poll tight enough to matter would spend the container's CPU
+#: stat-ing a directory. The number that actually matters is that it is FINITE — the old code
+#: committed once, after the last subprocess returned, so a timeout at epoch 15 of 16 landed
+#: nothing at all.
+WAN_ADAPTER_COMMIT_POLL_SECONDS = 60
+
+
+def wan_settled_adapters(
+    run_root: Any, sizes: dict[str, int], committed: set[str]
+) -> list[str]:
+    """Names of adapters in ``run_root`` that have STOPPED GROWING since the previous poll.
+
+    Pure and filesystem-only — no Modal, no Volume — so the rule that decides when an epoch's
+    adapter is safe to commit can be tested on a laptop with ``tmp_path``. It was a closure inside
+    ``wan_train`` first; that made the one piece of logic standing between a timeout and fifteen
+    lost adapters reachable only by reading it.
+
+    ``sizes`` is the previous poll's observation and is MUTATED here; ``committed`` is what has
+    already been landed and is only read. A file is settled when it shows the same NON-ZERO size on
+    two consecutive polls:
+
+      * first sighting is never enough — it cannot distinguish "written" from "still being written",
+        and a half-flushed safetensors committed under a finished-looking name is worse than a
+        missing one, because the next round of the chain would warm-start from it;
+      * a file already in ``committed`` is skipped, so no adapter is committed twice;
+      * an ``OSError`` mid-rename is swallowed and retried on the next poll rather than aborting a
+        multi-hour run over a transient stat.
+    """
+    from pathlib import Path  # noqa: PLC0415 — this module keeps every import function-local
+
+    landed: list[str] = []
+    for path in sorted(Path(run_root).glob("*.safetensors")):
+        if path.name in committed:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        previous = sizes.get(path.name)
+        sizes[path.name] = size
+        if size > 0 and previous == size:
+            landed.append(path.name)
+    return landed
+
 
 @app.function(
     image=download_image,  # code-only image + huggingface_hub, same as the two siblings.
@@ -6908,7 +6954,14 @@ def wan_train(
          ``subprocess.run`` with NO return-code check, so a failed cache pass there proceeds
          silently to training against an empty cache and produces an adapter trained on nothing.
          That is the single most expensive defect in the transcription and it is NOT carried over;
-      5. ``checkpoints_vol.commit()`` — commit-or-vanish.
+      5. ``checkpoints_vol.commit()`` — commit-or-vanish, in a ``finally`` and NOT only at the end.
+         The cache passes commit as they finish, and the TRAINING pass runs under ``Popen`` so each
+         epoch's adapter is committed once its size stops changing. musubi saves every epoch
+         (``--save_every_n_epochs 1``) directly into the mounted Volume, but a Volume commit is
+         explicit: committing once after the last subprocess returned meant a timeout at epoch 15 of
+         16 landed NOTHING, with no ``retries=`` and no resume to recover from. The size-settled
+         check exists because a file that appeared is not a file that is written, and a half-flushed
+         adapter on the Volume is worse than a missing one — the next round would warm-start from it.
 
     Reported with COUNTS (stage k of 3, elapsed seconds each), so a pass that was skipped prints a
     zero rather than printing nothing: Modal shows stdout at WARNING and an absent line reads
@@ -6998,20 +7051,67 @@ def wan_train(
     )
     completed = 0
     elapsed: list[str] = []
-    for index, (label, argv) in enumerate(stages, start=1):
-        print(f"[wan_train] stage {index}/{len(stages)} {label}: {' '.join(argv)}")
-        started = time.monotonic()
-        # check=True is the deviation from the transcription that matters most: train_kohya.py never
-        # inspects a return code, so a failed cache pass there proceeds to training on an empty
-        # cache at a perfectly ordinary loss curve.
-        subprocess.run(argv, cwd=MUSUBI_TUNER_ROOT, check=True)
-        took = time.monotonic() - started
-        completed += 1
-        elapsed.append(f"{label}={took:.0f}s")
-        print(f"[wan_train] stage {index}/{len(stages)} {label} OK in {took:.0f}s")
 
-    # -- (5) commit-or-vanish ----------------------------------------------------------------------
-    checkpoints_vol.commit()
+    def _commit_settled_adapters(seen: dict[str, int]) -> list[str]:
+        """Commit adapters whose SIZE HAS STOPPED CHANGING since the previous poll.
+
+        musubi saves an adapter every epoch (``--save_every_n_epochs 1``) straight into the mounted
+        Volume, but a Volume commit is explicit — so without this the whole 16-epoch run lands
+        nothing until the last subprocess returns. A timeout at epoch 15 loses fifteen finished
+        adapters, and the stage carries no ``retries=`` (deliberately, see the decorator) and no
+        resume, so the entire metered round is gone with nothing to resume from.
+
+        The size check is the reason this is not just ``glob + commit``: a file that APPEARED is not
+        a file that is WRITTEN. Committing a half-flushed safetensors would put a corrupt adapter on
+        the Volume under a name that looks finished — which is worse than losing it, because the
+        next round would warm-start from it. Two consecutive polls at the same non-zero size is the
+        cheap proxy for "musubi has moved on"; a file still growing is simply left for the next pass.
+        """
+        landed = wan_settled_adapters(run_root, seen, committed_names)
+        if landed:
+            checkpoints_vol.commit()
+            print(
+                f"[wan_train] committed {len(landed)} settled adapter(s) mid-run: "
+                f"{', '.join(landed)} — epoch saves are landed as they stop growing, so a timeout "
+                f"or preemption keeps every completed epoch."
+            )
+        return landed
+
+    committed_names: set[str] = set()
+    try:
+        for index, (label, argv) in enumerate(stages, start=1):
+            print(f"[wan_train] stage {index}/{len(stages)} {label}: {' '.join(argv)}")
+            started = time.monotonic()
+            # check=True is the deviation from the transcription that matters most: train_kohya.py
+            # never inspects a return code, so a failed cache pass there proceeds to training on an
+            # empty cache at a perfectly ordinary loss curve.
+            is_final = index == len(stages)
+            if not is_final:
+                subprocess.run(argv, cwd=MUSUBI_TUNER_ROOT, check=True)
+                # Land the cache pass before the long one starts. The caches are the expensive,
+                # re-usable half; losing them to a training-stage timeout means paying for them again.
+                checkpoints_vol.commit()
+            else:
+                # The TRAINING pass, under Popen so the Volume can be committed WHILE it runs.
+                sizes: dict[str, int] = {}
+                proc = subprocess.Popen(argv, cwd=MUSUBI_TUNER_ROOT)
+                while proc.poll() is None:
+                    time.sleep(WAN_ADAPTER_COMMIT_POLL_SECONDS)
+                    committed_names.update(_commit_settled_adapters(sizes))
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(proc.returncode, argv)
+                committed_names.update(_commit_settled_adapters(sizes))
+            took = time.monotonic() - started
+            completed += 1
+            elapsed.append(f"{label}={took:.0f}s")
+            print(f"[wan_train] stage {index}/{len(stages)} {label} OK in {took:.0f}s")
+    finally:
+        # -- (5) commit-or-vanish, on EVERY exit path ----------------------------------------------
+        # In a finally block rather than after the loop: a timeout, a preemption or a CalledProcess
+        # Error from any stage must still land whatever reached the Volume. The old placement meant
+        # the one case where committing matters most — the run that did not finish — was the one
+        # case that never committed.
+        checkpoints_vol.commit()
     adapters = sorted(p.name for p in run_root.glob("*.safetensors"))
     summary = (
         f"[wan_train] done — {completed}/{len(stages)} stage(s) completed ({', '.join(elapsed)}), "
