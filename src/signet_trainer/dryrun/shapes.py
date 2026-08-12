@@ -44,6 +44,23 @@ from signet_trainer.conditioning.mask_ops import (
     latent_frame_token_span,
     per_token_sigma,
 )
+from signet_trainer.conditioning.qwen_edit import (
+    QwenControlSlot,
+    QwenEditModelInputs,
+    resolve_control_slots,
+)
+from signet_trainer.conditioning.qwen_edit_geometry import (
+    QWEN_EDIT_FRAMES,
+    QWEN_EDIT_LATENT_CHANNELS,
+    QWEN_EDIT_PATCH,
+    QWEN_EDIT_PATCH_DIM,
+    QwenEditPackedLayout,
+    qwen_edit_area_budget_size,
+    qwen_edit_latent_size,
+    qwen_edit_packed_layout,
+    qwen_edit_rows_of,
+    qwen_edit_vae_latent_shape,
+)
 from signet_trainer.conditioning.strategy import (
     HEIGHT_SCALE,
     TIME_SCALE,
@@ -58,6 +75,7 @@ from signet_trainer.config.schema import SignetConfig
 from signet_trainer.config.validators import (
     validate_h3_reference_budget,
     validate_h3_seq_len_budget,
+    validate_qwen_edit_row_budget,
 )
 from signet_trainer.models.h3_loader import (
     EXPECTED_H3_AUDIO_IN_CHANNELS,
@@ -533,6 +551,543 @@ def _assert_h3_contract(cfg: SignetConfig, mi: ModelInputs) -> None:
         )
 
 
+# --------------------------------------------------------------------------------------------------
+# Qwen-Image-Edit-2511 (family #3) — the multi-slot control-image branch of the gate.
+#
+# Three jobs no earlier arm needed, and each one is a failure that produces a plausible loss curve
+# rather than a crash:
+#
+#   1. Prove the CONTROL BLOCK IS A SUFFIX and is out of the loss. Every other conditioning arm in
+#      this gate puts its clean rows FIRST (``ic_lora``'s reference prefix, H3's ``n_cond_video``
+#      prefix) and both exclude them by slicing the HEAD. ai-toolkit does the exact inverse —
+#      ``torch.cat([packed_latents_list[b], control], dim=1)``
+#      (``qwen_image_edit_plus.py:315-317``) — and reads the prediction back with a PREFIX slice
+#      (``:346``). A ``[:, ref_seq_len:]`` habit carried from a sibling arm keeps the CONTROL rows
+#      and drops the TARGET rows: same dtype, same shape family, an adapter trained on the thing it
+#      was supposed to be conditioned by. ``ref_seq_len`` is therefore pinned ``None`` here and the
+#      split travels as ``target_seq_len`` / ``control_seq_len``.
+#   2. Prove the geometry is QWEN's, not LTX's. ``compute_seq_len`` divides by 32; Qwen packs 16
+#      pixels per row edge, so ``compute_seq_len(1024, 1024, 1) == 1024`` against this family's real
+#      4096. That is a silently-4x-wrong sequence length, not a shape error.
+#   3. Prove the text mask is an INT 0/1 mask. ``qwen_image_edit_plus.py:326-329`` casts it to
+#      ``torch.int64`` and derives ``txt_seq_lens`` by SUMMING it; the additive ``-inf`` float mask
+#      that ``single_frame``/``ic_lora`` build for ltx_core would sum to ``-inf``.
+#
+# Every row count arrives from ``cfg.qwen_edit`` via ``conditioning/qwen_edit_geometry`` — this
+# module owns NO Qwen geometry and carries no row-count, patch-dim or area literal.
+# --------------------------------------------------------------------------------------------------
+
+#: Control-row sentinel — a DISTINCT non-zero constant from the target sentinel, deliberately, so
+#: the contract assert can verify the CONCAT POLARITY on the latent itself. Zeros on both halves
+#: would let ``torch.cat([control, target])`` pass every shape and mask assertion in this file.
+_QWEN_EDIT_CLEAN_CONTROL = -1.0
+
+#: Target-row sentinel. Non-zero for the same reason ``_H3_NOISED_AUDIO`` is: the target rows are
+#: PRESENT and NOISED, and an all-zero target block would make the gate assert against a regime
+#: that never occurs.
+_QWEN_EDIT_NOISED_TARGET = 1.0
+
+#: The synthetic target's file stem. ai-toolkit matches control images to targets BY STEM
+#: (``dataloader_mixins.py:979-985``), and ``resolve_control_slots`` records the stem on every slot
+#: — including blank fills — so the 1:1 correspondence stays checkable. A fixed literal keeps the
+#: gate deterministic; it names no real file and none is opened (D-12: no data, no weights, no VAE).
+_QWEN_EDIT_DRYRUN_STEM = "dryrun-0001"
+
+
+@dataclass(frozen=True)
+class QwenEditDryrunBudget:
+    """What the qwen_edit preflight priced: the packed layout and the DECLARED row ceiling.
+
+    ``ceiling_rows`` of ``0`` means **DISABLED — nobody has measured this**, which is a different
+    state from "measured and roomy" and the banner is required to render it differently. H3 can
+    derive a ceiling from a measured ``mib_per_packed_row``; no equivalent measurement exists for
+    Qwen-Image-Edit on any card in this program, so there is nothing here to derive from and this
+    module refuses to invent one. ``headroom_rows`` is ``None`` in that state rather than a large
+    number, because a large number is exactly what an operator would misread as safety.
+    """
+
+    layout: QwenEditPackedLayout
+    ceiling_rows: int
+
+    @property
+    def ceiling_enabled(self) -> bool:
+        """True when an operator declared a MEASURED ceiling. False == unmeasured, nothing refused."""
+        return self.ceiling_rows > 0
+
+    @property
+    def headroom_rows(self) -> int | None:
+        """Rows still available, or ``None`` when no ceiling was declared. Negative means over."""
+        return self.ceiling_rows - self.layout.total if self.ceiling_enabled else None
+
+
+def _qwen_edit_budget(cfg: SignetConfig) -> QwenEditDryrunBudget:
+    """Price the packed layout and read the declared ceiling. PRICING ONLY — raises no refusal.
+
+    Unlike H3 there is no worst-case ENUMERATION to do, and that is a property of the design rather
+    than an omission: ``qwen_edit.control_slots`` is a FIXED count with blank-padding, and every
+    slot is priced at the same ``control_area_px`` because an arbitrarily-sized control image is
+    fitted to that budget before the VAE sees it. So there is exactly ONE possible layout for a
+    given config and worst == nominal non-trivially. (H3's hole was that its pairing REGIME varies
+    by design; nothing here varies.)
+
+    CPU-pure: geometry ints only, no ``torch``, no ``ltx_core``, no ``modal``.
+    """
+    return QwenEditDryrunBudget(
+        layout=qwen_edit_packed_layout(cfg.training_dims, cfg.qwen_edit),
+        ceiling_rows=cfg.qwen_edit.max_packed_rows,
+    )
+
+
+def assert_qwen_edit_row_budget(cfg: SignetConfig) -> QwenEditDryrunBudget:
+    """Preflight guard: refuse a qwen_edit packed sequence that exceeds a DECLARED row ceiling.
+
+    Same posture as :func:`assert_h3_seq_len_budget` — raised BEFORE any GPU spend, with a message
+    naming both sides — and the refusal is likewise DELEGATED, to
+    ``config/validators.validate_qwen_edit_row_budget``, so it exists in exactly one place.
+
+    ⚠ The honest difference from the H3 sibling: this check is **opt-in**, because its ceiling is an
+    operator's measurement rather than a derived number. With ``qwen_edit.max_packed_rows == 0``
+    nothing is refused and the layout is merely reported. That is deliberate — the alternative was
+    to synthesise a ceiling from H3's measured A100 triple, which prices a different model at a
+    different row width with different resident weights. A guess wearing a measurement's clothes is
+    worse than a disabled check, because only one of the two announces itself in the banner.
+
+    Returns the :class:`QwenEditDryrunBudget` for the OK banner.
+    """
+    budget = _qwen_edit_budget(cfg)
+    if budget.ceiling_enabled:
+        validate_qwen_edit_row_budget(
+            budget.layout.total,
+            budget.ceiling_rows,
+            label=(
+                f"{budget.layout.control_slots} control slot(s) at "
+                f"{cfg.qwen_edit.control_area_px} px"
+            ),
+        )
+    return budget
+
+
+def _qwen_edit_control_plan(cfg: SignetConfig) -> list[QwenControlSlot]:
+    """The deterministic slot plan the synthetic batch is built against.
+
+    Resolved through ``conditioning/qwen_edit.resolve_control_slots`` — the strategy's OWN resolver,
+    never a re-implementation (the ``build_h3_packed_batch`` discipline, T-10-09-T2): a gate that
+    resolves its own slots can pass while the strategy resolves them differently.
+
+    The posture is MIXED on purpose, not all-real and not all-blank: every slot but the last carries
+    a real path with an EXPLICIT ``slot`` index, and the last is left absent so the resolver has to
+    gap-fill it. That exercises the three properties that matter in one shape — real slots resolve
+    to their declared index, a gap becomes an explicit blank AT ITS OWN INDEX instead of sliding the
+    later controls left (the ai-toolkit slide, ``dataloader_mixins.py:984-985``), and a blank still
+    COSTS ROWS because a black image has a real VAE latent rather than a zero one. At
+    ``control_slots == 1`` it degenerates to a single blank, which is the correct edge answer.
+    """
+    entries = [
+        {"slot": index, "stem": _QWEN_EDIT_DRYRUN_STEM, "path": f"controls/{index}/synthetic.png"}
+        for index in range(cfg.qwen_edit.control_slots - 1)
+    ]
+    return resolve_control_slots(
+        _QWEN_EDIT_DRYRUN_STEM,
+        entries,
+        control_slots=cfg.qwen_edit.control_slots,
+        blank_slot_fill=cfg.qwen_edit.blank_slot_fill,
+    )
+
+
+def _qwen_edit_img_shapes(cfg: SignetConfig) -> tuple[tuple[int, int, int], ...]:
+    """``[(F, H2, W2), ...]`` — the target block FIRST, then one entry per control slot.
+
+    Transcribes ai-toolkit's own construction: ``img_shapes = [[(1, img_h2, img_w2)]]`` for the
+    target (``qwen_image_edit_plus.py:236``, with ``img_h2, img_w2 = height // 2, width // 2`` over
+    the LATENT dims at ``:234``) and one ``append((1, cl_height // 2, cl_width // 2))`` per control
+    (``:302``). ``H2 * W2`` is that block's packed row count, which is what makes this tuple a
+    checkable restatement of the layout rather than decoration — the contract assert multiplies it
+    out and requires the product to equal the rows actually built.
+    """
+    width, height, _frames = cfg.training_dims
+    target_lat_h, target_lat_w = qwen_edit_latent_size(width, height)
+    shapes = [(QWEN_EDIT_FRAMES, target_lat_h // QWEN_EDIT_PATCH, target_lat_w // QWEN_EDIT_PATCH)]
+
+    slot_width, slot_height = qwen_edit_area_budget_size(
+        width, height, cfg.qwen_edit.control_area_px
+    )
+    slot_lat_h, slot_lat_w = qwen_edit_latent_size(slot_width, slot_height)
+    slot_shape = (QWEN_EDIT_FRAMES, slot_lat_h // QWEN_EDIT_PATCH, slot_lat_w // QWEN_EDIT_PATCH)
+    shapes.extend(slot_shape for _ in range(cfg.qwen_edit.control_slots))
+    return tuple(shapes)
+
+
+def _qwen_edit_vae_latents(cfg: SignetConfig) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    """The UNPACKED VAE latents the packer folds into rows: ``[1, C, F, H_lat, W_lat]`` each.
+
+    Built even though the gate's ``ModelInputs`` carries only the PACKED sequence, because the two
+    shapes are pinned at different layers and a mismatch between them is invisible from either side
+    alone. ``qwen_edit_vae_latent_shape`` is the STORAGE contract — rank 4 ``[C, F, H, W]`` with
+    ``F == 1``, batched to rank 5 here — which is what lets ``qwen_edit_latents/`` ride
+    ``data/precomputed.py``'s ``_normalize_video_latents`` einops path; the transformer boundary is
+    rank 3. F is squeezed at the model boundary, never at rest. The contract assert checks the
+    element-count identity ``C*F*H*W == rows * QWEN_EDIT_PATCH_DIM``, which is the invariant the 2x2
+    pack must satisfy and the one an off-by-a-factor-of-2 patch size breaks first.
+    """
+    width, height, _frames = cfg.training_dims
+    target = torch.zeros(1, *qwen_edit_vae_latent_shape(width, height))
+
+    slot_width, slot_height = qwen_edit_area_budget_size(
+        width, height, cfg.qwen_edit.control_area_px
+    )
+    slot_shape = qwen_edit_vae_latent_shape(slot_width, slot_height)
+    controls = tuple(
+        torch.full((1, *slot_shape), _QWEN_EDIT_CLEAN_CONTROL)
+        for _ in range(cfg.qwen_edit.control_slots)
+    )
+    return target, controls
+
+
+def build_qwen_edit_dryrun_inputs(
+    cfg: SignetConfig, budget: QwenEditDryrunBudget | None = None
+) -> QwenEditModelInputs:
+    """Build the synthetic qwen_edit batch as the strategy's own ``QwenEditModelInputs``.
+
+    Deliberately that subclass and not a bare ``ModelInputs`` (the ``h3_ref`` precedent): the fields
+    this family adds — ``target_seq_len`` / ``control_seq_len`` / ``img_shapes`` / ``txt_seq_lens``
+    — ARE the wire format, and a gate that asserted only the base contract would prove nothing about
+    the half of the call that carries Qwen's positional information.
+
+    Tensors are CPU-only at the REAL row counts and the REAL feature widths, so a shape bug still
+    surfaces here (D-12: no data, no weights, no VAE). Only the two latent halves carry sentinels,
+    and they carry DIFFERENT ones, because the concat polarity is the single most consequential
+    thing this arm proves.
+
+    ⚠ DECLARED GAP, so it is not mistaken for coverage: this builds the ``QwenEditModelInputs``
+    directly rather than driving ``QwenEditStrategy.prepare_training_inputs``, because that entry
+    point consumes a real dataloader batch and the qwen_edit prep pass (``qwen_edit_latents/``,
+    ``qwen_edit_control_latents/``, ``qwen_edit_conditions/``) does not exist yet. The slot plan
+    already goes through the strategy's own ``resolve_control_slots``. When the prep pass lands,
+    re-point this at the strategy the way the H3 arm calls ``build_h3_packed_batch`` — until then
+    this gate proves GEOMETRY, POLARITY and MASKING, and does not prove batch-key wiring.
+    """
+    budget = _qwen_edit_budget(cfg) if budget is None else budget
+    layout = budget.layout
+    qe = cfg.qwen_edit
+
+    # --- the packed image stream: TARGET rows FIRST, control rows APPENDED ------------------------
+    latent = torch.empty(1, layout.n_image_stream, QWEN_EDIT_PATCH_DIM)
+    latent[:, : layout.n_target_image, :] = _QWEN_EDIT_NOISED_TARGET
+    latent[:, layout.n_target_image :, :] = _QWEN_EDIT_CLEAN_CONTROL
+
+    sampled_sigma = _SAMPLED_SIGMA
+    # Control rows are CLEAN conditioning -> per-row timestep 0; target rows carry the sampled sigma.
+    # WR-02's reserved-sentinel rule applies here exactly as it does on the LTX arms.
+    timesteps = torch.full((1, layout.n_image_stream), sampled_sigma)
+    timesteps[:, layout.n_target_image :] = 0.0
+
+    # THE SUFFIX MASK. True on the target PREFIX, False on the control SUFFIX — the inverse of every
+    # other arm in this file, which is precisely why it is built explicitly rather than reconstructed
+    # from a sibling's idiom.
+    video_loss_mask = torch.zeros(1, layout.n_image_stream, dtype=torch.bool)
+    video_loss_mask[:, : layout.n_target_image] = True
+
+    # Qwen carries NO coordinate tensor. Positional information travels as ``img_shapes`` /
+    # ``txt_seq_lens`` inside ``transformer_kwargs()`` (``qwen_image_edit_plus.py:332-344`` passes no
+    # positions argument at all). An EMPTY tensor rather than plausible zeros: a consumer that
+    # indexes it gets an immediate IndexError instead of a silently-zero RoPE grid.
+    positions = torch.zeros(0)
+
+    text_embeds = torch.zeros(1, layout.n_text, qe.text_embed_dim)
+    # ⛔ INT 0/1, NOT the additive -inf float mask the LTX arms build. The transformer casts this to
+    # int64 (``qwen_image_edit_plus.py:326-328``) and SUMS it for ``txt_seq_lens`` (``:329``); an
+    # -inf-filled float mask sums to -inf and yields a garbage sequence length rather than an error.
+    context_mask = torch.ones(1, layout.n_text, dtype=torch.int64)
+
+    video = Modality(
+        latent=latent,
+        sigma=torch.tensor([sampled_sigma]),
+        timesteps=timesteps,
+        positions=positions,
+        context=text_embeds,
+        context_mask=context_mask,
+    )
+
+    slots = _qwen_edit_control_plan(cfg)
+    return QwenEditModelInputs(
+        video=video,
+        audio=None,
+        # TARGET-ONLY velocity target, at the PREFIX length. A forgotten
+        # ``[:, :target_seq_len]`` slice in the loss then fails LOUD on shape instead of quietly
+        # training the adapter against its own control conditioning.
+        video_targets=torch.randn(1, layout.n_target_image, QWEN_EDIT_PATCH_DIM),
+        audio_targets=None,
+        video_loss_mask=video_loss_mask,
+        audio_loss_mask=None,
+        # ⛔ STAYS None. The control block is a SUFFIX; ``ref_seq_len`` means "length of the
+        # reference PREFIX" (``strategy.py:114``) and every consumer slices ``[:, ref_seq_len:, :]``.
+        ref_seq_len=None,
+        target_seq_len=layout.n_target_image,
+        control_seq_len=layout.n_control,
+        control_slots=tuple(slots),
+        control_slot_rows=tuple(layout.per_slot for _ in slots),
+        img_shapes=_qwen_edit_img_shapes(cfg),
+        txt_seq_lens=(int(context_mask.sum()),),
+        caption_dropped=False,
+    )
+
+
+def _assert_qwen_edit_contract(cfg: SignetConfig, mi: ModelInputs) -> None:
+    """THE CPU proof for the qwen_edit arm. Raises ``AssertionError`` on any violation.
+
+    (a) the CONTROL SUFFIX is out of the loss and the TARGET PREFIX is entirely in it — the L-3
+        guard in its inverted form, and the one assertion that separates this family from every
+        other arm in this file;
+    (b) the concat POLARITY is right, checked on the latent's own sentinels, so a
+        ``torch.cat([control, target])`` cannot pass by satisfying shapes and masks alone;
+    (c) ``video_targets`` is TARGET-ONLY at the PREFIX length, so a missing slice fails on shape;
+    (d) ``ref_seq_len`` is ``None`` — populating it would hand every ``[:, ref_seq_len:]`` consumer
+        the controls and drop the targets;
+    (e) the geometry is QWEN's, not LTX's: the packed rows must NOT equal ``compute_seq_len``, which
+        under-counts this family by exactly 4x while returning a plausible integer;
+    (f) the unpacked VAE latent and the packed rows agree by element count, which is the invariant a
+        wrong patch size breaks first;
+    (g) ``img_shapes`` multiplies out to exactly the rows built, target block first;
+    (h) the text mask is INT 0/1 and ``txt_seq_lens`` is its SUM;
+    (i) ``positions`` is EMPTY — this family has no coordinate tensor.
+
+    The batch is rebuilt here (the build is fully deterministic) and BRIDGED to ``mi`` by equality on
+    the tensors the caller can see, exactly as ``_assert_h3_contract`` does, so the assertions below
+    are provably about the object ``build_dryrun_inputs`` returned.
+    """
+    budget = _qwen_edit_budget(cfg)
+    rebuilt = build_qwen_edit_dryrun_inputs(cfg, budget)
+    layout = budget.layout
+    width, height, frames = cfg.training_dims
+
+    # --- the bridge: the rebuild IS what build_dryrun_inputs returned -----------------------------
+    assert isinstance(mi, QwenEditModelInputs), (
+        f"the qwen_edit arm must return QwenEditModelInputs (got {type(mi).__name__}): "
+        f"target_seq_len / control_seq_len / img_shapes / txt_seq_lens ARE the wire format, and a "
+        f"bare ModelInputs proves nothing about the half of the call that carries Qwen's "
+        f"positional information."
+    )
+    assert torch.equal(mi.video.latent, rebuilt.video.latent), (
+        "video.latent does not match the deterministic rebuild"
+    )
+    assert torch.equal(mi.video_loss_mask, rebuilt.video_loss_mask), (
+        "video_loss_mask does not match the deterministic rebuild"
+    )
+    assert (mi.target_seq_len, mi.control_seq_len) == (
+        rebuilt.target_seq_len,
+        rebuilt.control_seq_len,
+    ), "the target/control split does not match the deterministic rebuild"
+
+    # --- the priced layout is what was actually built ----------------------------------------------
+    assert frames == QWEN_EDIT_FRAMES, (
+        f"qwen_edit training_dims F is {frames}, must be EXACTLY {QWEN_EDIT_FRAMES} — enforced "
+        f"upstream by config/validators.validate_qwen_edit_frames; a config reaching here "
+        f"unvalidated bypassed the load-time gate (and LTX's law admits 1, so the shared pre-screen "
+        f"never would have caught it)."
+    )
+    assert mi.target_seq_len == layout.n_target_image == qwen_edit_rows_of(width, height), (
+        f"target_seq_len {mi.target_seq_len} != priced target rows {layout.n_target_image}"
+    )
+    assert mi.control_seq_len == layout.n_control == layout.per_slot * layout.control_slots, (
+        f"control_seq_len {mi.control_seq_len} != priced control rows {layout.n_control}"
+    )
+    assert len(mi.control_slots) == cfg.qwen_edit.control_slots, (
+        f"resolved {len(mi.control_slots)} control slot(s) != configured "
+        f"{cfg.qwen_edit.control_slots} — the slot count is FIXED and blank-padded, so a short plan "
+        f"means a gap was closed up rather than filled (dataloader_mixins.py:984-985's slide)."
+    )
+    assert tuple(slot.index for slot in mi.control_slots) == tuple(
+        range(cfg.qwen_edit.control_slots)
+    ), (
+        f"control slots are not at consecutive indices 0..{cfg.qwen_edit.control_slots - 1}: "
+        f"{[slot.index for slot in mi.control_slots]}. Slot index IS the caption's ctrl_img_N "
+        f"addressing, so a shifted plan conditions the sample on the wrong image."
+    )
+    assert sum(mi.control_slot_rows) == layout.n_control, (
+        f"per-slot rows {mi.control_slot_rows} sum to {sum(mi.control_slot_rows)} != "
+        f"n_control {layout.n_control}"
+    )
+
+    # --- (a) THE SUFFIX loss guard -----------------------------------------------------------------
+    assert tuple(mi.video_loss_mask.shape) == (1, layout.n_image_stream), (
+        f"video_loss_mask shape {tuple(mi.video_loss_mask.shape)} != (1, {layout.n_image_stream})"
+    )
+    assert bool(mi.video_loss_mask[:, : mi.target_seq_len].all()), (
+        "every TARGET image row must be IN the loss."
+    )
+    assert not mi.video_loss_mask[:, mi.target_seq_len :].any(), (
+        "control-SUFFIX loss mask must be ALL False across [target_seq_len:]: loss on the control "
+        "rows trains a dead adapter. ⚠ Note the direction — the control block is a SUFFIX here "
+        "(qwen_image_edit_plus.py:315-317 appends it), the inverse of ic_lora's and H3's reference "
+        "PREFIX. A [:ref_seq_len] guard copied from either sibling checks the wrong half."
+    )
+    assert int(mi.video_loss_mask.sum()) == mi.target_seq_len, (
+        f"video loss mask covers {int(mi.video_loss_mask.sum())} rows != target_seq_len "
+        f"{mi.target_seq_len}"
+    )
+    assert torch.all(mi.video.timesteps[:, : mi.target_seq_len] == _SAMPLED_SIGMA), (
+        "target rows must carry the sampled sigma."
+    )
+    assert torch.all(mi.video.timesteps[:, mi.target_seq_len :] == 0), (
+        "control rows must carry per-row timestep 0 (they are clean conditioning, never denoised)."
+    )
+
+    # --- (b) CONCAT POLARITY, on the latent itself -------------------------------------------------
+    assert tuple(mi.video.latent.shape) == (1, layout.n_image_stream, QWEN_EDIT_PATCH_DIM), (
+        f"video.latent shape {tuple(mi.video.latent.shape)} != (1, {layout.n_image_stream}, "
+        f"{QWEN_EDIT_PATCH_DIM}) — [1, target rows + control rows, C * patch**2]."
+    )
+    assert torch.all(mi.video.latent[:, : mi.target_seq_len, :] == _QWEN_EDIT_NOISED_TARGET), (
+        "concat polarity violation: the PREFIX must be the noised TARGET block. ai-toolkit builds "
+        "torch.cat([packed_latents, control], dim=1) (qwen_image_edit_plus.py:315-317) and reads "
+        "the prediction back with a PREFIX slice (:346) — target first, controls appended."
+    )
+    assert torch.all(mi.video.latent[:, mi.target_seq_len :, :] == _QWEN_EDIT_CLEAN_CONTROL), (
+        "concat polarity violation: the SUFFIX must be the clean CONTROL block."
+    )
+
+    # --- (c) TARGET-ONLY targets -------------------------------------------------------------------
+    assert tuple(mi.video_targets.shape) == (1, mi.target_seq_len, QWEN_EDIT_PATCH_DIM), (
+        f"video_targets shape {tuple(mi.video_targets.shape)} != (1, {mi.target_seq_len}, "
+        f"{QWEN_EDIT_PATCH_DIM}) — must be TARGET-ONLY, NOT the packed length "
+        f"{layout.n_image_stream}."
+    )
+
+    # --- (d) ref_seq_len stays None ----------------------------------------------------------------
+    assert mi.ref_seq_len is None, (
+        f"ref_seq_len is {mi.ref_seq_len}, must be None on qwen_edit. It means 'length of the "
+        f"reference PREFIX' (strategy.py:114) and every consumer slices [:, ref_seq_len:, :]; with "
+        f"a SUFFIX control block that keeps the controls and drops the targets — same dtype, "
+        f"plausible loss curve, an adapter trained on its own conditioning. The split travels as "
+        f"target_seq_len / control_seq_len instead."
+    )
+
+    # --- (e) the geometry is QWEN's, not LTX's -----------------------------------------------------
+    ltx_rows = compute_seq_len(width, height, frames)
+    assert mi.target_seq_len != ltx_rows, (
+        f"qwen_edit target rows ({mi.target_seq_len}) must NOT equal compute_seq_len "
+        f"({ltx_rows}): LTX divides by 32 and Qwen packs {QWEN_EDIT_PATCH_DIM // QWEN_EDIT_LATENT_CHANNELS}"
+        f" latent cells per row at 8x VAE compression, i.e. 16 pixels per row edge. Equality here "
+        f"means the LTX helper leaked into this arm — a silently-4x-wrong sequence length, not a "
+        f"shape error."
+    )
+
+    # --- (f) unpacked VAE latents agree with the packed rows by element count -----------------------
+    target_latent, control_latents = _qwen_edit_vae_latents(cfg)
+    assert tuple(target_latent.shape) == (1, QWEN_EDIT_LATENT_CHANNELS, QWEN_EDIT_FRAMES, *
+                                          qwen_edit_latent_size(width, height)), (
+        f"target VAE latent shape {tuple(target_latent.shape)} != (1, {QWEN_EDIT_LATENT_CHANNELS}, "
+        f"{QWEN_EDIT_FRAMES}, {qwen_edit_latent_size(width, height)}) — the STORAGE contract is "
+        f"rank-4 [C, F, H_lat, W_lat] with F == 1, batched to rank 5. F is squeezed at the model "
+        f"boundary, never at rest."
+    )
+    assert target_latent.numel() == mi.target_seq_len * QWEN_EDIT_PATCH_DIM, (
+        f"pack identity violated: the unpacked target latent holds {target_latent.numel()} "
+        f"elements but the packed block is {mi.target_seq_len} rows x {QWEN_EDIT_PATCH_DIM} = "
+        f"{mi.target_seq_len * QWEN_EDIT_PATCH_DIM}. The 2x2 pack is a reshape and must preserve "
+        f"element count exactly (qwen_image_edit_plus.py:222-228) — this is the invariant a wrong "
+        f"patch size breaks first."
+    )
+    assert len(control_latents) == cfg.qwen_edit.control_slots
+    for index, control_latent in enumerate(control_latents):
+        assert control_latent.numel() == mi.control_slot_rows[index] * QWEN_EDIT_PATCH_DIM, (
+            f"pack identity violated for control slot {index}: {control_latent.numel()} elements "
+            f"vs {mi.control_slot_rows[index]} rows x {QWEN_EDIT_PATCH_DIM}."
+        )
+
+    # --- (g) img_shapes multiplies out to the rows actually built -----------------------------------
+    assert len(mi.img_shapes) == 1 + cfg.qwen_edit.control_slots, (
+        f"img_shapes has {len(mi.img_shapes)} entries != 1 target + "
+        f"{cfg.qwen_edit.control_slots} control slot(s). ai-toolkit builds exactly this list "
+        f"(qwen_image_edit_plus.py:236 then :302 per control) and the transformer reads its "
+        f"positional grid from it."
+    )
+    # ⚠ Known limit, stated so the next reader does not over-trust these three lines: they compare
+    # ROW COUNTS, so they can only detect a mis-ORDERED img_shapes when the target block and the
+    # control blocks have different geometries. At the house 1024x1024 target with
+    # control_area_px = VAE_IMAGE_SIZE every block is 4096 rows, and any permutation of an
+    # all-4096 list satisfies all three. Probed both ways: at [512, 512, 1] (target 1024 rows,
+    # slots 4096) a rotated list is caught on the first assert. Ordering is therefore proven for
+    # asymmetric geometries and merely consistent for symmetric ones — detecting it in the
+    # symmetric case needs a per-block identity the row count does not carry.
+    block_rows = [int(f) * int(h2) * int(w2) for f, h2, w2 in mi.img_shapes]
+    assert block_rows[0] == mi.target_seq_len, (
+        f"img_shapes[0] {mi.img_shapes[0]} multiplies to {block_rows[0]} rows != target_seq_len "
+        f"{mi.target_seq_len} — the TARGET block must come first."
+    )
+    assert block_rows[1:] == list(mi.control_slot_rows), (
+        f"img_shapes control entries multiply to {block_rows[1:]} != per-slot rows "
+        f"{list(mi.control_slot_rows)}"
+    )
+    assert sum(block_rows) == layout.n_image_stream, (
+        f"img_shapes accounts for {sum(block_rows)} rows != the packed image stream "
+        f"{layout.n_image_stream}"
+    )
+
+    # --- (h) the INT text mask and its SUM -----------------------------------------------------------
+    assert mi.video.context_mask is not None, "qwen_edit must carry a text attention mask"
+    assert mi.video.context_mask.dtype == torch.int64, (
+        f"context_mask dtype is {mi.video.context_mask.dtype}, must be torch.int64. Qwen consumes "
+        f"this mask TWICE as integers — cast at qwen_image_edit_plus.py:326-328 and SUMMED for "
+        f"txt_seq_lens at :329 — so the additive 0/-inf FLOAT mask that single_frame.py:184-185 and "
+        f"ic_lora.py:248-249 build for ltx_core sums to -inf here. It does not raise; it produces a "
+        f"garbage sequence length and a silently mis-attended text stream."
+    )
+    assert tuple(mi.video.context.shape) == (1, layout.n_text, cfg.qwen_edit.text_embed_dim), (
+        f"video.context shape {tuple(mi.video.context.shape)} != (1, {layout.n_text}, "
+        f"{cfg.qwen_edit.text_embed_dim})"
+    )
+    assert list(mi.txt_seq_lens) == [int(mi.video.context_mask.sum())], (
+        f"txt_seq_lens {list(mi.txt_seq_lens)} != the mask's own sum "
+        f"[{int(mi.video.context_mask.sum())}] — it is DERIVED from the mask (:329), never carried "
+        f"independently."
+    )
+
+    # --- (i) no coordinate tensor -------------------------------------------------------------------
+    assert mi.video.positions.numel() == 0, (
+        f"video.positions holds {mi.video.positions.numel()} elements, must be EMPTY: Qwen carries "
+        f"no coordinate tensor. Positional information travels as img_shapes / txt_seq_lens inside "
+        f"transformer_kwargs() (qwen_image_edit_plus.py:332-344 passes no positions argument). "
+        f"Plausible zeros here would be a silently-zero RoPE grid; an empty tensor makes any "
+        f"consumer fail immediately."
+    )
+
+    # --- the budget split: what is shaped vs what is priced -----------------------------------------
+    assert layout.total == layout.n_image_stream + layout.n_text, (
+        f"layout total {layout.total} != image stream {layout.n_image_stream} + text "
+        f"{layout.n_text}. The TOTAL is the attention sequence (the budget number); the image "
+        f"stream is what hidden_states is shaped by. Dual-stream MMDiT keeps img_* and txt_* as "
+        f"separate parameter sets joined only in attention — reporting one and shaping with the "
+        f"other is the mistake this split exists to prevent."
+    )
+
+
+def _qwen_edit_ok_banner(cfg: SignetConfig, budget: QwenEditDryrunBudget) -> str:
+    """The qwen_edit OK line: geometry, the packed breakdown, the slot plan, and the ceiling STATE.
+
+    ⚠ The ceiling clause is required to read ``ceiling=DISABLED (unmeasured)`` when no ceiling was
+    declared, and to print NO headroom number in that state. A headroom figure is read as reassurance
+    and there is nothing here to be reassured by: no MiB-per-row measurement for Qwen-Image-Edit
+    exists in this program. The banner's job is to make "nobody measured this" as visible as a
+    number would have been.
+    """
+    width, height, frames = cfg.training_dims
+    lat_h, lat_w = qwen_edit_latent_size(width, height)
+    if budget.ceiling_enabled:
+        ceiling = f"ceiling={budget.ceiling_rows} (headroom {budget.headroom_rows} rows)"
+    else:
+        ceiling = "ceiling=DISABLED (unmeasured — qwen_edit.max_packed_rows is 0, nothing refused)"
+    return (
+        f"[signet-dryrun] OK — qwen_edit config valid, synthetic packed batch built on CPU: "
+        f"family={cfg.model.family}, {width}x{height} pixels x {frames} frame -> "
+        f"{lat_w}x{lat_h} latent, {budget.layout.describe()}, "
+        f"{budget.layout.control_slots} slot(s) at {cfg.qwen_edit.control_area_px} px "
+        f"(blank fill '{cfg.qwen_edit.blank_slot_fill}'), rank/alpha "
+        f"{cfg.lora.rank}/{cfg.lora.alpha} lock={cfg.qwen_edit.rank_alpha_lock}, "
+        f"{ceiling}. Zero GPU, zero Modal spend."
+    )
+
+
 def _inpaint_dryrun_mask(lat_f: int, lat_h: int, lat_w: int) -> torch.Tensor:
     """Deterministic ASYMMETRIC ``[F_lat, H_lat, W_lat]`` KEEP mask for the inpaint dry-run.
 
@@ -627,9 +1182,19 @@ def build_dryrun_inputs(cfg: SignetConfig) -> ModelInputs:
     layout, not an LTX video-token count. ``compute_seq_len``'s ``(F-1)//8+1`` frame law and
     128-channel latents are both wrong for H3 and would silently produce a plausible number. Every
     LTX branch below is untouched.
+
+    The ``qwen_edit`` branch (family #3) dispatches on the family for the SAME reason and one more.
+    ``compute_seq_len`` is not merely inapplicable there, it is quietly WRONG: it divides by 32
+    while Qwen packs 16 pixels per row edge, so it returns exactly a quarter of the real row count
+    as a perfectly plausible integer (``compute_seq_len(1024, 1024, 1) == 1024`` against a real
+    4096). And unlike H3, that family's frame count is legal under LTX's own law
+    (``(1 - 1) % 8 == 0``), so nothing upstream would have diverted it. Its ``conditioning.mode`` is
+    pinned to ``none`` at config load, so the mode dispatch below is unreachable for it either way.
     """
     if cfg.model.family == "h3":
         return _build_h3_dryrun_inputs(cfg)
+    if cfg.model.family == "qwen_edit":
+        return build_qwen_edit_dryrun_inputs(cfg)
 
     width, height, frames = cfg.training_dims
     seq_len = compute_seq_len(width, height, frames)
@@ -850,6 +1415,13 @@ def _assert_contract(cfg: SignetConfig, mi: ModelInputs) -> None:
     # asserts below apply to it (same posture as the ic_lora arm, one level up).
     if cfg.model.family == "h3":
         _assert_h3_contract(cfg, mi)
+        return
+    # qwen_edit likewise: a packed image stream with a SUFFIX control block, an int text mask and no
+    # coordinate tensor. None of the LTX seq_len/channel asserts below describe it — and unlike the
+    # H3 arm they would not even fail loudly on it, because ``compute_seq_len`` returns a plausible
+    # (4x too small) integer for an image geometry rather than raising.
+    if cfg.model.family == "qwen_edit":
+        _assert_qwen_edit_contract(cfg, mi)
         return
 
     width, height, frames = cfg.training_dims
@@ -1252,11 +1824,21 @@ def run_dryrun(cfg: SignetConfig) -> int:
     (H3-07). That check runs FIRST, inside the same try/except, so the refusal becomes a non-zero
     return with the message on stderr — and so an over-budget geometry is rejected without ever
     allocating the batch it could not afford.
+
+    ``model.family == "qwen_edit"`` prices its packed sequence in the same position, with one
+    deliberate difference: the refusal is OPT-IN. ``qwen_edit.max_packed_rows`` defaults to 0 =
+    ceiling DISABLED, because no MiB-per-row figure has been measured for Qwen-Image-Edit on any
+    card in this program and H3's measured triple prices a different model at a different row width.
+    The layout is computed and PRINTED regardless; the banner says ``ceiling=DISABLED (unmeasured)``
+    so the gap is visible rather than implied by a comfortable-looking headroom number.
     """
     h3_budget: H3DryrunBudget | None = None
+    qwen_edit_budget: QwenEditDryrunBudget | None = None
     try:
         if cfg.model.family == "h3":
             h3_budget = assert_h3_seq_len_budget(cfg)
+        elif cfg.model.family == "qwen_edit":
+            qwen_edit_budget = assert_qwen_edit_row_budget(cfg)
         mi = build_dryrun_inputs(cfg)
         _assert_contract(cfg, mi)
     except AssertionError as exc:
@@ -1268,6 +1850,10 @@ def run_dryrun(cfg: SignetConfig) -> int:
 
     if h3_budget is not None:
         print(_h3_ok_banner(cfg, h3_budget))
+        return 0
+
+    if qwen_edit_budget is not None:
+        print(_qwen_edit_ok_banner(cfg, qwen_edit_budget))
         return 0
 
     width, height, frames = cfg.training_dims

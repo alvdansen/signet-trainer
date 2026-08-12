@@ -29,13 +29,16 @@ Anti-Pattern-6 assertion for the whole session (the same reason ``inference/rend
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
 
-from signet_trainer.inference.render_key import h3_render_key
+from signet_trainer.inference.render_key import h3_render_key, qwen_edit_render_key
 
 __all__ = [
     "SAMPLES_SUBDIR_BY_FAMILY",
     "expected_h3_render_key",
+    "expected_qwen_edit_band_keys",
+    "expected_qwen_edit_render_key",
     "landed_render_ids",
     "samples_root",
     "samples_subdir",
@@ -45,9 +48,16 @@ __all__ = [
 #: Transcribed from ``modal/fns.py`` (``"samples_h3" / h3_render_key(...)`` for H3; the LTX
 #: ``sample`` branch's ``samples*`` dirs) — NOT guessed. ``samples_text_to_video`` is never written
 #: by anything (training-review §2 WR-08); do not add it here on the strength of a mode name.
+#:
+#: ``qwen_edit`` (family #3) was RESERVED here before its render surface existed, and is now LIVE:
+#: ``expected_qwen_edit_render_key`` and the ``landed_render_ids`` arm below are real. The reservation
+#: did its job — ``samples_subdir`` raised on the unknown family, so nobody could reach for the
+#: shortest fix (point the watcher at ``"samples"``) and re-open the phantom-spend hole this module
+#: exists to close.
 SAMPLES_SUBDIR_BY_FAMILY = {
     "ltx": "samples",
     "h3": "samples_h3",
+    "qwen_edit": "samples_qwen_edit",
 }
 
 #: A LTX render dir is a UTC wall-clock stamp: ``samples/20260805T154357Z/``.
@@ -103,6 +113,90 @@ def expected_h3_render_key(
     )
 
 
+def expected_qwen_edit_render_key(
+    *, checkpoint: str, seed: int, control_ids: Any
+) -> str:
+    """The directory a ``qwen_edit`` render WILL write for this (checkpoint, seed, controls) request.
+
+    Delegates to ``inference.render_key.qwen_edit_render_key`` — the render's own function, never a
+    re-implementation, so the watcher's expectation and the directory the render creates cannot
+    drift. Identical discipline to ``expected_h3_render_key``.
+
+    The stub this replaces named two things that had to be settled TOGETHER; both are settled and
+    both are recorded in ``qwen_edit_render_key``'s docstring:
+
+      1. **No ``_f<frames>`` segment.** F is pinned to exactly 1 on this family, so a frame segment
+         would be a constant wearing an identity axis's clothes.
+      2. **The A/B prompt mode is NOT an identity axis.** §8's style-only / content-named pair is one
+         side-by-side comparison produced by one pass, so the two modes are SUBDIRS of a single
+         render dir (the ``base/`` + ``lora/`` shape ``h3_sample`` already uses), not two dirs. Had
+         the mode gone into the key, a row whose A half landed would read to the watcher as a
+         complete render.
+
+    ``_QWEN_EDIT_KEY_RE`` and the ``landed_render_ids`` arm below were updated in the same commit as
+    this function, which is what the stub required.
+    """
+    return qwen_edit_render_key(checkpoint=checkpoint, seed=seed, control_ids=control_ids)
+
+
+def expected_qwen_edit_band_keys(
+    *, checkpoints: Sequence[str], seed: int, control_ids: Any
+) -> list[str]:
+    """Every render key a checkpoint BAND produces, in band order — the band's landed-check unit.
+
+    §8 of the house method: *"Checkpoint selection = a band, not a winner … the shipped deliverable
+    was three checkpoints … A trainer should support exporting a band."* The watcher's question on
+    this family is therefore **"did the whole band land?"**, and asking it one checkpoint at a time
+    is how a partially-rendered band gets shipped: the three members share ``output_dir``, ``seed``,
+    the held-out control set and their prompt pair, so they write identical FILENAMES and differ only
+    in the render-dir identity. A caller that checked the first member alone would accept it as proof
+    the other two rendered.
+
+    Order is the BAND's order, preserved — ``["4000", "4200", "5000"]`` is how the band is read and
+    handed over, and a sorted copy would silently reorder a band whose members are named by anything
+    other than a zero-padded step.
+
+    Returns one key per member; duplicates in ``checkpoints`` are refused rather than de-duplicated,
+    because a repeated member means the band was assembled wrongly and a silent de-dupe would ship a
+    two-checkpoint band under a three-checkpoint label.
+    """
+    members = list(checkpoints)
+    if not members:
+        raise ValueError(
+            "expected_qwen_edit_band_keys got an EMPTY band. A band is 1..N checkpoints (§8 ships "
+            "three); zero members means the caller resolved no checkpoint at all, and returning [] "
+            "would read to the watcher as 'every render landed' — the inverse of the truth."
+        )
+    seen: dict[str, int] = {}
+    for i, name in enumerate(members):
+        if name in seen:
+            raise ValueError(
+                f"checkpoint {name!r} appears twice in the band (positions {seen[name]} and {i}). "
+                "A repeated member means the band was assembled wrongly; de-duplicating it silently "
+                "would ship a shorter band under its original label."
+            )
+        seen[name] = i
+    return [
+        expected_qwen_edit_render_key(checkpoint=name, seed=seed, control_ids=control_ids)
+        for name in members
+    ]
+
+
+#: A ``qwen_edit`` render dir is an IDENTITY key: ``<checkpoint>_s<seed>_c<control ids>``. Anchored
+#: on the ``_s<d>_c`` tail exactly as ``_H3_KEY_RE`` anchors on ``_s<d>_f<d>_``.
+#:
+#: ⚠ The ``_c`` marker is what keeps the two families' patterns MUTUALLY EXCLUSIVE, and that matters
+#: because ``landed_render_ids`` takes the family from config: an H3 key carries ``_s<d>_f<d>_`` and
+#: never ``_s<d>_c``, and a qwen key carries ``_s<d>_c`` and never ``_s<d>_f<d>_``. Pointing either
+#: family's parse at the other family's listing therefore yields ``[]`` — visibly nothing landed —
+#: rather than a plausible partial list. Pinned both directions by test.
+#:
+#: Like ``_H3_KEY_RE`` this is a RECOGNISER, not a parser: ``landed_render_ids`` adds the whole
+#: directory NAME, never a capture group, so a control id that happened to contain ``_s12_c`` would
+#: mis-split the groups harmlessly and still be recognised.
+_QWEN_EDIT_KEY_RE = re.compile(r"^(?P<ckpt>.+)_s(?P<seed>\d+)_c(?P<ids>.+)$")
+
+
 def landed_render_ids(listing: str, family: str) -> list[str]:
     """Every committed render identity visible in a ``modal volume ls`` listing, sorted.
 
@@ -112,16 +206,26 @@ def landed_render_ids(listing: str, family: str) -> list[str]:
       * ``ltx`` -> the UTC stamps, the historical behaviour, byte-for-byte.
       * ``h3``  -> the identity keys, so two renders differing ONLY in reference condition or frame
         count are two distinct ids rather than one.
+      * ``qwen_edit`` -> the identity keys, so two BAND members differing only in checkpoint are two
+        distinct ids rather than one. The two families' patterns are mutually exclusive by
+        construction (see ``_QWEN_EDIT_KEY_RE``): each family's parse returns ``[]`` against the
+        other's listing — visibly nothing, never a plausible partial list.
+
+    An unknown family raises via ``samples_subdir`` BEFORE any parse: a silent fall-through to the H3
+    regex would return ``[]`` for a directory of SUCCESSFUL renders, which reads to the watcher as
+    "nothing landed", never marks the step rendered, and re-books the full per-render estimate on
+    every poll (KNOWLEDGE.md 'watcher phantom-spend').
     """
     subdir = samples_subdir(family)  # validates the family first — unknown families raise here
     if family == "ltx":
         return sorted(set(_LTX_STAMP_RE.findall(listing or "")))
 
+    key_re = _QWEN_EDIT_KEY_RE if family == "qwen_edit" else _H3_KEY_RE
     found: set[str] = set()
     for raw in (listing or "").splitlines():
         # `modal volume ls` prints Volume-relative paths (`outputs/x/samples_h3/<key>`); take the
         # segment after the render root so a checkpoint name containing `/` can never leak through.
         name = raw.strip().rstrip("/").split(f"{subdir}/")[-1].split("/")[-1]
-        if name and _H3_KEY_RE.match(name):
+        if name and key_re.match(name):
             found.add(name)
     return sorted(found)

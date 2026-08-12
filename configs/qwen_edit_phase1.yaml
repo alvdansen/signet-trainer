@@ -1,0 +1,146 @@
+# embe — Qwen-Image-Edit-2511, signet-native qwen_edit family. PHASE 1, FOR REAL.
+#
+# Purpose: demonstrate the signet-trainer qwen_edit path end to end on the real embe dataset —
+# the same 19-row, two-reference-slot dataset the house method's first evidence row (embe /
+# embe-edit-qwen) was built from. The production run of this dataset was driven by ai-toolkit;
+# this config drives the same data through OUR trainer. That is the whole point of the exercise.
+#
+# The recipe below is copied from the production config that shipped with the dataset
+# (train_edit_5e5.yaml), NOT re-derived:
+#   linear/linear_alpha 42/42 · lr 5e-5 constant · adamw8bit · flowmatch · bf16
+#   batch 1 / grad_accum 1 · gradient_checkpointing · seed 42 · caption_dropout 0.05
+#   save_every == sample_every · NO ema_config in either production stage (EMA off)
+#
+# DELIBERATE DEVIATIONS FROM PRODUCTION, all three for proof-run economy, none to the recipe:
+#   1. max_steps 5000 — PHASE 1 of the production curriculum at full length. The production chain
+#      is priming 3000 -> p1 8000 -> p2 13000 -> p3 18000 -> p4 23000 CUMULATIVE, so phase 1 is
+#      5000 steps of its own. This is that, not a sample of it.
+#   2. subset_1 (7 rows) rather than the combined 19. Phase 1 of the curriculum.
+#   3. No priming stage — the priming dataset is a separate embe character set not shipped with
+#      this package, so this starts from the Qwen-Image-Edit-2511 base. The README says that is a
+#      supported entry point. It means the "primed-style-landed" gate does not apply: there is no
+#      primed style to land. Convergence is read as base-vs-LoRA divergence instead.
+#
+# Storage: everything this run writes is namespaced under qwen_edit_embe_proof / a dot-prefixed
+# precompute root. It creates no volume and overwrites no existing path.
+
+training_dims: [1024, 1024, 1]
+
+data:
+  preprocessed_data_root: /dataset/.precomputed_qwen_edit_embe_proof
+  metadata_path: /dataset/qwen_edit_embe_proof/metadata.jsonl  # ABSOLUTE — DATASET_DIR = Path("/dataset")
+  num_dataloader_workers: 2
+  batch_size: 1
+  resolution_buckets:
+    - 1024x1024x1
+
+lora:
+  # HARD LOCK. Production is 42/42 and a chain cannot survive a rank change — the published
+  # primer (alvdansen/illustration-1.0-qwen-image, already on this account's keyframe-edit-models
+  # volume) is a 14-leaf rank-42 adapter and nothing else can warm-start from it.
+  rank: 42
+  alpha: 42
+  dropout: 0.0
+  # target_modules omitted on purpose -> the family default 14-leaf regex (840 modules).
+
+training:
+  max_steps: 5000
+  learning_rate: 5.0e-5      # production value, constant, no scheduler games
+  weight_decay: 0.01
+  optimizer: adamw8bit
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  scheduler: constant
+  warmup_steps: 0
+  checkpoint_every: 250      # == validation.interval, the matched-cadence rule
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+model:
+  family: qwen_edit
+  # Diffusers SUBDIRECTORIES, written by modal/fns.py::download_qwen_edit_weights. Directories,
+  # not bare .safetensors, because from_single_file would need an explicit config_source: diffusers'
+  # infer_diffusers_model_type has no Qwen branch on the pinned version.
+  # The diffusers pipeline ROOT. Required on qwen_edit: the Qwen2.5-VL processor lives in
+  # <root>/processor/, not beside the text encoder, and it is also the config_source a
+  # single-file transformer load would need.
+  pipeline_root_id: qwen-image-edit-2511
+  model_id: qwen-image-edit-2511/transformer
+  text_encoder_id: qwen-image-edit-2511/text_encoder
+  vae_id: qwen-image-edit-2511/vae
+
+qwen_edit:
+  # TWO slots, not three. The embe dataset ships refs_a + refs_b and the production config declares
+  # exactly two control_path entries. A third slot would be blank-padded on every row and would buy
+  # 4096 packed rows of nothing per sample.
+  control_slots: 2
+  # POSITIONAL: refs_a -> ctrl_img_1, refs_b -> ctrl_img_2. Mirrors the production config's
+  # two control_path entries in the same order. Never inferred.
+  control_dirs: ["refs_a", "refs_b"]
+  blank_slots: []
+  blank_slot_fill: black
+  control_area_px: 1048576     # VAE_IMAGE_SIZE       — pipeline_qwenimage_edit_plus.py:67
+  condition_area_px: 147456    # CONDITION_IMAGE_SIZE — same file, :66 (VL channel, not the VAE)
+  prompt_tokens_estimate: 256
+  text_embed_dim: 3584         # asserted against txt_in at load; not trusted from here
+  rank_alpha_lock: 42
+  max_packed_rows: 0           # ceiling disabled — still unmeasured, and the banner says so
+  # 0.0, and this REPRODUCES production rather than departing from it.
+  #
+  # The production config (train_edit_5e5.yaml) sets caption_dropout_rate 0.05 AND
+  # cache_text_embeddings true. ai-toolkit's dropout is guarded at
+  # toolkit/dataloader_mixins.py:402:
+  #
+  #     if self.dataset_config.caption_dropout_rate > 0 and not short_caption \
+  #        and not self.dataset_config.cache_text_embeddings:
+  #
+  # `not cache_text_embeddings` is required, so with caching ON the branch never runs and the
+  # EFFECTIVE dropout is zero. token_dropout_rate is guarded identically at :417. Every proven
+  # chain therefore trained at dropout 0 despite the recipe naming 0.05.
+  #
+  # Setting 0.05 here would make our run differ from the runs that produced the evidence, in the
+  # direction of "more faithful to the written recipe" — which is exactly the trap the
+  # timestep_type finding already documented. Same call, same reason: reproduce measured
+  # behaviour, not nominal config. signet refuses the contradictory pair at config load rather
+  # than silently training at 0, which is how this surfaced.
+  caption_dropout_rate: 0.0
+  cache_text_embeddings: true
+  # content, not path: the control images ride the Qwen2.5-VL text embeddings on this arch, so a
+  # caption-keyed cache would serve a stale embedding after a control image changed. That is the
+  # method doc's SS7.5 trap, one layer deeper than the doc states it.
+  control_cache_key_mode: content
+
+offload:
+  blocks_to_swap: 0
+
+modal:
+  hourly_rate_usd: 1.64
+  # Sized from the MEASURED 250-step run rather than from the method doc's A6000 figure: that run
+  # loaded, quantized, injected and completed 250 steps well inside one hour on an A100-80GB. At
+  # 20x the steps, 8.0 h is a deliberately loose upper bound — the guardrail exists to stop a
+  # runaway, not to be a tight forecast, and a too-tight bound aborts a healthy long run.
+  cost_guardrail_usd: 40.0
+  est_hours: 8.0
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250
+  frame_count: 1               # REQUIRED — the shared default is 49, an LTX clip length
+  width: 1024
+  height: 1024
+  guidance_scale: 4.0
+  num_samples: 1
+  seed: 42
+  prompts:
+    # Verbatim from the production config's sample block, first entry.
+    - "Use the character shown in image 1 and image 2 as reference. Draw embe standing at a window in early morning, hair still tousled, drinking from a small ceramic mug. Style: warm risograph print with grainy texture, navy ink outlines, peach and pink palette."
+
+conditioning:
+  mode: none                   # qwen_edit conditioning IS the multi-slot control mechanism above
+
+seed: 42
+output_dir: outputs/qwen_edit_embe_phase1

@@ -28,7 +28,16 @@ _APP = _SRC / "app.py"
 
 #: The GPU image families a ``gpu=`` function may declare. Widen by ONE NAME when a new model family
 #: gets its own image; never add a per-function exemption.
-_KNOWN_GPU_IMAGES = ("gpu_image", "h3_gpu_image")
+#:
+#: Phase 11 widened it by exactly one, as designed: ``qwen_gpu_image`` — the Qwen-Image-Edit family
+#: (diffusers at ``QWEN_DIFFUSERS_SHA`` + transformers at ``QWEN_TRANSFORMERS_VERSION`` +
+#: ``optimum-quanto`` for the locked qfloat8 recipe). It is a THIRD image rather than a widening of
+#: ``h3_gpu_image`` because the two families pin DIFFERENT diffusers SHAs — h3's for
+#: ``MiniMaxH3Transformer3DModel``, qwen's for the ``QwenImageEditPlus`` surface every transcribed
+#: line citation in ``conditioning/qwen_edit_geometry.py`` / ``models/qwen_edit_loader.py`` /
+#: ``prep/qwen_edit_encode.py`` was measured against. One image cannot carry two SHAs, and
+#: re-pinning h3's would risk a working path for build convenience.
+_KNOWN_GPU_IMAGES = ("gpu_image", "h3_gpu_image", "qwen_gpu_image")
 
 # Each @app.function(...) decorator paired with its function name. The decorators contain no nested
 # parens (only {}/[] for volumes/secrets), so a non-greedy match to the first ')' is safe.
@@ -162,6 +171,89 @@ def cpu_image_on_a_gpu() -> str:
     ...
 '''
     assert _offenders(synthetic) == ["cpu_image_on_a_gpu"]
+
+
+def test_qwen_diffusers_pin_is_a_literal_40_hex_sha() -> None:
+    """Family #3 supply chain: ``diffusers`` is git-installed at its OWN literal pinned SHA.
+
+    The ``DIFFUSERS_SHA`` discipline applied a second time, and the ``@main`` ban re-asserted — but
+    the load-bearing assertion here is the LAST one: ``qwen_gpu_image`` must interpolate
+    ``QWEN_DIFFUSERS_SHA``, never h3's ``DIFFUSERS_SHA``. Each family pins its OWN constant, so
+    bumping one family's diffusers can never silently move the other's. That property is the entire
+    reason family #3 got a third image instead of widening h3's: every line-numbered Qwen citation in
+    ``conditioning/qwen_edit_geometry.py`` / ``models/qwen_edit_loader.py`` /
+    ``prep/qwen_edit_encode.py`` was measured against THIS SHA, and h3's was chosen for a different
+    model on a different day.
+    """
+    src = _APP.read_text(encoding="utf-8")
+
+    sha = re.search(r'^QWEN_DIFFUSERS_SHA = "([0-9a-f]{40})"$', src, re.MULTILINE)
+    assert sha, "QWEN_DIFFUSERS_SHA must be a literal 40-hex commit SHA assigned at module scope"
+
+    assert re.search(
+        r"diffusers @ git\+https://github\.com/huggingface/diffusers@\{QWEN_DIFFUSERS_SHA\}", src
+    ), (
+        "the qwen_gpu_image diffusers install must interpolate QWEN_DIFFUSERS_SHA — not a second "
+        "literal (which drifts) and NOT h3's DIFFUSERS_SHA (which would couple two families' "
+        "reproducibility to one bump)"
+    )
+
+
+def test_qwen_pins_are_literal_versions_not_ranges() -> None:
+    """``transformers`` and ``optimum-quanto`` are pinned EXACTLY on the qwen image, and why.
+
+    ``transformers`` owns ``Qwen2_5_VLProcessor`` — the object that turns the control images into
+    the vision tokens the model is conditioned on — so it is conditioning-critical for the same
+    reason ``Qwen3VLProcessor`` is on the H3 leg, and gets the same treatment.
+
+    ``optimum-quanto`` is pinned exactly for a sharper reason than reproducibility:
+    ``models/qwen_edit_loader.quantize_qwen_edit`` is WRITTEN AGAINST a known
+    ``include=``/``exclude=`` swap bug in release 0.2.4 and stays correct only by passing neither
+    filter. A range could resolve past the release that reasoning describes.
+    """
+    src = _APP.read_text(encoding="utf-8")
+
+    for const, pattern in (
+        ("QWEN_TRANSFORMERS_VERSION", r'^QWEN_TRANSFORMERS_VERSION = "[0-9][0-9A-Za-z.\-]*"$'),
+        ("QWEN_OPTIMUM_QUANTO_VERSION", r'^QWEN_OPTIMUM_QUANTO_VERSION = "[0-9][0-9A-Za-z.\-]*"$'),
+    ):
+        assert re.search(pattern, src, re.MULTILINE), (
+            f"{const} must be a literal version assigned at module scope — the same "
+            f"single-source-of-truth shape as QWEN_DIFFUSERS_SHA"
+        )
+
+    assert re.search(r"transformers==\{QWEN_TRANSFORMERS_VERSION\}", src), (
+        "qwen_gpu_image must pin transformers to QWEN_TRANSFORMERS_VERSION with `==`, interpolated "
+        "rather than restated"
+    )
+    assert re.search(r"optimum-quanto==\{QWEN_OPTIMUM_QUANTO_VERSION\}", src), (
+        "qwen_gpu_image must pin optimum-quanto to QWEN_OPTIMUM_QUANTO_VERSION with `==` — the "
+        "house recipe locks qfloat8 on both the transformer and the text encoder, so there is no "
+        "un-quantized fallback and no version this family can be indifferent about"
+    )
+    installs = [
+        line
+        for line in re.sub(r"#.*", "", src).splitlines()
+        if "optimum-quanto" in line
+    ]
+    assert installs, "the optimum-quanto install line vanished — the scan is broken, not the image"
+    assert not [line for line in installs if "optimum-quanto>=" in line], (
+        f"an `optimum-quanto>=` range survives in an install line ({installs})"
+    )
+
+
+def test_positive_control_qwen_image_is_accepted() -> None:
+    """A GPU function declaring the Qwen family image must NOT be flagged (family #3)."""
+    synthetic = '''
+@app.function(
+    gpu="A100-80GB",
+    image=qwen_gpu_image,
+    volumes={"/weights": weights_vol},
+)
+def qwen_stage() -> str:
+    ...
+'''
+    assert _offenders(synthetic) == []
 
 
 def test_positive_control_h3_image_is_accepted() -> None:

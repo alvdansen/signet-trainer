@@ -508,6 +508,22 @@ _FORWARD_SITE_REGISTRY: dict[tuple[str, str, str, str | None], tuple[str, str]] 
         _NOT_A_MODEL_FORWARD,
         "Qwen3VLProcessor.__call__ — tokenizer + image-processor config, no model weights.",
     ),
+    # ---- family #3 (qwen_edit) pre-encode: the SAME class, inherited as structure not as prose ----
+    # This block is the point of the registry. The H3 leg inherited D-10-DEF-10's SITE and not its
+    # RULE and paid for it again; family #3 arrives already classified, because the scan named these
+    # three the first time the suite ran after prep/qwen_edit_encode.py existed.
+    ("prep/qwen_edit_encode.py", "encode_qwen_edit_latents", "vae", "encode"): (
+        _GRAD_FREE_REQUIRED,
+        "AutoencoderKLQwenImage — the chokepoint every target and control image routes through.",
+    ),
+    ("prep/qwen_edit_encode.py", "encode_qwen_edit_text_conditions", "text_encoder", None): (
+        _GRAD_FREE_REQUIRED,
+        "the Qwen2.5-VL forward; its vision half runs too, so the retained graph would be larger.",
+    ),
+    ("prep/qwen_edit_encode.py", "encode_qwen_edit_text_conditions", "processor", None): (
+        _NOT_A_MODEL_FORWARD,
+        "Qwen2_5_VLProcessor.__call__ — tokenizer + image-processor, no model weights.",
+    ),
     ("prep/h3_vae_contract.py", "_contract_report", "vae", "encode"): (
         _GRAD_FREE_REQUIRED,
         "the probe loop's production-form pass; it asserts its own result is graph-free.",
@@ -545,6 +561,14 @@ _FORWARD_SITE_REGISTRY: dict[tuple[str, str, str, str | None], tuple[str, str]] 
         _NOT_A_MODEL_FORWARD,
         "likewise — ltx-core's LatentState constructor, not a forward.",
     ),
+    ("inference/qwen_edit_layout.py", "of", "cls", None): (
+        _NOT_A_MODEL_FORWARD,
+        "CheckpointBand.of's `cls(...)` — a frozen dataclass of checkpoint NAMES being constructed "
+        "by its own classmethod factory. No weights, no tensors; qwen_edit_layout is stdlib-only "
+        "and cannot import torch. Registered rather than rewritten to `CheckpointBand(...)`: the "
+        "scan's `cls` heuristic is doing its job, and editing correct code to hide from a detector "
+        "is how the population stops being the prefix.",
+    ),
     # ---- training: a graph is REQUIRED here, and saying so is what defines the boundary -----------
     ("modal/fns.py", "_h3_step", "model_", None): (
         _TRAINING_STEP,
@@ -553,6 +577,12 @@ _FORWARD_SITE_REGISTRY: dict[tuple[str, str, str, str | None], tuple[str, str]] 
     ("train/step.py", "training_step", "model", None): (
         _TRAINING_STEP,
         "the LTX training forward — same reason.",
+    ),
+    ("train/qwen_edit_step.py", "_qwen_edit_step", "model_", None): (
+        _TRAINING_STEP,
+        "the qwen_edit training forward — it MUST build a graph; loop.py:353 calls backward() on "
+        "what it returns. Deliberately BARE (no autocast, QWEN_EDIT_AUTOCAST=False) and deliberately "
+        "not grad-free: the only no_grad in this family's step path is the caller's, if any.",
     ),
     ("train/loop.py", "train_loop", "step_fn", None): (
         _TRAINING_STEP,

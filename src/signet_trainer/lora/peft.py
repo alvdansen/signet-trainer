@@ -525,40 +525,149 @@ def load_adapter_into(
     adapter_file = adapter_dir / ADAPTER_FILENAME
     weights = load_file(str(adapter_file))
     if not weights:
-        # Raise (1): a zeroed/empty adapter must NOT silently continue (mirror T-03-41).
+        # Raise (1), from main: a zeroed/empty adapter must NOT silently continue (T-03-41).
         raise RuntimeError(
             f"Adapter load aborted: empty adapter state_dict in {adapter_file} -- zero tensors "
             f"to apply, so the model would keep its zero-init (identity) adapter."
         )
-    result = set_peft_model_state_dict(model, weights, adapter_name=adapter_name)
-    unexpected = list(getattr(result, "unexpected_keys", None) or [])
-    if unexpected:
-        # Raise (2): these file tensors were NOT applied anywhere on the model.
-        raise RuntimeError(
-            f"Adapter load aborted: {len(unexpected)} of {len(weights)} tensors in "
-            f"{adapter_file} matched NO parameter of adapter {adapter_name!r} (examples: "
-            f"{unexpected[:3]}). The saved adapter's targets/key layout do not line up with this "
-            f"model -- check lora.target_modules parity across rounds and the model family."
-        )
-    # Raise (3): full-coverage check. The model's lora tensors for THIS adapter, normalized back to
-    # the on-disk key form (PEFT strips the ".{adapter_name}." component on save), must all have
-    # been supplied by the file — a cold (still zero-init) lora_B is a silent half-warm start.
-    marker = f".{adapter_name}."  # dot-bounded component, same doctrine as stack_frozen_adapter
-    cold = sorted(
-        name.replace(marker, ".", 1)
-        for name, _ in model.named_parameters()
-        if ".lora_" in name and marker in name
-        and name.replace(marker, ".", 1) not in weights
-        and name not in weights  # tolerate a file that kept the adapter component in its keys
+    return load_adapter_state_into(
+        model, weights, adapter_name=adapter_name, what=str(adapter_file)
     )
-    if cold:
-        raise RuntimeError(
-            f"Adapter load aborted: {len(cold)} lora tensor(s) of adapter {adapter_name!r} were "
-            f"NOT in {adapter_file} and stayed at their init (examples: {cold[:3]}). A partially "
-            f"warm-started adapter is silently half-cold -- the saved target set must cover every "
-            f"injected target."
+
+
+def is_quanto_quantized(model: nn.Module) -> bool:
+    """Does this model carry quanto ``QModuleMixin`` layers? Decides which load path is usable."""
+    return any(
+        type(module).__name__.startswith("Q")
+        and hasattr(module, "weight")
+        and hasattr(type(module), "_load_from_state_dict")
+        and "quanto" in type(module).__module__
+        for module in model.modules()
+    )
+
+
+def load_adapter_state_into(
+    model: nn.Module,
+    adapter_weights: dict[str, Any],
+    *,
+    adapter_name: str = "default",
+    what: str = "adapter",
+) -> Any:
+    """Assign a PEFT adapter state dict into ``model``, by whichever path the model can survive.
+
+    ⛔ ``set_peft_model_state_dict`` IS UNUSABLE ON A QUANTIZED MODEL, and this is the fourth
+    instance of the house pattern *the flag is not the behaviour*. It ends in
+    ``model.load_state_dict(peft_state_dict, strict=False)``, and ``load_state_dict`` walks EVERY
+    submodule — not only the ones the incoming dict names. On a quanto-quantized transformer the
+    base Linears are ``QModuleMixin``, whose ``_load_from_state_dict`` does an UNCONDITIONAL
+    ``state_dict.pop(prefix + name)`` for its own ``_data`` internals. A LoRA adapter dict carries no
+    base weights, so the pop raises — and ``strict=False`` does not save you, because quanto's
+    override never consults it::
+
+        KeyError: 'base_model.model.time_text_embed.timestep_embedder.linear_1.weight._data'
+
+    That exact line has now killed a run TWICE: once as the crash-resume that cost 4500 steps of
+    phase 1 (fixed in ``train/checkpoint.py`` at f8f2815), and once as the §8 band render, which got
+    its base column out and died on the first band member. The second time is why this lives here
+    rather than inline in ``resume()``: it is a property of loading an adapter onto a quantized
+    model, not a property of resuming, and every caller of :func:`load_adapter_into` needs it.
+
+    ``CheckpointManager.resume`` now DELEGATES here rather than carrying its own copy. It briefly
+    did carry one — the resume fix landed first and the render walked into the identical failure
+    through :func:`load_adapter_into` — which is the whole argument for one implementation: a
+    duplicated money-critical routine is fixed in one place and stays broken in the other.
+
+    ⚠ THIS FUNCTION IS NOW SOURCE-TEXT ASSERTED. ``tests/test_checkpoint_resume.py`` greps THIS FILE
+    for "HARD LOCK across a chain" and "PARTIAL adapter is worse than refusing", because a refusal
+    that stops explaining WHY has lost the part that makes it actionable. Reword them and that test
+    fails on purpose; it is not being brittle about formatting, it is holding the reasoning in place.
+
+    THE SAFE PATH. The adapter parameters are NOT quantized — quantization runs on the un-wrapped
+    transformer BEFORE ``inject_lora``, so quanto converts the base Linears and the LoRA tensors are
+    added afterwards as ordinary parameters. They can therefore be assigned DIRECTLY, which never
+    visits a quantized module. The only transform PEFT applies to a saved key is inserting the
+    adapter name before the final component; verified against the real 1680-tensor checkpoint, all
+    1680 keys map. Non-quantized models keep the original ``set_peft_model_state_dict`` path
+    untouched.
+
+    Two refusals rather than a best-effort load:
+
+      * a SHAPE MISMATCH names the rank lock — ``rank == alpha`` is a HARD LOCK across a chain
+        precisely because changing either re-shapes ``lora_A`` / ``lora_B``;
+      * a PARTIAL match refuses outright. Continuing from a half-restored adapter at a plausible
+        loss, or rendering a band column from one, is the worst available outcome: nothing looks
+        wrong.
+    """
+    if not is_quanto_quantized(model):
+        result = set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
+        # Raises (2) and (3) come from main, which hardened load_adapter_into independently while
+        # this branch was replacing its body. They are kept rather than picked between: main's are
+        # about COVERAGE (did every file tensor land, did every injected tensor get supplied), this
+        # branch's are about the quantized PATH. Both failures are silent — a half-applied adapter
+        # renders the untouched base under an adapter label — so each side keeps its guarantee.
+        unexpected = list(getattr(result, "unexpected_keys", None) or [])
+        if unexpected:
+            raise RuntimeError(
+                f"Adapter load aborted ({what}): {len(unexpected)} of {len(adapter_weights)} "
+                f"tensors matched NO parameter of adapter {adapter_name!r} (examples: "
+                f"{unexpected[:3]}). The saved adapter's targets/key layout do not line up with "
+                f"this model -- check lora.target_modules parity across rounds and the family."
+            )
+        marker = f".{adapter_name}."  # dot-bounded component, the stack_frozen_adapter doctrine
+        cold = sorted(
+            name.replace(marker, ".", 1)
+            for name, _ in model.named_parameters()
+            if ".lora_" in name
+            and marker in name
+            and name.replace(marker, ".", 1) not in adapter_weights
+            and name not in adapter_weights
         )
-    return result
+        if cold:
+            # Wording is main's, deliberately verbatim: tests/test_lora_roundtrip.py matches on
+            # "NOT in .* and stayed at their init". Rewording it broke their test while the
+            # behaviour was identical — the message IS the contract here, not just prose.
+            raise RuntimeError(
+                f"Adapter load aborted: {len(cold)} lora tensor(s) of adapter {adapter_name!r} "
+                f"were NOT in {what} and stayed at their init (examples: {cold[:3]}). A partially "
+                f"warm-started adapter is silently half-cold -- the saved target set must cover "
+                f"every injected target."
+            )
+        return result
+
+    live = dict(model.named_parameters())
+    missing: list[str] = []
+    loaded = 0
+    with torch.no_grad():
+        for key, tensor in adapter_weights.items():
+            target = live.get(key)
+            if target is None:
+                head, sep, tail = key.rpartition(".")
+                target = live.get(f"{head}.{adapter_name}{sep}{tail}") if sep else None
+            if target is None:
+                missing.append(key)
+                continue
+            if tuple(target.shape) != tuple(tensor.shape):
+                raise RuntimeError(
+                    f"Adapter load aborted ({what}): {key} is {tuple(tensor.shape)} on disk but "
+                    f"{tuple(target.shape)} in the live model. A rank/alpha change between rounds "
+                    f"re-shapes lora_A/lora_B — that is why rank == alpha is a HARD LOCK across a "
+                    f"chain."
+                )
+            target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+            loaded += 1
+    if missing or loaded != len(adapter_weights):
+        raise RuntimeError(
+            f"Adapter load aborted ({what}): {loaded}/{len(adapter_weights)} adapter tensor(s) "
+            f"matched a live parameter; {len(missing)} unmatched, first few: {missing[:4]}. Loading "
+            f"a PARTIAL adapter is worse than refusing — the caller would continue from a "
+            f"half-restored state at a plausible loss."
+        )
+    banner = (
+        f"[lora] quantized adapter load ({what}): {loaded}/{len(adapter_weights)} tensors assigned "
+        f"directly — set_peft_model_state_dict is unusable on a quanto model (LANDMINE #1b)."
+    )
+    print(banner)
+    return banner
 
 
 # --------------------------------------------------------------------------------------------------

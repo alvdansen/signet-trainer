@@ -1,0 +1,175 @@
+# embe — Qwen-Image-Edit-2511, qwen_edit family. THE §8 RENDER of the phase-1 band.
+#
+# Purpose: read CONVERGENCE off the phase-1 run the way the house method specifies it — as
+# base-vs-LoRA DIVERGENCE, in pixels, not as a loss curve. Phase 1 has no primer (see
+# qwen_edit_phase1.yaml, deviation 3), so "primed-style-landed" does not apply and divergence is
+# the only convergence gate there is. The loss series across the band is 0.0194 / 0.0670 / 0.0038 /
+# 0.0167 — non-monotonic and unreadable, which is precisely why §8 reads samples instead.
+#
+# This config drives `sample` (mode routed by model.family). It TRAINS NOTHING. Everything in the
+# training/lora/model blocks below is carried verbatim from qwen_edit_phase1.yaml so the render is
+# assembled from the same recipe the adapter was trained under — the rank/alpha 42/42 lock in
+# particular, which is what the adapter's 1680 tensors were written at.
+#
+# ── WHAT "HELD-OUT" MEANS ON THIS DATASET (read before trusting the grid) ────────────────────────
+# The embe corpus is a CHARACTER adapter: the two control slots carry a character REFERENCE PAIR,
+# and the corpus reuses a small pool of reference images across its rows (refs_a holds ~3 distinct
+# files across 7 rows; refs_b ~4). The references are meant to be reused — that is what a character
+# sheet is for — so they are not the axis that can be held out.
+#
+# The held-out axis here is the SCENE. Both probes below pair a reference set the run has seen with
+# a scene prompt that appears NOWHERE in metadata.jsonl. probe_window's scene is the production
+# config's own validation prompt, which is a novel scene by the same construction.
+#
+# This is an interpretation of §8 for a character corpus, and it is written here rather than left
+# implicit: a grid labelled "held-out" that reused a training SCENE would answer a question nobody
+# asked. If the intent is a reference pair the run has never seen, that pair has to be supplied —
+# there is no unseen reference on the dataset Volume to reach for.
+#
+# ── GRID SIZE ────────────────────────────────────────────────────────────────────────────────────
+#   columns = (1 base + 4 band members) x 2 §8 prompt modes = 10
+#             (the base column is the SAME model under disable_adapter() — never a second load)
+#   rows    = 2 held-out probes
+#   cells   = 10 x 2 = 20 renders at 1024x1024, 30 steps each = 600 denoise steps
+# Counted the way `[signet-cost] render batch` counts it — the config and the cost line an operator
+# approves from must not describe the same grid two different ways.
+# Cells already on the Volume are resumed rather than re-rendered, so a re-dispatch after a
+# timeout continues this grid instead of restarting it.
+
+training_dims: [1024, 1024, 1]
+
+data:
+  preprocessed_data_root: /dataset/.precomputed_qwen_edit_embe_proof
+  metadata_path: /dataset/qwen_edit_embe_proof/metadata.jsonl
+  num_dataloader_workers: 2
+  batch_size: 1
+  resolution_buckets:
+    - 1024x1024x1
+
+lora:
+  # The adapter being LOADED was written at 42/42. Not a choice here — a mismatch would refuse at
+  # load, and PEFT scale alpha/rank IS §8's LoRA strength 1.0.
+  rank: 42
+  alpha: 42
+  dropout: 0.0
+
+training:
+  max_steps: 5000
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  optimizer: adamw8bit
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  scheduler: constant
+  warmup_steps: 0
+  checkpoint_every: 250
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+model:
+  family: qwen_edit
+  pipeline_root_id: qwen-image-edit-2511
+  model_id: qwen-image-edit-2511/transformer
+  text_encoder_id: qwen-image-edit-2511/text_encoder
+  vae_id: qwen-image-edit-2511/vae
+
+qwen_edit:
+  control_slots: 2
+  control_dirs: ["refs_a", "refs_b"]
+  blank_slots: []
+  blank_slot_fill: black
+  control_area_px: 1048576
+  condition_area_px: 147456
+  prompt_tokens_estimate: 256
+  text_embed_dim: 3584
+  rank_alpha_lock: 42
+  max_packed_rows: 0
+  caption_dropout_rate: 0.0
+  cache_text_embeddings: true
+  control_cache_key_mode: content
+
+  # ── the §8 render request ──────────────────────────────────────────────────────────────────────
+  # Band members are bare directory NAMES under output_dir, in step order, exactly as they exist on
+  # signe-trainer-checkpoints (verified 2026-08-10 by `modal volume ls`, after the run completed).
+  # Four members rather than the method's minimum three: the read is a TRAJECTORY — whether
+  # divergence from base grows with training — and three points barely describe a curve.
+  #
+  # SPAN, not prefix. The run committed 20 checkpoints; these four are spread 250 -> 5000 rather
+  # than taken consecutively. An earlier draft of this file banded 250/500/750/1000 because that
+  # was all that existed while phase 1 was still running — every one of those sits inside the first
+  # fifth of the run, so the grid would have shown four near-identical columns and answered nothing
+  # about where the adapter actually arrives. Same cell count, same price, incomparably better read.
+  render_checkpoint_band:
+    - checkpoint-step-00250-loss-0.0194
+    - checkpoint-step-01000-loss-0.0167
+    - checkpoint-step-02500-loss-0.0313
+    - checkpoint-step-05000-loss-0.0539
+
+  # Images are dataset-Volume-relative and POSITIONAL: image 0 -> slot 0 (ctrl_img_1), image 1 ->
+  # slot 1 (ctrl_img_2), mirroring control_dirs' [refs_a, refs_b] order.
+  #
+  # The A/B pair is the measurement, and the ONLY difference between them is whether the subject is
+  # NAMED. a_style withholds "embe" so the adapter has to carry the character from the reference
+  # images; b_content names her, which is the condition under which tracing is cheapest. Everything
+  # else in the two strings is identical, deliberately — any other difference would land in the
+  # delta and be read as an adapter property.
+  render_inputs:
+    - id: probe_window
+      label: "window / morning (refs from img_3711)"
+      images:
+        - qwen_edit_embe_proof/refs_a/img_3711.png
+        - qwen_edit_embe_proof/refs_b/img_3711.png
+      prompts:
+        a_style: "Use the character shown in image 1 and image 2 as reference. Draw the character standing at a window in early morning, hair still tousled, drinking from a small ceramic mug. Style: warm risograph print with grainy texture, navy ink outlines, peach and pink palette."
+        b_content: "Use the character shown in image 1 and image 2 as reference. Draw embe standing at a window in early morning, hair still tousled, drinking from a small ceramic mug. Style: warm risograph print with grainy texture, navy ink outlines, peach and pink palette."
+
+    - id: probe_stool
+      label: "stool / sketching (refs from img_3465)"
+      images:
+        - qwen_edit_embe_proof/refs_a/img_3465.png
+        - qwen_edit_embe_proof/refs_b/img_3465.png
+      prompts:
+        a_style: "Use the character shown in image 1 and image 2 as reference. Draw the character seated on a low wooden stool, leaning over a sketchbook balanced on one knee, antlers tilted forward, a mug of tea cooling on the floor beside her. Plain off-white background. Style: clean lineart illustration, flat color."
+        b_content: "Use the character shown in image 1 and image 2 as reference. Draw embe seated on a low wooden stool, leaning over a sketchbook balanced on one knee, antlers tilted forward, a mug of tea cooling on the floor beside her. Plain off-white background. Style: clean lineart illustration, flat color."
+
+offload:
+  blocks_to_swap: 0
+
+modal:
+  hourly_rate_usd: 1.64
+  # A RENDER, not the 8.0h training shell. One ~40.9 GiB transformer load + Qwen2.5-VL + VAE, then
+  # 20 cells at 30 steps. Sized with headroom rather than tightly: est_hours also bounds the metered
+  # container (timeout = est_hours * timeout_margin), and a driver-level hang inside a tight bound
+  # still costs the full bound. The guardrail is pulled in from the training config's 40.0 — a
+  # render that somehow reached even half of that has failed in a way nobody wants running.
+  cost_guardrail_usd: 10.0
+  est_hours: 1.5
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  interval: 250
+  frame_count: 1
+  width: 1024
+  height: 1024
+  # NOT read by the render — the §8 settings are locked in QWEN_EDIT_RENDER_RECIPE. Set to the
+  # recipe's values because a config that CONTRADICTS them is refused at $0: the gallery banner
+  # would otherwise print a number describing a render nobody performed.
+  guidance_scale: 4.0
+  num_inference_steps: 30
+  num_samples: 1
+  seed: 42
+  # Deliberately NOT this grid's prompt source — §8's A/B pair travels with its input above, because
+  # a flat list cannot say which entry is A, which is B, or which input either belongs to. Left as
+  # the phase-1 entry so the two configs stay diffable.
+  prompts:
+    - "Use the character shown in image 1 and image 2 as reference. Draw embe standing at a window in early morning, hair still tousled, drinking from a small ceramic mug. Style: warm risograph print with grainy texture, navy ink outlines, peach and pink palette."
+
+conditioning:
+  mode: none
+
+seed: 42
+output_dir: outputs/qwen_edit_embe_phase1

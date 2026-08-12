@@ -201,18 +201,44 @@ class CheckpointManager:
         """
         latest = self.find_latest()
         if latest is None:
-            logger.info("No checkpoint in %s — cold start at step 0.", self.output_dir)
+            # PRINTED, not logger.info'd. "Did this run CONTINUE or RESTART?" is the single most
+            # consequential line in a long run's log, and it was invisible: Modal shows stdout at
+            # the default WARNING level, so an INFO-level report leaves no trace in a metered run.
+            # A silent restart burns the whole budget from step 0 and looks exactly like progress.
+            # Same reasoning as the qfloat8 report — a load-bearing event needs an artifact, and the
+            # artifact carries NUMBERS so the wrong answer is visible rather than merely absent.
+            banner = (
+                f"[checkpoint] COLD START at step 0 — no complete checkpoint found in "
+                f"{self.output_dir}. If a prior run should have left one, STOP: this run is about "
+                f"to retrain from scratch, not continue."
+            )
+            print(banner)
+            logger.info(banner)
             return 0
 
         # ── LANDMINE #1: re-inject the adapter weights resume() historically did NOT restore ──────
-        from peft import set_peft_model_state_dict  # noqa: PLC0415 — function-local (import-light)
+        # ``load_adapter_state_into`` rather than ``set_peft_model_state_dict`` directly — it picks
+        # the path this model can survive (see LANDMINE #1b below) and owns the peft import.
         from safetensors.torch import load_file  # noqa: PLC0415
+
+        from signet_trainer.lora.peft import load_adapter_state_into  # noqa: PLC0415
 
         adapter_weights = load_file(str(latest / ADAPTER_FILENAME))
         if not adapter_weights:
             # A zeroed/corrupted adapter must NOT silently continue (threat T-03-41).
             raise RuntimeError(f"Resume aborted: empty adapter state_dict in {latest}")
-        set_peft_model_state_dict(model, adapter_weights, adapter_name="default")
+
+        # ── LANDMINE #1b: set_peft_model_state_dict CANNOT be used on a QUANTIZED model ──────────
+        #
+        # Delegated to ``lora/peft.load_adapter_state_into``, which carries the full reasoning, the
+        # direct-assignment path and both refusals. It lives there rather than here because the
+        # property belongs to loading an adapter onto a QUANTIZED MODEL, not to resuming — and this
+        # file learned that the expensive way twice over. The first time it cost a 5000-step run
+        # (phase 1 interrupted at step 500; every one of Modal's ten retries died on
+        # ``KeyError: '...timestep_embedder.linear_1.weight._data'``). The second time the fix was
+        # here and ONLY here, so the §8 band render walked into the identical failure through
+        # ``load_adapter_into``. One implementation, one place to fix it.
+        load_adapter_state_into(model, adapter_weights, adapter_name="default", what=str(latest))
 
         # ── restore optimizer / scheduler / step / RNG from training_state.pt ────────────────────
         state = torch.load(
@@ -228,5 +254,10 @@ class CheckpointManager:
             torch.cuda.set_rng_state(state["rng_torch_cuda"])
 
         step = int(state["step"])
-        logger.info("Resumed from %s at step %d (adapter re-injected).", latest.name, step)
+        banner = (
+            f"[checkpoint] RESUMED from {latest.name} at step {step} — adapter re-injected, "
+            f"optimizer/scheduler/RNG restored. Training CONTINUES from {step}, it does not restart."
+        )
+        print(banner)
+        logger.info(banner)
         return step

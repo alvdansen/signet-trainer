@@ -266,6 +266,506 @@ def _h3_encode_params(cfg: object) -> dict[str, object] | None:
     }
 
 
+#: The signet-side modules each ``qwen_edit`` stage imports Modal-side, checked LOCALLY before the
+#: dispatch so a gap costs $0 instead of a container boot. Mirrors ``modal/fns._qwen_edit_require_
+#: backend``, which re-checks the SAME names in-container for the reason ``modal/app.py``'s
+#: ``download_image`` INVARIANT banner states in one sentence: a passing local gate proves nothing
+#: about the container's site-packages. The two are cheap and independent, and neither replaces the
+#: other.
+_QWEN_EDIT_STAGE_MODULES: dict[str, tuple[str, ...]] = {
+    "preprocess": (
+        "signet_trainer.models.qwen_edit_loader",
+        "signet_trainer.prep.qwen_edit_encode",
+    ),
+    "train": (
+        "signet_trainer.models.qwen_edit_loader",
+        "signet_trainer.train.qwen_edit_step",
+        "signet_trainer.train.family_hooks",
+        # The 2x2 pack. The cache stores ``[C, F, H, W]`` latents and ``QwenEditStrategy`` REFUSES a
+        # latent-form payload when ``pack_fn`` is None — deliberately, rather than transcribing the
+        # pack a second time. Named here so the gap is a pre-dispatch abort, not a strategy raise
+        # after the transformer is resident.
+        "signet_trainer.conditioning.qwen_edit_packing",
+    ),
+    "sample": (
+        "signet_trainer.inference.qwen_edit_layout",
+        "signet_trainer.models.qwen_edit_loader",
+        # LANDED (e132b30). Still named here, because the readiness list is a contract about what
+        # this stage IMPORTS, not a to-do list — it is what turns a future deletion or rename into
+        # a $0 abort instead of a ModuleNotFoundError inside a metered container. The render
+        # assembles a ``QwenImageEditPlusPipeline`` whose scheduler carries the §8 STATIC
+        # reparameterisation
+        # value, and that construction lives OUTSIDE ``inference/`` because
+        # ``tests/test_no_wan_params.py``'s ``_WAN_TOKENS`` bans the bare token from every ``*.py``
+        # under that directory — a guard written for LTX paths whose directory-wide scope now also
+        # covers a family where that setting is mandatory at a different value. Narrowing the guard
+        # is a RULING on a shipped money-safe check; putting the builder in ``models/`` is the
+        # reversible side of it and costs nothing. Until the module lands, a ``--mode sample``
+        # dispatch on this family aborts HERE, at $0, instead of after a 40.9 GiB load.
+        "signet_trainer.models.qwen_edit_pipeline",
+    ),
+}
+
+
+def _qwen_edit_stage_readiness(mode: str) -> None:
+    """Refuse pre-dispatch when a module the ``qwen_edit`` stage imports has not landed. Costs $0.
+
+    Uses ``importlib.util.find_spec`` rather than a real import ON PURPOSE: it answers "does this
+    module exist?" WITHOUT executing it, so a module whose body legitimately needs a container-only
+    dependency (torch on CUDA, diffusers at the pinned SHA, ``optimum.quanto``) cannot produce a
+    FALSE refusal here on a laptop. The signet convention already forbids that shape — every heavy
+    import in ``models/qwen_edit_loader.py`` / ``prep/qwen_edit_encode.py`` is function-local for
+    exactly this reason — but a readiness check that depends on everybody keeping a convention is a
+    check that eventually reports the wrong answer.
+
+    Called AFTER ``_require_approval`` and BEFORE ``.spawn(``, the same position and for the same
+    reason as ``_h3_encode_params``: a named abort at this point still costs $0 (``.spawn()`` never
+    fires) but it tells the operator exactly what to land.
+    """
+    import importlib.util  # noqa: PLC0415 — local; nothing else in this module needs importlib
+
+    missing = [
+        name
+        for name in _QWEN_EDIT_STAGE_MODULES[mode]
+        if importlib.util.find_spec(name) is None
+    ]
+    if missing:
+        raise SystemExit(
+            f"[signet-entrypoint] the qwen_edit {mode!r} stage imports {missing}, which do not "
+            f"exist in this tree. Family #3 landed as several independent slices and the Modal "
+            f"wiring is the one that spends money, so an unlanded module aborts HERE — after the "
+            f"approval pause, before any dispatch, at $0 — rather than as a ModuleNotFoundError "
+            f"inside a metered container. Land the module(s) named above, then re-run this exact "
+            f"command; nothing in the Modal layer needs to change."
+        )
+
+
+#: The two ``qwen_edit`` config fields a RENDER needs and the schema does not carry yet. Named once,
+#: here, because three places must spell them identically — the gap message (which tells the operator
+#: what to add), the render-batch cost note (which sizes the grid from them) and
+#: ``modal/fns.py::qwen_edit_sample`` (which reads them in-container). A test cross-checks that the
+#: Modal stage names the same two strings: a rename that missed one would produce a config the
+#: entrypoint accepts and the container refuses, which is the burned gate this whole layer avoids.
+#:
+#: ⚠ There is deliberately NO field here for the §8 inference settings (steps / true_cfg / CFGNorm /
+#: the static scheduler reparameterisation / LoRA strength / the negative prompt). Those are LOCKED
+#: in ``models/qwen_edit_pipeline.QWEN_EDIT_RENDER_RECIPE`` — recipe terms in the same sense that
+#: ``quantize_qwen_edit``'s qfloat8 is one — so the render reads them from there, not from the
+#: config. What the config CAN do is contradict them, and gap (5) below refuses exactly that.
+_QWEN_EDIT_BAND_FIELD = "render_checkpoint_band"
+_QWEN_EDIT_INPUTS_FIELD = "render_inputs"
+
+
+def _qwen_edit_render_request(cfg: object) -> dict[str, object]:
+    """The DECLARED render request, read tolerantly so this works before AND after the fields land.
+
+    ``getattr(..., default)`` rather than attribute access — the idiom the ``control_dirs`` gap
+    already uses below. ``SignetConfig`` is ``extra="forbid"`` and these four fields do not exist on
+    ``QwenEditConfig`` today, so a plain read would raise ``AttributeError`` instead of producing
+    the actionable refusal that names them. The day they land as real fields every caller here
+    starts seeing real values and NOTHING in this file changes, which is the property that makes a
+    declared gap cheaper than a workaround.
+    """
+    qwen_edit = cfg.qwen_edit
+    return {
+        "band": tuple(getattr(qwen_edit, _QWEN_EDIT_BAND_FIELD, ()) or ()),
+        "inputs": tuple(getattr(qwen_edit, _QWEN_EDIT_INPUTS_FIELD, ()) or ()),
+    }
+
+
+def _qwen_edit_render_batch_note(cfg: object) -> str:
+    """Size the render grid from the config so the cost banner prints WORK, not just an estimate.
+
+    ``cfg.modal.est_hours`` is a declared number — there is no Modal price API and no steps/second
+    figure has been measured for Qwen-Image-Edit on any card in this program — and for a training
+    run that is genuinely all there is. For a RENDER it is not: the work is fully determined before
+    dispatch (``2 prompt modes x (1 base + band size) x held-out inputs`` images at the recipe's
+    step count each), so the counts are arithmetic and the per-image budget the declared estimate
+    implies is a real quotient. "8 h" cannot be sanity-checked by eye; "8 h / 12 images = 2400 s per
+    image" can — and a band that quietly tripled the work still prints the same ``est_hours``.
+
+    The step count comes from ``QWEN_EDIT_RENDER_RECIPE``, not from ``validation.num_inference_steps``,
+    because that is what the render actually uses; pricing the batch off a field the sampler does not
+    read would be a cost line for a render nobody performs. Gap (5) refuses the case where the two
+    disagree, so the operator is never left comparing them by hand.
+
+    The guardrail's BASIS is deliberately unchanged: this line is printed BESIDE
+    ``format_cost_line``, never in place of it. Deriving hours from these counts would need a
+    seconds-per-denoise-step figure nobody has measured, and inventing one to feed a money gate is
+    the opposite of what the gate is for.
+
+    Prints honestly when the grid cannot be sized — the missing declarations are the same ones
+    ``_qwen_edit_config_gaps`` refuses on after the approval pause, so the operator sees the shape
+    of the problem at the cost line and its remedy at the refusal.
+    """
+    from signet_trainer.inference.qwen_edit_layout import (  # noqa: PLC0415
+        QWEN_EDIT_PROMPT_MODES,
+    )
+    from signet_trainer.modal.cost import (  # noqa: PLC0415
+        format_render_batch_line,
+        render_batch_estimate,
+    )
+    from signet_trainer.models.qwen_edit_pipeline import (  # noqa: PLC0415
+        QWEN_EDIT_RENDER_RECIPE,
+    )
+
+    request = _qwen_edit_render_request(cfg)
+    band, inputs = request["band"], request["inputs"]
+    modes = len(QWEN_EDIT_PROMPT_MODES)
+    steps = int(QWEN_EDIT_RENDER_RECIPE.steps)
+    if not band or not inputs:
+        return (
+            f"[signet-cost] render batch: NOT SIZEABLE — {modes} prompt mode(s) and {steps} denoise "
+            f"step(s) per image are known, but the checkpoint band ({len(band)} member(s) declared) "
+            f"and the held-out input set ({len(inputs)} declared) are what multiply them. Both are "
+            "DECLARED GAPS; the refusal after the approval pause names the fields "
+            f"(qwen_edit.{_QWEN_EDIT_BAND_FIELD} / qwen_edit.{_QWEN_EDIT_INPUTS_FIELD}). The "
+            f"guardrail above is priced on the declared cfg.modal.est_hours="
+            f"{cfg.modal.est_hours:g}, unchanged."
+        )
+    return format_render_batch_line(
+        render_batch_estimate(
+            band_members=len(band),
+            prompt_modes=modes,
+            held_out_inputs=len(inputs),
+            steps_per_image=steps,
+            est_hours=float(cfg.modal.est_hours),
+        )
+    )
+
+
+def _qwen_edit_config_gaps(cfg: object, *, mode: str) -> list[str]:
+    """Every DECLARED gap between a validated ``family: qwen_edit`` config and what the stage needs.
+
+    A config that loads is not the same as a config that can drive a stage, and the difference is
+    worth naming rather than discovering inside a paid container. Each entry is one sentence saying
+    what is missing, why the stage needs it, and what would land it.
+
+    Five gaps exist today — two shared with the encode legs, three that only ``sample`` can hit —
+    and every one is a real finding about the SCHEMA, not about this file. Each names the field that
+    would land it, so the check goes green on a schema edit with no change here.
+
+    **(1) ``config_source`` for a single-file ``model_id`` — every mode.** The shipped configs now
+    use the DIRECTORY form (``qwen-image-edit-2511/transformer``), which sidesteps this gap
+    entirely. It still fires for a genuinely single-file ``model_id``, and
+    ``models/qwen_edit_loader.load_qwen_edit_transformer`` documents that ``config_source`` is
+    REQUIRED on that path: ``from_single_file`` with no ``config=`` calls ``fetch_diffusers_config``
+    -> ``infer_diffusers_model_type``, which has **no Qwen branch at all** on the pinned diffusers and
+    falls through to ``model_type = "v1"``, whose default is
+    ``stable-diffusion-v1-5/stable-diffusion-v1-5``. diffusers would then reach the HUB for a Stable
+    Diffusion v1.5 ``transformer/`` config from inside a metered container. ai-toolkit works around
+    it by hard-coding the hub id ``"Qwen/Qwen-Image"``; signet takes the value from the caller so an
+    air-gapped Volume-local directory is expressible and ``local_files_only`` can stay on.
+
+    The field that carries it is ``model.pipeline_root_id``. ``config/schema.py``'s
+    ``_FAMILY_ONLY_MODEL_IDS`` USED to map it to ``frozenset({"h3"})`` so that setting it under
+    ``family: qwen_edit`` was rejected at config load; ``"qwen_edit"`` was added to that entry
+    in this branch, because the field now has a consumer on this family. **The remedy is
+    therefore a CONFIG edit, not a schema edit** — point ``model.pipeline_root_id`` at the
+    diffusers root on the weights Volume, or use a DIRECTORY-form ``model_id`` so the config
+    travels with the weights. An operator who reads this text, opens schema.py expecting to make
+    the map edit and finds it already made will conclude the refusal is stale rather than that
+    their ``model_id`` is the problem — which is why this paragraph is maintained rather than
+    left to rot.
+
+    **(2) the control-image directories — ``preprocess`` only.**
+    ``prep/qwen_edit_encode.resolve_qwen_edit_control_sources`` takes "the ORDERED config directory
+    list", one directory PER SLOT, because the mapping is POSITIONAL: directory *i* fills slot *i*,
+    which is what the caption's ``ctrl_img_{i+1}`` refers to. No block in ``SignetConfig`` declares
+    it — ``DataConfig`` carries only ``metadata_path`` / ``preprocessed_data_root`` /
+    ``resolution_buckets``, and ``QwenEditConfig`` carries the slot COUNT and the blank FILL but no
+    paths. Inventing a convention here (``<data_root>/controls/slot_0`` or similar) is the one thing
+    that must not happen: a guessed directory order silently re-points every caption's ``ctrl_img_N``
+    and the sample trains against a request nobody wrote, at perfectly ordinary shapes and an
+    perfectly ordinary loss curve. That is the exact failure ``resolve_qwen_edit_control_sources``
+    was written to REFUSE, and it would be defeated by guessing one level up.
+
+    **(3) the checkpoint BAND — ``sample`` only.** §8 of the house method: *"Checkpoint selection =
+    a band, not a winner … the shipped deliverable was three checkpoints."* Nothing in
+    ``QwenEditConfig`` declares one, and the fallback a reader reaches for —
+    ``CheckpointManager.find_latest()`` — is the H3 D-10-DEF-19 failure under a different name: the
+    render directory is keyed on the render's IDENTITY and the checkpoint name is part of that key,
+    so against a training run that commits every ``checkpoint_every`` steps each re-dispatch
+    resolves a DIFFERENT adapter, lands in a FRESH directory, and finds nothing to resume. A
+    5000-step run checkpointing every 250 steps moves that target twenty times. WHAT LANDS IT:
+    ``qwen_edit.render_checkpoint_band`` — the ordered band-member directory NAMES under
+    ``<output_dir>/`` — H3's ``h3.render_checkpoint_name`` pin made plural, because on this family
+    the deliverable IS the band.
+
+    **(4) the held-out control inputs AND their A/B prompt pair — ``sample`` only.** §8 requires
+    *"A/B prompt modes on every held-out input: (A) style-only … and (B) content-named … Same
+    input, two prompts, side by side"*. Two schema surfaces are missing and they are missing
+    TOGETHER: ``qwen_edit.control_dirs`` names the TRAINING control directories (rendering those
+    asks a different question than a held-out probe does), and ``validation.prompts`` is a flat
+    ``list[str]`` that cannot say which entry is A, which is B, or which input either belongs to.
+    Deriving the pair positionally from that list is the invention this file must not make: A and B
+    differ by whether the SUBJECT IS NAMED, so a mis-paired list silently inverts the
+    trace-vs-reinterpret read the grid exists to produce, at a perfectly ordinary-looking grid.
+    WHAT LANDS IT: one declared object per held-out input carrying its ``id``, its ordered per-slot
+    ``images`` and its prompt PER MODE — ``qwen_edit.render_inputs`` of
+    ``{id, images, prompts: {a_style: …, b_content: …}}``, keyed by the ids in
+    ``QWEN_EDIT_PROMPT_MODES`` because that tuple is the single place a mode is declared. This is
+    the ``ValidationSample`` doctrine this schema already applies (*"an OBJECT … so a sample's
+    prompt and its condition can never desync across a config edit"*), and it is the exact shape
+    ``inference/qwen_edit_layout.QwenEditHeldOutInput`` consumes, so nothing translates between the
+    two.
+
+    **(5) a config that CONTRADICTS the locked §8 recipe — ``sample`` only.** The inference settings
+    are NOT config fields and that is deliberate: ``models/qwen_edit_pipeline`` holds them as
+    ``QWEN_EDIT_RENDER_RECIPE`` — 30 steps, true_cfg 4.0, CFGNorm on, the static scheduler
+    reparameterisation, LoRA strength 1.0, a non-empty negative prompt — recipe terms in the same
+    sense that ``quantize_qwen_edit``'s qfloat8 is one. But ``ValidationConfig`` still CARRIES
+    ``num_inference_steps`` and ``guidance_scale`` (LTX's, defaulting to 30 and 3.0), and the render
+    does not read them. A config that declares 3.0 while the grid renders at 4.0 is a config lying
+    to its reader, and the gallery banner would print one of the two — the same
+    "banner that describes a render nobody performed" failure ``h3_sample`` records at its
+    ``width``/``height`` (``modal/fns.py:4808-4813``). So a divergence is REFUSED at $0 with the
+    remedy in the message, rather than silently ignored. WHAT LANDS IT: set the fields to the
+    recipe's values (``guidance_scale: 4.0``, ``num_inference_steps: 30``) — or land the ruling that
+    makes them real knobs, at which point the render reads them and this gap goes away with it.
+    """
+    gaps: list[str] = []
+
+    if str(cfg.model.model_id).endswith(".safetensors") and cfg.model.pipeline_root_id is None:
+        gaps.append(
+            f"model.model_id is the single FILE {cfg.model.model_id!r}, so "
+            "load_qwen_edit_transformer needs a config_source — and the field that would carry it "
+            "(model.pipeline_root_id) is refused on this family by config/schema.py's "
+            "_FAMILY_ONLY_MODEL_IDS, which maps it to frozenset({'h3'}). WHAT LANDS IT: add "
+            "'qwen_edit' to that entry (the field now has a consumer, which is the condition its "
+            "own comment records for inclusion), or point model.model_id at a diffusers DIRECTORY "
+            "on the weights Volume, where the config travels with the weights and no config_source "
+            "is needed. Dispatching without it would make diffusers fetch a Stable Diffusion v1.5 "
+            "config from the Hub inside a metered container."
+        )
+
+    # ``sample`` joins the two encode legs here: the render assembles a QwenImageEditPlusPipeline
+    # whose PROCESSOR component lives at <root>/processor, exactly as the pre-encode's does. Both
+    # plausible wrong guesses (<root>, <root>/text_encoder) were tried on live hardware and both
+    # failed, so the render inherits the refusal instead of re-discovering it on a metered container.
+    if mode in ("preprocess", "train", "sample") and cfg.model.pipeline_root_id is None:
+        gaps.append(
+            "model.pipeline_root_id is unset, and the Qwen2.5-VL PROCESSOR is a PIPELINE-ROOT "
+            "component: a Qwen-Image-Edit-2511 snapshot writes preprocessor_config.json into "
+            "<root>/processor/, NOT into <root>/text_encoder/. Composing the processor path from "
+            "model.text_encoder_id raises \"Can't load image processor for .../text_encoder\" — and "
+            "it raises AFTER the arch gate has loaded 38 GiB of transformer, so the discovery is "
+            "metered. Declaring the root here makes it free. WHAT LANDS IT: add the root directory "
+            "under WEIGHTS_DIR to your `model:` block, e.g.\n"
+            "        pipeline_root_id: qwen-image-edit-2511"
+        )
+
+    if mode == "preprocess":
+        declared = tuple(getattr(cfg.qwen_edit, "control_dirs", ()) or ())
+        blanks = tuple(getattr(cfg.qwen_edit, "blank_slots", ()) or ())
+        covered = len(declared) + len(blanks)
+        if covered != int(cfg.qwen_edit.control_slots):
+            gaps.append(
+                "the ORDERED control-image directories (one per slot) are not fully declared: "
+                f"qwen_edit.control_dirs has {len(declared)} entr(ies) and qwen_edit.blank_slots "
+                f"has {len(blanks)}, covering {covered} of {cfg.qwen_edit.control_slots} slot(s). "
+                "prep/qwen_edit_encode.resolve_qwen_edit_control_sources requires every slot to be "
+                "accounted for because the mapping is POSITIONAL — directory i fills slot i, which "
+                "is what the caption's ctrl_img_{i+1} refers to. This is deliberately NOT defaulted "
+                "to a convention: a guessed directory order re-points every caption's ctrl_img_N "
+                "and trains the sample against a request nobody wrote, silently and at an ordinary "
+                "loss. Declare them explicitly, in slot order."
+            )
+
+    if mode == "sample":
+        request = _qwen_edit_render_request(cfg)
+
+        if not request["band"]:
+            gaps.append(
+                f"the checkpoint BAND is not declared (qwen_edit.{_QWEN_EDIT_BAND_FIELD} is unset "
+                "or empty), so the render has no adapter to load. §8 makes the BAND the deliverable "
+                "unit — 'checkpoint selection = a band, not a winner'; the shipped JPM deliverable "
+                "was three checkpoints — and inference/qwen_edit_layout.CheckpointBand refuses an "
+                "empty band because a grid whose only column is the un-adaptered base control is a "
+                "valid-looking artifact that answers nothing. Falling back to "
+                "CheckpointManager.find_latest() is NOT the fix: it is a moving target while a run "
+                "is live (H3's D-10-DEF-19), and because the render directory is keyed on the "
+                "checkpoint NAME, every re-dispatch would resolve a different adapter, land in a "
+                "fresh directory and resume nothing. WHAT LANDS IT: "
+                f"qwen_edit.{_QWEN_EDIT_BAND_FIELD}, the ordered band-member directory names under "
+                "<output_dir>/ — H3's render_checkpoint_name pin made plural."
+            )
+
+        if not request["inputs"]:
+            gaps.append(
+                "the HELD-OUT control inputs and their A/B prompt pair are not declared "
+                f"(qwen_edit.{_QWEN_EDIT_INPUTS_FIELD} is unset or empty). §8 renders every held-out "
+                "input under BOTH prompt modes — (A) style-only, subject NOT named; (B) "
+                "content-named — side by side, because the A-vs-B delta at a fixed checkpoint IS "
+                "the trace-vs-reinterpret read. Neither half can be borrowed from what exists: "
+                "qwen_edit.control_dirs names the TRAINING controls (rendering those asks a "
+                "different question than a held-out probe), and validation.prompts is a flat list "
+                "that cannot say which entry is A, which is B, or which input either belongs to — "
+                "and a mis-paired list inverts the very read the grid is for, at an "
+                f"ordinary-looking grid. WHAT LANDS IT: qwen_edit.{_QWEN_EDIT_INPUTS_FIELD}, one "
+                "object per input with {id, images (one per control slot, in slot order), prompts "
+                "(keyed by the QWEN_EDIT_PROMPT_MODES ids: a_style, b_content)} — the shape "
+                "inference/qwen_edit_layout.QwenEditHeldOutInput already consumes, so nothing "
+                "translates between the config and the planner."
+            )
+        else:
+            slots = int(cfg.qwen_edit.control_slots)
+            for i, entry in enumerate(request["inputs"]):
+                absent = [
+                    name
+                    for name in ("id", "images", "prompts")
+                    if not getattr(entry, name, None)
+                ]
+                if absent:
+                    gaps.append(
+                        f"qwen_edit.{_QWEN_EDIT_INPUTS_FIELD}[{i}] is missing {absent} — every "
+                        "held-out input needs an id (it is the CONTROL AXIS of the render key AND "
+                        "the stem of every file it renders, so two inputs sharing one id overwrite "
+                        "each other inside one render dir), its ordered per-slot images, and a "
+                        "prompt for BOTH §8 modes."
+                    )
+                    continue
+                images = tuple(getattr(entry, "images", ()) or ())
+                if len(images) != slots:
+                    gaps.append(
+                        f"qwen_edit.{_QWEN_EDIT_INPUTS_FIELD}[{i}] "
+                        f"({getattr(entry, 'id', '?')!r}) declares {len(images)} control image(s) "
+                        f"but qwen_edit.control_slots is {slots}. The mapping is POSITIONAL — image "
+                        "i fills slot i, which is what the prompt's ctrl_img_{i+1} addresses — so a "
+                        "short list does not render a smaller grid, it renders the WRONG request "
+                        "under the right label."
+                    )
+
+        # The recipe is LOCKED in models/qwen_edit_pipeline, so these two config fields are not read
+        # by the render. They can still CONTRADICT it, and a banner printing one number while the
+        # grid was rendered at another is the failure h3_sample records at its width/height.
+        # Imported function-locally: this module must stay importable on the SDK-free interpreter
+        # the dry-run contract targets, and the recipe lives in the Modal-side model tier.
+        from signet_trainer.models.qwen_edit_pipeline import (  # noqa: PLC0415
+            QWEN_EDIT_RENDER_RECIPE,
+        )
+
+        contradictions = [
+            f"validation.{field}={declared!r} but the locked §8 recipe renders at {expected!r}"
+            for field, declared, expected in (
+                (
+                    "guidance_scale",
+                    float(cfg.validation.guidance_scale),
+                    float(QWEN_EDIT_RENDER_RECIPE.true_cfg),
+                ),
+                (
+                    "num_inference_steps",
+                    int(cfg.validation.num_inference_steps),
+                    int(QWEN_EDIT_RENDER_RECIPE.steps),
+                ),
+            )
+            if declared != expected
+        ]
+        if contradictions:
+            gaps.append(
+                "the config contradicts the LOCKED §8 inference recipe: "
+                + "; ".join(contradictions)
+                + ". models/qwen_edit_pipeline.QWEN_EDIT_RENDER_RECIPE is deliberately NOT a config "
+                "block — every term in it is settled by the method doc in the same sense that "
+                "quantize_qwen_edit's qfloat8 is — so the render uses the recipe and does NOT read "
+                "these fields. A config that declares one number while the grid renders at another "
+                "puts a figure in the gallery banner that describes a render nobody performed, "
+                "which is the failure h3_sample records for its own banner-only width/height "
+                "(modal/fns.py:4808-4813). Note validation.guidance_scale would in any case map to "
+                "true_cfg_scale and NEVER to the pipeline's guidance_scale=, which this checkpoint "
+                "ignores for want of a guidance embedder — passing it there renders the whole grid "
+                "at CFG 1.0. WHAT LANDS IT: set the fields to the recipe's values, or land the "
+                "ruling that makes them real knobs (at which point the render reads them and this "
+                "gap goes with it)."
+            )
+
+    return gaps
+
+
+def _qwen_edit_refuse_on_gaps(cfg: object, *, mode: str) -> None:
+    """Abort pre-dispatch, naming every gap at once, when a qwen_edit config cannot drive ``mode``.
+
+    Every gap is reported together rather than the first one — the enochiatron lesson the H3 arch
+    gate records (*"caught 6 mismatches in one ~$1.40 run precisely because it did not stop at the
+    first"*), applied to configuration instead of architecture. Fixing one gap and re-running to
+    discover the next is how a cheap check becomes an expensive loop.
+    """
+    gaps = _qwen_edit_config_gaps(cfg, mode=mode)
+    if not gaps:
+        return
+    listed = "\n".join(f"  ({i + 1}) {gap}" for i, gap in enumerate(gaps))
+    raise SystemExit(
+        f"[signet-entrypoint] the qwen_edit {mode!r} stage cannot be dispatched from this config — "
+        f"{len(gaps)} DECLARED gap(s):\n{listed}\n"
+        "[signet-entrypoint] Aborting AFTER the approval pause and BEFORE any dispatch: nothing was "
+        "spent. Every gap above names what lands it."
+    )
+
+
+def _qwen_edit_encode_params(cfg: object) -> dict[str, object] | None:
+    """EVERY required kwarg of ``fns.qwen_edit_preprocess`` for a ``family: qwen_edit`` config.
+
+    The ``_h3_encode_params`` shape and the same burned-gate discipline (09-07 T3): read ONLY fields
+    that exist on the loaded config, and read them HERE — bound to a local, before the dispatch —
+    never inline inside the ``.spawn(`` expression. ``SignetConfig`` is ``extra="forbid"``, so a
+    field read that names the wrong block raises ``AttributeError`` AFTER the approval pause; a named
+    abort at that point still costs $0 but it tells the operator what to fix.
+
+    ``qwen_edit_preprocess`` declares ALL 17 parameters REQUIRED with no defaults, so a threading gap
+    is a ``TypeError`` at dispatch rather than a silent wrong default inside a paid container.
+
+    ``control_dirs`` / ``blank_slots`` are REAL SCHEMA FIELDS on ``QwenEditConfig`` as of this
+    branch, so this function no longer always aborts — it aborts only when the declared slots do
+    not account for ``control_slots``, which is gap (2)'s per-mode check and a genuine config
+    error. The earlier text here said the abort was unconditional; that described the tree
+    before the fields landed and would send an operator hunting for a schema gap that is closed.
+    """
+    if cfg.model.family != "qwen_edit":
+        return None
+    for name in ("vae_id", "text_encoder_id"):
+        if getattr(cfg.model, name) is None:
+            raise SystemExit(
+                f"[signet-entrypoint] model.{name} is unset on a family: qwen_edit config. The "
+                f"pre-encode loads the Qwen-Image VAE and the Qwen2.5-VL text encoder (WITH its "
+                f"vision tower) as separate components under WEIGHTS_DIR, and qwen_edit_preprocess "
+                f"requires both. Aborting before any dispatch — nothing was spent."
+            )
+    # Raises on every gap at once. Kept BEFORE the dict build so a missing field cannot surface as a
+    # confusing AttributeError from inside the comprehension below.
+    _qwen_edit_refuse_on_gaps(cfg, mode="preprocess")
+    width, height, _frames = cfg.training_dims
+    return {
+        # cfg.data — where the manifest is read from and where the three qwen_edit_* sources land.
+        "metadata_path": cfg.data.metadata_path,
+        "output_dir": cfg.data.preprocessed_data_root,
+        # ⛔ UNREACHABLE until gap (2) lands; the refusal above fires first. Spelled out rather than
+        #    omitted so the shape of the threading is reviewable now.
+        "control_dirs": tuple(getattr(cfg.qwen_edit, "control_dirs", ())),
+        "blank_slots": tuple(getattr(cfg.qwen_edit, "blank_slots", ())),
+        # cfg.qwen_edit — the locked recipe values, every one a documented field (D-NOHARDCODE).
+        "control_slots": cfg.qwen_edit.control_slots,
+        "blank_slot_fill": cfg.qwen_edit.blank_slot_fill,
+        # ⚠ TWO DIFFERENT BUDGETS for the SAME image, and conflating them is the family's easiest
+        #   mistake: control_area_px (1024²) is the VAE channel, condition_area_px (384²) is the
+        #   Qwen2.5-VL channel. Threaded as two parameters so neither can stand in for the other.
+        "control_area_px": cfg.qwen_edit.control_area_px,
+        "condition_area_px": cfg.qwen_edit.condition_area_px,
+        "control_cache_key_mode": cfg.qwen_edit.control_cache_key_mode,
+        "cache_text_embeddings": cfg.qwen_edit.cache_text_embeddings,
+        # Threaded so the arch gate CHECKS the config's [UNVERIFIED] 3584 against the live txt_in
+        # rather than believing it — the field's own description says the loading pass must.
+        "text_embed_dim": cfg.qwen_edit.text_embed_dim,
+        # training_dims is [W, H, F]; F is pinned to exactly 1 on this IMAGE family.
+        "target_width": width,
+        "target_height": height,
+        # cfg.model — the component paths under WEIGHTS_DIR (the CALLER composes them Modal-side).
+        "model_id": cfg.model.model_id,
+        "vae_id": cfg.model.vae_id,
+        "text_encoder_id": cfg.model.text_encoder_id,
+        "pipeline_root_id": cfg.model.pipeline_root_id,
+    }
+
+
 @app.local_entrypoint()
 def main(config: str, approve: bool = False, mode: str = "train") -> None:
     """Preflight + gated launch from a YAML config — load, dry-run gate, cost print, APPROVE, dispatch.
@@ -288,6 +788,16 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
     ``preprocess`` each route on ``cfg.model.family`` inside their existing arm, dispatching
     ``h3_train`` / ``h3_sample`` / ``h3_preprocess`` for a ``family: h3`` config and the LTX stage
     otherwise. Six dispatches, one gate, one ledger.
+
+    Phase 11 adds the Qwen-Image-Edit leg the SAME way and for the same reason — a THIRD family, and
+    still zero new modes. The same three arms gained a ``family == "qwen_edit"`` branch dispatching
+    ``qwen_edit_train`` / ``qwen_edit_sample`` / ``qwen_edit_preprocess``. Nine dispatches now, and
+    still ONE gate and ONE ledger: that invariant is what makes the count boring rather than
+    alarming. Each qwen arm additionally runs two $0 pre-dispatch checks — ``_qwen_edit_stage_
+    readiness`` (are the modules the stage imports actually in this tree?) and
+    ``_qwen_edit_refuse_on_gaps`` (can this config drive that stage at all?) — both strictly AFTER
+    the approval pause and BEFORE the ``.spawn``, so they abort a doomed run without spending and
+    without weakening MODL-02.
 
     Pass ``--approve`` to authorize non-interactively (harness path); otherwise the operator must
     type ``approved`` at the prompt (D-03 / MODL-02).
@@ -437,6 +947,12 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             est_hours=cfg.modal.est_hours,
             cost_guardrail_usd=cfg.modal.cost_guardrail_usd,
         )
+    # The one mode whose WORK is knowable before dispatch: a render grid is
+    # ``modes x (base + band) x held-out inputs`` images at a known step count, all declared. Printed
+    # BESIDE the estimate, never in place of it — this adds a line, never a decision, so MODL-03's
+    # guardrail arithmetic and its BASIS are byte-identical to every other mode.
+    if mode == "sample" and cfg.model.family == "qwen_edit":
+        print(_qwen_edit_render_batch_note(cfg))
     print(format_cost_line(decision))
     if not decision.allowed:
         print(
@@ -485,6 +1001,35 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         )
         fc = h3_sample.with_options(timeout=h3_sample_timeout_s).spawn(config_text)
         _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "h3_sample")
+    elif mode == "sample" and cfg.model.family == "qwen_edit":
+        # Phase-11 qwen_edit arm of the SAME mode: the A/B-prompt x checkpoint-BAND render grid.
+        # Routed by family, NOT by a new mode value — six dispatches, one gate, one ledger.
+        # ``qwen_edit_sample`` takes the recipe BY VALUE (``config_yaml: str``) and re-parses it
+        # in-container exactly like ``sample`` and ``h3_sample``; the ``.spawn`` CALL sits strictly
+        # after ``_require_approval`` (MODL-02) and the timeout is computed HERE, after approval.
+        from signet_trainer.modal.fns import qwen_edit_sample
+
+        _qwen_edit_stage_readiness("sample")
+        _qwen_edit_refuse_on_gaps(cfg, mode="sample")
+        qwen_edit_sample_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
+        print(
+            "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
+            "Dispatching qwen_edit_sample.spawn() (gated, family: qwen_edit); the band's renders "
+            "commit to signe-trainer-checkpoints under <output_dir>/samples_qwen_edit/<render-key>/. "
+            "The arch gate fires inside the stage — there is no separate smoke step.\n"
+            "[signet-entrypoint] ⚠ THIS IS A FULL, METERED RENDER. The generate call landed with "
+            "the sampler, so the stage runs end to end: ~40.9 GiB transformer + Qwen2.5-VL + VAE "
+            "loaded once, then every cell of (base + each band member) x (held-out inputs) x (the "
+            "§8 A/B modes) at 30 steps and true_cfg 4.0. It does NOT abort in the first seconds — "
+            "the earlier banner here said so while the render was a declared stub, and that stub "
+            "is gone. Budget the container accordingly; the §8 inference settings are LOCKED in "
+            "models/qwen_edit_pipeline.QWEN_EDIT_RENDER_RECIPE (steps 30, true_cfg 4.0 + CFGNorm, "
+            "the STATIC scheduler reparameterisation pinned AFTER pipeline construction and "
+            "re-verified per render, LoRA strength 1.0, reference into BOTH encodes) rather than "
+            "read from this config. Cells already on the Volume are resumed, not re-rendered."
+        )
+        fc = qwen_edit_sample.with_options(timeout=qwen_edit_sample_timeout_s).spawn(config_text)
+        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "qwen_edit_sample")
     elif mode == "sample":
         # Phase-4 base-vs-LoRA grid (D-RUN-1 part 1) — reuses the EXACT gate above; the
         # ``sample.with_options(...).spawn`` CALL sits strictly after ``_require_approval`` (MODL-02).
@@ -527,6 +1072,34 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         )
         fc = h3_preprocess.with_options(timeout=h3_preprocess_timeout_s).spawn(**h3_params)
         _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "h3_preprocess")
+    elif mode == "preprocess" and cfg.model.family == "qwen_edit":
+        # Phase-11 qwen_edit arm of the SAME mode: the signet-native Qwen-Image-Edit pre-encode.
+        # There is no canonical Qwen encoder anywhere (not in-repo, not upstream), so the "never
+        # write a custom encoder" landmine does not apply — there is nothing canonical to prefer.
+        # Routed by family, NOT by a new mode value.
+        #
+        # Like ``h3_preprocess`` and unlike the two config-text stages, ``qwen_edit_preprocess``
+        # takes REQUIRED kwargs with no defaults, so the whole threading burden sits in
+        # ``_qwen_edit_encode_params`` — bound to a local HERE, before the dispatch, so a field-read
+        # failure is a named abort rather than a traceback out of a ``.spawn()`` expression.
+        from signet_trainer.modal.fns import qwen_edit_preprocess
+
+        _qwen_edit_stage_readiness("preprocess")
+        qwen_edit_params = _qwen_edit_encode_params(cfg)
+        assert qwen_edit_params is not None  # family was just checked by this arm's condition
+        qwen_edit_preprocess_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
+        print(
+            "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
+            "Dispatching qwen_edit_preprocess.spawn() (gated, family: qwen_edit); the two-phase "
+            "encode writes qwen_edit_conditions/ then qwen_edit_latents/ + "
+            "qwen_edit_control_latents/ to the dataset Volume under cfg.data.preprocessed_data_root "
+            "and commits it. The arch gate fires inside the stage, before a single image is opened, "
+            "and releases the transformer before the Qwen2.5-VL encoder is loaded."
+        )
+        fc = qwen_edit_preprocess.with_options(timeout=qwen_edit_preprocess_timeout_s).spawn(
+            **qwen_edit_params
+        )
+        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "qwen_edit_preprocess")
     elif mode == "preprocess":
         # Phase-8 canonical pre-encode as a first-class GATED mode (D-8-PREPROC) — retires the
         # hardcoded hourly-rate drift in the throwaway scripts/_encode_demo*.py by routing the
@@ -635,6 +1208,34 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         )
         fc = h3_train.with_options(timeout=h3_train_timeout_s).spawn(config_text)
         _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "h3_train")
+    elif cfg.model.family == "qwen_edit":
+        # Phase-11 qwen_edit arm of the DEFAULT ``train`` mode. Routed by family, NOT by a new mode
+        # value. ``qwen_edit_train`` takes the recipe BY VALUE and re-parses it in-container, so
+        # there is nothing to thread; the ``.spawn`` CALL sits strictly after ``_require_approval``.
+        #
+        # Bounds the metered shell at ``est_hours * timeout_margin`` — the H3 arm's deviation from
+        # the LTX 24h decorator ceiling, taken here for the same reason: a driver-level hang on a
+        # ~38 GiB model riding the ceiling is the wrong default.
+        from signet_trainer.modal.fns import qwen_edit_train
+
+        _qwen_edit_stage_readiness("train")
+        _qwen_edit_refuse_on_gaps(cfg, mode="train")
+        qwen_edit_train_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
+        print(
+            "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
+            "Dispatching qwen_edit_train.spawn() (gated, family: qwen_edit); checkpoints commit to "
+            "signe-trainer-checkpoints under <output_dir>/. The arch gate fires inside the stage "
+            "and must see 840 LoRA targets across all fourteen leaves before any training spend.\n"
+            f"[signet-entrypoint] ⚠ COST BASIS: est_hours={cfg.modal.est_hours:g} is a DECLARED "
+            f"estimate, not a measurement — no steps/hour figure has been recorded for "
+            f"Qwen-Image-Edit on any card in this program, and it shows up a second time as "
+            f"qwen_edit.max_packed_rows=0 (row ceiling DISABLED because no OOM boundary is "
+            f"measured either). The guardrail arithmetic above is real and binding; the INPUT to it "
+            f"is a declared number. After this round, set est_hours from the observed "
+            f"steps/hour over {cfg.training.max_steps} steps and the estimate becomes measured."
+        )
+        fc = qwen_edit_train.with_options(timeout=qwen_edit_train_timeout_s).spawn(config_text)
+        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "qwen_edit_train")
     else:
         from signet_trainer.modal.fns import train
 
