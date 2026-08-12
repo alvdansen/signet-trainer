@@ -263,6 +263,17 @@ This is a **private beta** cut with fresh history.
 
 ### Known beta gaps
 
+Two operational caveats from the most recent deep audit (fixes are staged for the next round —
+tracked in issue #45):
+
+- **The parallel-render watcher's unattended completion-detection has known gaps** (it can declare
+  a long render stalled or complete at the wrong moment). For now, prefer attended renders and
+  re-run the grid script manually to refresh a live grid; the artifacts themselves always commit
+  to the Volume regardless.
+- **The cost line prices ONE container life.** Arms that carry server-side retries can multiply
+  the worst-case metered spend well past the printed estimate if a run is repeatedly preempted or
+  times out. Watch long metered runs; do not fire-and-forget under a tight budget.
+
 `python -m pytest` is **not** green out of the box, for reasons that are known rather than
 mysterious. Expect roughly **48 failed, ~1890 passed, 27 skipped**, in three groups:
 
