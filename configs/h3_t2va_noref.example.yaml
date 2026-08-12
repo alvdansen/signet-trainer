@@ -1,0 +1,119 @@
+# =============================================================================
+# ⚠ ALPHA — H3 NO-REFERENCE TRAINING IS ALPHA: smoke-tested only, no end-to-end
+# run exists; file issues. (h3.references_per_sample: 0)
+#
+# Example MiniMax-H3 NO-REFERENCE (t2va) LoRA config — family: h3, zero reference
+# slots. Derived from the Ref2VA campaign shape (tests/test_h3_config_schema.py's
+# minimal-valid H3 payload + the campaign example conventions); every path below is
+# a SYNTHETIC placeholder — no client data, no real property names.
+#
+# What "no-reference" means here (proven by signet-dryrun on this file):
+#   * zero reference latent rows AND zero Qwen vision rows — every image reference
+#     bills TWICE (vision tokens + ref latent rows), so removing the slots removes
+#     BOTH contributions from the packed sequence;
+#   * the text stream is the bare prompt (no label blocks, no vision sentinels);
+#   * the loss covers every target row (no reference prefix to mask out);
+#   * the ref-only knobs (reference_dropout / reference_pair_seed /
+#     reference_image_short_edge / t_visual_cond / the reference size lists) must
+#     stay UNSET — the schema rejects a non-default value at references_per_sample 0.
+#
+# `--mode sample` is REFUSED on this config: the transcribed diffusers workflow
+# (ref2va) is reference-conditioned end to end; the t2va render path is not
+# transcribed in this repo yet.
+#
+# Zero GPU / zero spend to author. Rides the ONE gate:
+#   PYTHONPATH=src PYTHONUTF8=1 modal run -m signet_trainer.modal.entrypoint \
+#     --config configs/h3_t2va_noref.example.yaml --mode <train|preprocess>
+# =============================================================================
+
+# training_dims = [W, H, F] — single source of truth for the validators + dry-run batch.
+# H3's frame law is 17n+5 (22 = the Phase-10 proven count); canvas 1344x768 is the
+# 16:9 resolve of h3.target_aspect (short edge 768, both axes %32).
+training_dims: [1344, 768, 22]
+
+data:
+  # Encoded-latents root on the dataset Volume. The gated `--mode preprocess` encode
+  # writes h3_latents/ + h3_conditions/ + h3_audio_latents/ under this root — NO
+  # h3_reference_latents/ on a no-reference encode, and the train side does not
+  # declare that source at zero slots (a ref-bearing cache also works: its
+  # reference dir is simply never read).
+  preprocessed_data_root: /dataset/.precomputed_example_noref
+  # Staged corpus manifest (synthetic placeholder). No reference keys are needed on
+  # any row for a no-reference encode.
+  metadata_path: /dataset/example_noref/metadata.jsonl
+  num_dataloader_workers: 2
+  batch_size: 1          # H3 packs ONE sample per sequence (bs=1 locked)
+  resolution_buckets:
+    - 1344x768x22        # single bucket at the training canvas + frame count
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  # No target_modules override: family h3 resolves the H3 path regex default (the
+  # 300-target main-stack set) at config load.
+
+model:
+  family: h3
+  # H3 model IDs are DIRECTORIES under WEIGHTS_DIR (no filename to sniff).
+  model_id: minimax-h3/transformer_ref
+  vae_id: minimax-h3/vae
+  audio_vae_id: minimax-h3/audio_vae
+  text_encoder_id: minimax-h3/text_encoder
+
+h3:
+  # NO-REFERENCE (ALPHA): zero reference slots. The ref-only knobs are deliberately
+  # ABSENT — setting any of them alongside 0 is a config-load error (lean
+  # field-split, no silently-ignored block).
+  references_per_sample: 0
+  # Still live at zero slots: the packed-seq budget triple (MEASURED, P10-1b), the
+  # prompt estimate, the canvas aspect and the audio-loss ruling.
+  prompt_tokens_estimate: 96
+  target_aspect: [16, 9]
+  audio_in_loss: false
+  gpu_usable_gib: 79.25
+  resident_gib: 62.97
+  mib_per_packed_row: 1.21
+
+training:
+  max_steps: 100         # run-specific step budget (D-RUN-1) — state your own per run
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  optimizer: adamw8bit   # house rule — NEVER Prodigy
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30
+  checkpoint_every: 50
+  keep_checkpoints: null # never silently prune intermediates (research-lab rule)
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+modal:
+  hourly_rate_usd: 1.64      # A100-80GB (single-A100 house rule)
+  cost_guardrail_usd: 20.0
+  est_hours: 1.0
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  # Eval prompts are FIRST-CLASS setup (settled at the session gate). Klippbok
+  # grammar, synthetic subject anchor. `--mode sample` is refused at 0 slots, so
+  # these serve the config's documentation + any future t2va render leg.
+  prompts:
+    - "a cinematic film still of the subject walking through a sunlit atrium"
+    - "close-up, the subject speaks to camera, soft indoor light"
+  frame_count: 122           # render band (5-15 s at 24 fps) — a DIFFERENT law from 17n+5
+  num_inference_steps: 40
+  guidance_scale: 4.0
+  seed: 42
+  width: 1344
+  height: 768
+
+conditioning:
+  mode: none                 # H3 reference control lives on the h3 block, not here
+
+seed: 42
+output_dir: outputs/h3_t2va_noref_example

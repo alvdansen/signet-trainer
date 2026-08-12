@@ -384,6 +384,26 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
                 f"pre-approval, no dispatch.{silent_note}"
             )
 
+    # (1c) H3 NO-REFERENCE (ALPHA) routing — pre-approval, zero-spend. No new mode and no new entry
+    #      point: no-reference rides --mode train/preprocess through THIS same gate. `sample` is
+    #      REFUSED here (and again in-container, belt to this brace): h3_sample is transcribed for
+    #      the reference-conditioned ref2va workflow only, and the t2va workflow a no-reference
+    #      render needs is not transcribed in this repo — faking it as "ref2va with no references"
+    #      would render an unvalidated request under a no-reference label.
+    if cfg.model.family == "h3" and cfg.h3.references_per_sample == 0:
+        if mode == "sample":
+            raise SystemExit(
+                "[signet-entrypoint] h3.references_per_sample is 0 (NO-REFERENCE, ALPHA) and "
+                "--mode sample was requested: no-reference H3 rendering is NOT supported (the "
+                "pinned diffusers ref2va workflow is reference-conditioned end to end; the t2va "
+                "workflow is not transcribed in this repo). Aborting pre-approval, no dispatch. "
+                "Train/preprocess ride --mode train/preprocess; for renders, file an issue."
+            )
+        print(
+            "[signet-entrypoint] H3 NO-REFERENCE TRAINING IS ALPHA - smoke-tested only, no "
+            "end-to-end run exists; file issues"
+        )
+
     # (2) Dry-run hard gate (CONF-03) on the already-loaded cfg — must pass before ANY remote
     #     dispatch. Non-zero -> abort.
     rc = run_dryrun(cfg)
