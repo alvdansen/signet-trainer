@@ -57,12 +57,13 @@ _WAN_TOKENS = ("UniPC", "shift", "frames=33", "guidance_scale=5", "num_inference
 
 #: Filename prefixes that mark a module as owned by a non-LTX family.
 #:
-#: ⚠ ``wan_`` IS DELIBERATELY ABSENT and must stay absent until the Wan family lands. Releasing
-#: the bare-token ban for a filename prefix that matches NO module in this branch buys nothing
-#: and pre-authorises musubi's --discrete_flow_shift 7.0 — the exact Wan value this gate was
-#: written to keep out of an inference path — for a file nobody has reviewed yet. The carve-out
-#: travels WITH runners/wan_musubi.py on the multi-source branch, where it has a consumer.
-_FAMILY_PREFIXES = ("h3_", "qwen_edit_")
+#: ``wan_`` is present HERE and absent on the qwen branch, deliberately. A carve-out that
+#: releases the bare-token ban and pre-authorises musubi's --discrete_flow_shift 7.0 — the exact
+#: Wan value this gate exists to keep out — must not ship one commit ahead of the module that
+#: justifies it. It lands with runners/wan_musubi.py, and
+#: :func:`test_a_family_carve_out_requires_a_module_that_consumes_it` makes that a RULE rather
+#: than an intention: any prefix in this tuple must match a real scanned module.
+_FAMILY_PREFIXES = ("h3_", "qwen_edit_", "wan_")
 
 #: Wan tokens that stay banned EVERYWHERE, including in family-scoped modules. The bare ``shift``
 #: is deliberately absent: it is the token this scoping exists to release.
@@ -72,8 +73,9 @@ _WAN_TOKENS_ALWAYS = ("UniPC", "frames=33", "guidance_scale=5", "num_inference_s
 #: family's set is refused — including Wan's 4.0, which is what the original token guarded against.
 _ALLOWED_SHIFT_VALUES = {
     "qwen_edit_": {"3.0", "7.0"},   # METHOD §8: edit 3.0, base Qwen-Image 7.0
+    "wan_": {"7.0"},                # musubi --discrete_flow_shift 7.0 (runners/wan_musubi.py)
     "h3_": set(),                   # H3 pins no static shift; any literal here is a surprise
-}   # NOTE: no "wan_" entry — it lands with the wan family. See _FAMILY_PREFIXES above.
+}
 
 #: Modules OUTSIDE inference/ that carry sampling parameters and must be scanned anyway. Added
 #: because the Qwen scheduler pin lives in models/, and a gate that misses the file holding the
@@ -294,10 +296,9 @@ def test_a_wan_shift_value_in_a_family_module_is_still_refused() -> None:
     assert "4.0" not in _ALLOWED_SHIFT_VALUES["qwen_edit_"], (
         "4.0 became allowed for qwen_edit — that is Wan's value and the whole point of this gate"
     )
-    assert "wan_" not in _FAMILY_PREFIXES and "wan_" not in _ALLOWED_SHIFT_VALUES, (
-        "a wan_ carve-out is present without a wan_ module to justify it. Releasing the bare-token "
-        "ban for a family that does not exist in this branch pre-authorises musubi's 7.0 in an "
-        "inference path nobody has reviewed — the carve-out must travel with runners/wan_musubi.py."
+    assert "4.0" not in _ALLOWED_SHIFT_VALUES["wan_"], (
+        "4.0 became allowed for wan_ — 7.0 is musubi's discrete_flow_shift; 4.0 is the sampling "
+        "value the original token ban was written against"
     )
 
 
@@ -436,3 +437,41 @@ def test_every_runner_module_is_reached_by_some_scan() -> None:
         f"family prefix from {_FAMILY_PREFIXES} so the family scoping applies, or add it to "
         f"_EXTRA_SCANNED."
     )
+
+
+def test_a_family_carve_out_requires_a_module_that_consumes_it() -> None:
+    """Every prefix in ``_FAMILY_PREFIXES`` must match a real scanned module. No prefix may ship
+    ahead of the code that justifies it.
+
+    THE FAILURE THIS PREVENTS, which actually happened. The ``wan_`` carve-out shipped on the
+    qwen_edit branch, where no ``wan_``-prefixed module existed anywhere. It did two things at once
+    for a family that was not there: released the bare-token ban for that filename prefix, and
+    pre-authorised ``7.0`` — musubi's ``--discrete_flow_shift``, i.e. the exact Wan value this whole
+    file exists to keep out of an inference path. A later branch adding ``inference/wan_sampler.py``
+    would have inherited a pre-opened door nobody reviewed.
+
+    A carve-out is a RELAXATION. Relaxations must arrive with the thing that needs them, and the
+    only reliable way to enforce that is to make an orphan prefix fail here — where it costs a test
+    run — rather than in review, where it costs an audit pass and a reviewer's attention.
+
+    Note this is not the same as requiring every family to have a module: it requires every
+    DECLARED PREFIX to have one. Delete the module, and the prefix must go with it.
+    """
+    extra = [Path(__file__).resolve().parents[1] / rel for rel in _EXTRA_SCANNED]
+    scanned = [
+        path.name
+        for path in [*_inference_sources(), *(q for q in extra if q.exists())]
+    ]
+    for prefix in _FAMILY_PREFIXES:
+        assert any(name.startswith(prefix) for name in scanned), (
+            f"_FAMILY_PREFIXES declares {prefix!r} but no scanned module has that prefix. The "
+            f"carve-out releases the bare-token ban and pre-authorises "
+            f"{sorted(_ALLOWED_SHIFT_VALUES.get(prefix, set()))} for a file that does not exist. "
+            f"Scanned: {sorted(scanned)}"
+        )
+    for prefix in _ALLOWED_SHIFT_VALUES:
+        assert prefix in _FAMILY_PREFIXES, (
+            f"_ALLOWED_SHIFT_VALUES declares {prefix!r}, which is not a family prefix — the value "
+            f"allowance would never be consulted, so it reads as a reviewed decision while doing "
+            f"nothing."
+        )
