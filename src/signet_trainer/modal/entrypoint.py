@@ -433,8 +433,9 @@ def _qwen_edit_config_gaps(cfg: object, *, mode: str) -> list[str]:
     and every one is a real finding about the SCHEMA, not about this file. Each names the field that
     would land it, so the check goes green on a schema edit with no change here.
 
-    **(1) ``config_source`` for a single-file ``model_id`` — every mode.** The shipped example config
-    sets ``model_id: qwen_image_edit_2511_bf16.safetensors``, a bare file, and
+    **(1) ``config_source`` for a single-file ``model_id`` — every mode.** The shipped configs now
+    use the DIRECTORY form (``qwen-image-edit-2511/transformer``), which sidesteps this gap
+    entirely. It still fires for a genuinely single-file ``model_id``, and
     ``models/qwen_edit_loader.load_qwen_edit_transformer`` documents that ``config_source`` is
     REQUIRED on that path: ``from_single_file`` with no ``config=`` calls ``fetch_diffusers_config``
     -> ``infer_diffusers_model_type``, which has **no Qwen branch at all** on the pinned diffusers and
@@ -444,13 +445,16 @@ def _qwen_edit_config_gaps(cfg: object, *, mode: str) -> list[str]:
     it by hard-coding the hub id ``"Qwen/Qwen-Image"``; signet takes the value from the caller so an
     air-gapped Volume-local directory is expressible and ``local_files_only`` can stay on.
 
-    The field that would carry it is ``model.pipeline_root_id`` — and ``config/schema.py``'s
-    ``_FAMILY_ONLY_MODEL_IDS`` maps it to ``frozenset({"h3"})``, so setting it under
-    ``family: qwen_edit`` is REJECTED at config load with *"that ID is only read under family
-    {'h3'} and would be silently ignored here"*. That is correct behaviour for a field with no
-    consumer; it is now a field WITH a consumer, so the fix is one entry in that map, not a
-    workaround here. A DIRECTORY-form ``model_id`` sidesteps the gap entirely — the config travels
-    with the weights — which is why this gap is CONDITIONAL and not a blanket refusal.
+    The field that carries it is ``model.pipeline_root_id``. ``config/schema.py``'s
+    ``_FAMILY_ONLY_MODEL_IDS`` USED to map it to ``frozenset({"h3"})`` so that setting it under
+    ``family: qwen_edit`` was rejected at config load; ``"qwen_edit"`` was added to that entry
+    in this branch, because the field now has a consumer on this family. **The remedy is
+    therefore a CONFIG edit, not a schema edit** — point ``model.pipeline_root_id`` at the
+    diffusers root on the weights Volume, or use a DIRECTORY-form ``model_id`` so the config
+    travels with the weights. An operator who reads this text, opens schema.py expecting to make
+    the map edit and finds it already made will conclude the refusal is stale rather than that
+    their ``model_id`` is the problem — which is why this paragraph is maintained rather than
+    left to rot.
 
     **(2) the control-image directories — ``preprocess`` only.**
     ``prep/qwen_edit_encode.resolve_qwen_edit_control_sources`` takes "the ORDERED config directory
@@ -698,11 +702,11 @@ def _qwen_edit_encode_params(cfg: object) -> dict[str, object] | None:
     ``qwen_edit_preprocess`` declares ALL 17 parameters REQUIRED with no defaults, so a threading gap
     is a ``TypeError`` at dispatch rather than a silent wrong default inside a paid container.
 
-    ⛔ ``control_dirs`` / ``blank_slots`` have NO source in the schema today, so this function
-    currently always aborts through ``_qwen_edit_refuse_on_gaps`` above. That refusal is the deliberate
-    output: see ``_qwen_edit_config_gaps`` gap (2) for why a convention must not be invented here. The
-    remaining sixteen parameters are threaded and correct, so landing the field is a one-line change
-    on both sides rather than a rewrite of this seam.
+    ``control_dirs`` / ``blank_slots`` are REAL SCHEMA FIELDS on ``QwenEditConfig`` as of this
+    branch, so this function no longer always aborts — it aborts only when the declared slots do
+    not account for ``control_slots``, which is gap (2)'s per-mode check and a genuine config
+    error. The earlier text here said the abort was unconditional; that described the tree
+    before the fields landed and would send an operator hunting for a schema gap that is closed.
     """
     if cfg.model.family != "qwen_edit":
         return None

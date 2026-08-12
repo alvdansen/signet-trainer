@@ -33,14 +33,27 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from signet_trainer.conditioning.qwen_edit_geometry import (
+# ⛔ MUST PRECEDE the models.qwen_edit_pipeline import below, which reaches diffusers through its
+# function-local imports. ``diffusers`` is a ``[modal-runtime]`` extra kept OUT of the core install
+# so the suite runs on a laptop (CONTRIBUTING.md / README.md), and without this guard every test in
+# this file is a hard ModuleNotFoundError on a bare clone rather than a skip.
+#
+# That is not a cosmetic difference: the repo documents a red-set contract, and the triage rule
+# ("outside these buckets = a real bug") is what makes a genuine regression visible. Measured on a
+# fresh clone this file alone took the suite from 48 red to 79 — 31 failures indistinguishable from
+# real ones. It also silently defeated the branch's own regression gate, which compares base against
+# work in ONE interpreter and therefore cannot see a new test that needs an optional dependency the
+# author happens to have installed.
+pytest.importorskip("diffusers")
+
+from signet_trainer.conditioning.qwen_edit_geometry import (  # noqa: E402 — after skip-guard
     QWEN_EDIT_CONDITION_IMAGE_SIZE,
     QWEN_EDIT_MAX_CONTROL_SLOTS,
     QWEN_EDIT_VAE_IMAGE_SIZE,
     qwen_edit_area_budget_size,
 )
-from signet_trainer.lora.peft import build_lora_config
-from signet_trainer.models.qwen_edit_pipeline import (
+from signet_trainer.lora.peft import build_lora_config  # noqa: E402 — after skip-guard
+from signet_trainer.models.qwen_edit_pipeline import (  # noqa: E402 — after skip-guard
     QWEN_EDIT_RENDER_CFG_NORM,
     QWEN_EDIT_RENDER_LORA_SCALE,
     QWEN_EDIT_RENDER_NEGATIVE_PROMPT,

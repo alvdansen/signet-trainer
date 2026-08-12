@@ -281,6 +281,10 @@ def test_expected_arch_matches_the_diffusers_class_defaults() -> None:
     _require("diffusers")
     import inspect  # noqa: PLC0415
 
+    # Same reason as tests/test_qwen_edit_sampler.py's module-level guard: diffusers is a
+    # [modal-runtime] extra kept out of the core install, so on a bare clone this is a SKIP,
+    # not a hard failure that pollutes the documented red set.
+    pytest.importorskip("diffusers")
     from diffusers import QwenImageTransformer2DModel  # noqa: PLC0415
 
     defaults = {
@@ -485,6 +489,9 @@ def test_the_two_pass_quantization_converts_blocks_then_extras_exactly_once() ->
     _require("optimum.quanto")
     import torch.nn as nn  # noqa: PLC0415
 
+    # quantize_qwen_edit reaches optimum.quanto, which imports diffusers — so this test needs
+    # the [modal-runtime] extra even though nothing in its own body names diffusers.
+    pytest.importorskip("diffusers")
     from signet_trainer.models.qwen_edit_loader import quantize_qwen_edit  # noqa: PLC0415
 
     hidden = 32

@@ -778,7 +778,14 @@ class QwenEditConfig(_Base):
         description="Pre-compute and cache the Qwen2.5-VL text embeddings instead of encoding live "
         "each step. Effectively REQUIRED at >= 2 control slots: ai-toolkit's multi-slot path reads "
         "only the cached batch.control_tensor (SDTrainer.py:1509-1510), so signet mirrors the "
-        "requirement rather than inventing a live multi-slot encode it has never run.",
+        "requirement rather than inventing a live multi-slot encode it has never run. "
+        "⚠ NARROWER THAN ITS NAME, and flagged rather than quietly left: its ONLY runtime consumer "
+        "is the re-encode SKIP in qwen_edit_preprocess (modal/fns.py:5560). Setting it false does "
+        "NOT switch training to live text encoding — training always reads the precomputed "
+        "conditions — so it cannot be used to enable caption dropout. It is a preprocess knob "
+        "wearing a training-shaped name; either give it a training-side consumer or retire it "
+        "(deliberately not retired here: shipped configs set it, and removing a field under "
+        "extra='forbid' breaks them at load).",
     )
     control_cache_key_mode: Literal["path", "content"] = Field(
         default="content",
@@ -788,6 +795,19 @@ class QwenEditConfig(_Base):
         "STALE VL embedding — and overwriting control images in place is precisely the chained-edit "
         "workflow this family is for. 'content' (the default) hashes the file BYTES and is correct "
         "for any chain; choose 'path' only when bug-compatibility with ai-toolkit is the goal.",
+    )
+
+    timestep_weighting: bool = Field(
+        default=True,
+        description="TRUE (the default) = the locked recipe: the loss is weighted by the bsmntw "
+        "bell curve that ai-toolkit actually trains under. FALSE is the unweighted-loss ABLATION, "
+        "pinning the weight at 1.0. Exposed as a config field because "
+        "build_qwen_edit_step_fn's own docstring says the ablation should be 'stated explicitly in "
+        "a config rather than achieved by deleting a line' — and until this field existed there was "
+        "no YAML key for it, so the only route was editing train/qwen_edit_step.py or modal/fns.py: "
+        "an untracked source edit driving a metered A100, producing an adapter attributable to no "
+        "config on disk. Changing this makes a run diverge from every proven house chain; the "
+        "DECISION-LOG entry is the point of it being a field.",
     )
 
     # ── the §8 RENDER request. Read only under mode 'sample'; empty is legal for the other modes ──
@@ -2312,16 +2332,43 @@ class SignetConfig(_Base):
             # caption dropout under caching (dataloader_mixins.py:402,417) — i.e. it silently trains
             # at rate 0. Refuse at config load instead; a knob that reads as set and behaves as unset
             # is the exact class the lean field-split exists to kill.
-            if self.qwen_edit.caption_dropout_rate > 0.0 and self.qwen_edit.cache_text_embeddings:
+            # ⛔ REFUSED OUTRIGHT, not conditionally on caching. The earlier form of this check
+            # fired only under `cache_text_embeddings: true` and offered `false` as the remedy —
+            # and that remedy DOES NOT WORK. `cache_text_embeddings` has exactly one runtime
+            # consumer in this tree (the re-encode SKIP at modal/fns.py:5560, inside
+            # qwen_edit_preprocess); it does not switch training to live text encoding. Nothing
+            # anywhere supplies `empty_text_conditions`, which is what
+            # conditioning/qwen_edit.py:824 needs the moment a dropout draw fires.
+            #
+            # So an operator who hit the old refusal and followed its instruction got a config that
+            # LOADS, dry-runs green, passes the cost gate, boots an A100, pays the ~40.9 GiB
+            # transformer load + qfloat8 + LoRA inject, trains to roughly step 20 of 5000, and then
+            # raises — eleven times over, because the train stage carries
+            # retries=modal.Retries(max_retries=10) with single_use_containers=True. Eleven full
+            # container starts, zero usable steps, and the config was following our own advice.
+            #
+            # A remedy that costs eleven A100 starts is worse than no remedy. Until an
+            # empty-caption encode exists, the honest answer is that this family cannot do caption
+            # dropout at all.
+            if self.qwen_edit.caption_dropout_rate > 0.0:
                 raise ValueError(
-                    "qwen_edit.caption_dropout_rate > 0 with cache_text_embeddings: true — a "
-                    "cached text embedding is computed once per (caption, control) key, so a "
-                    "per-step caption dropout cannot reach it. ai-toolkit resolves this by "
-                    "HARD-DISABLING caption dropout under caching "
-                    "(dataloader_mixins.py:402,417); signet refuses at config load instead of "
-                    "silently training at rate 0. Either set caption_dropout_rate: 0.0, or set "
-                    "cache_text_embeddings: false — which control_slots >= 2 does not currently "
-                    "support."
+                    "qwen_edit.caption_dropout_rate > 0 is not supported on this family. Caption "
+                    "dropout needs an EMPTY-CAPTION text payload to substitute in, and nothing in "
+                    "this tree produces one — QwenEditStrategy.empty_text_conditions defaults to "
+                    "None and no caller sets it, so the first dropout draw raises inside the "
+                    "training step (conditioning/qwen_edit.py:824). This is refused at config load "
+                    "because the failure would otherwise land AFTER the ~40.9 GiB load on a metered "
+                    "A100, and repeat ten more times under the stage's retry policy.\n"
+                    "        Set caption_dropout_rate: 0.0. Note this REPRODUCES the production "
+                    "chain rather than departing from it: every proven house run trained at an "
+                    "effective 0 anyway, because ai-toolkit hard-disables caption dropout whenever "
+                    "cache_text_embeddings is on (dataloader_mixins.py:402,417) and all three "
+                    "production Qwen chains ran with caching enabled.\n"
+                    "        WHAT WOULD LAND IT: have qwen_edit_preprocess encode the empty caption "
+                    "once into qwen_edit_conditions/ under a reserved key, and thread it as "
+                    "QwenEditStrategy(empty_text_conditions=...) at modal/fns.py:5894. Do NOT reach "
+                    "for cache_text_embeddings: false — that flag gates a preprocess-side re-encode "
+                    "SKIP and has no training-side effect whatsoever."
                 )
             # Price the packed sequence ALWAYS; refuse only against a ceiling someone MEASURED.
             # The layout call is not optional even with the ceiling disabled: it is what validates

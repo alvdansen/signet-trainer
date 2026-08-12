@@ -56,7 +56,13 @@ _WAN_TOKENS = ("UniPC", "shift", "frames=33", "guidance_scale=5", "num_inference
 # --------------------------------------------------------------------------------------------------
 
 #: Filename prefixes that mark a module as owned by a non-LTX family.
-_FAMILY_PREFIXES = ("h3_", "qwen_edit_", "wan_")
+#:
+#: ⚠ ``wan_`` IS DELIBERATELY ABSENT and must stay absent until the Wan family lands. Releasing
+#: the bare-token ban for a filename prefix that matches NO module in this branch buys nothing
+#: and pre-authorises musubi's --discrete_flow_shift 7.0 — the exact Wan value this gate was
+#: written to keep out of an inference path — for a file nobody has reviewed yet. The carve-out
+#: travels WITH runners/wan_musubi.py on the multi-source branch, where it has a consumer.
+_FAMILY_PREFIXES = ("h3_", "qwen_edit_")
 
 #: Wan tokens that stay banned EVERYWHERE, including in family-scoped modules. The bare ``shift``
 #: is deliberately absent: it is the token this scoping exists to release.
@@ -66,9 +72,8 @@ _WAN_TOKENS_ALWAYS = ("UniPC", "frames=33", "guidance_scale=5", "num_inference_s
 #: family's set is refused — including Wan's 4.0, which is what the original token guarded against.
 _ALLOWED_SHIFT_VALUES = {
     "qwen_edit_": {"3.0", "7.0"},   # METHOD §8: edit 3.0, base Qwen-Image 7.0
-    "wan_": {"7.0"},                # musubi --discrete_flow_shift 7.0
     "h3_": set(),                   # H3 pins no static shift; any literal here is a surprise
-}
+}   # NOTE: no "wan_" entry — it lands with the wan family. See _FAMILY_PREFIXES above.
 
 #: Modules OUTSIDE inference/ that carry sampling parameters and must be scanned anyway. Added
 #: because the Qwen scheduler pin lives in models/, and a gate that misses the file holding the
@@ -102,6 +107,22 @@ def _shift_literals(code: str) -> set[str]:
 
     Case-insensitive for the last reason. A scanner that silently under-matches is worse than no
     scanner: it reports a clean gate over an unread file.
+
+    A FOURTH form, added 2026-08-12 after review: the CALL.
+
+        scheduler.set_shift(4.0)                     call with a literal
+        pipe.scheduler.set_shift(WAN_SHIFT)          call with a symbolic constant
+
+    This is the form the guarded module's own docstring is about, and neither half of the gate could
+    see it: the released bare-token ban skips family-prefixed files, and the value scanner above
+    requires an ``=`` or a ``:``, so ``set_shift(4.0)`` extracted nothing at all. A Wan-tuned value
+    could therefore ship into an inference path with both halves green — the single failure this
+    file exists to prevent.
+
+    Symbolic arguments are resolved against numeric constants assigned in the SAME file. A constant
+    imported from another module is not resolved and is deliberately not silently ignored either:
+    it is returned as its name, so an unrecognised (non-numeric) entry surfaces at the caller rather
+    than vanishing.
     """
     pattern = re.compile(
         r"""[\w.]*shift\w*["']?\s*(?::\s*[\w\[\]]+\s*)?=\s*([0-9]+\.?[0-9]*)"""
@@ -114,6 +135,28 @@ def _shift_literals(code: str) -> set[str]:
             found.add(a)
         if b:
             found.add(b)
+
+    # Same-file numeric constants, so a symbolic call argument can be resolved to its value.
+    consts = {
+        name: value
+        for name, value in re.findall(
+            r"""^\s*([A-Za-z_]\w*)\s*(?::\s*[\w\[\]]+\s*)?=\s*([0-9]+\.?[0-9]*)\s*$""",
+            code,
+            re.MULTILINE,
+        )
+    }
+    for arg in re.findall(
+        r"""[\w.]*set_shift\s*\(\s*([^)\s,]+)\s*[,)]""", code, re.IGNORECASE
+    ):
+        arg = arg.strip()
+        if re.fullmatch(r"[0-9]+\.?[0-9]*", arg):
+            found.add(arg)
+        elif arg in consts:
+            found.add(consts[arg])
+        elif not arg.isidentifier() or arg.isupper():
+            # An unresolved SYMBOL (e.g. imported from another module). Surfaced by name rather
+            # than dropped: an allowed-value check that silently sees nothing reports a clean gate.
+            found.add(arg)
     return found
 
 
@@ -206,7 +249,11 @@ def test_a_wan_shift_value_in_a_family_module_is_still_refused() -> None:
     assert "4.0" not in _ALLOWED_SHIFT_VALUES["qwen_edit_"], (
         "4.0 became allowed for qwen_edit — that is Wan's value and the whole point of this gate"
     )
-    assert "4.0" not in _ALLOWED_SHIFT_VALUES["wan_"]
+    assert "wan_" not in _FAMILY_PREFIXES and "wan_" not in _ALLOWED_SHIFT_VALUES, (
+        "a wan_ carve-out is present without a wan_ module to justify it. Releasing the bare-token "
+        "ban for a family that does not exist in this branch pre-authorises musubi's 7.0 in an "
+        "inference path nobody has reviewed — the carve-out must travel with runners/wan_musubi.py."
+    )
 
 
 def test_the_shift_literal_scanner_reads_real_forms() -> None:
@@ -215,6 +262,11 @@ def test_the_shift_literal_scanner_reads_real_forms() -> None:
         ("shift = 3.0", {"3.0"}),
         ("scheduler.shift = 3.0", {"3.0"}),
         ("set_shift(x)\nshift=7.0", {"7.0"}),
+        # THE CALL FORM — the hole this scanner had until 2026-08-12. Both of these previously
+        # extracted NOTHING, so a Wan value reached an inference path with the gate green.
+        ("scheduler.set_shift(4.0)", {"4.0"}),
+        ("pipe.scheduler.set_shift( 7.0 )", {"7.0"}),
+        ("WAN_SHIFT = 4.0\nscheduler.set_shift(WAN_SHIFT)", {"4.0"}),
         ('cfg = {"shift": 3.0}', {"3.0"}),
         ("discrete_flow_shift = 7.0", {"7.0"}),
         ("no_shift_here()", set()),

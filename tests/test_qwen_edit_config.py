@@ -26,6 +26,7 @@ CPU only. No torch model, no Modal, no downloads.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -397,16 +398,47 @@ def test_ltx_conditioning_mode_is_refused_under_qwen_edit() -> None:
     assert "conditioning.mode" in str(exc.value)
 
 
-def test_caption_dropout_under_caching_is_refused_rather_than_silently_zeroed() -> None:
-    with pytest.raises((ValidationError, ValueError)):
-        SignetConfig(
-            **_qwen_payload(
-                qwen_edit={"caption_dropout_rate": 0.1, "cache_text_embeddings": True}
+def test_caption_dropout_is_refused_on_this_family_under_EITHER_cache_setting() -> None:
+    """Both settings refuse — and the second half is the one that used to be the bug.
+
+    This test previously asserted that `cache_text_embeddings: false` was an ESCAPE from the
+    dropout refusal, matching a schema message that offered exactly that remedy. Neither was true.
+    That flag's only runtime consumer is the re-encode SKIP in qwen_edit_preprocess
+    (modal/fns.py:5560); it does not switch training to live text encoding, and nothing in the tree
+    ever supplies `empty_text_conditions`. So the "escape" produced a config that loads, dry-runs
+    green, passes the cost gate, boots an A100, pays the ~40.9 GiB load, and dies at the first
+    dropout draw — ten more times under the stage's retry policy.
+
+    A test that asserts a broken remedy WORKS is worse than no test: it pins the bug in place and
+    reports green while doing it.
+    """
+    for caching in (True, False):
+        with pytest.raises((ValidationError, ValueError)) as exc:
+            SignetConfig(
+                **_qwen_payload(
+                    qwen_edit={"caption_dropout_rate": 0.1, "cache_text_embeddings": caching}
+                )
             )
+        message = str(exc.value)
+        assert "empty_text_conditions" in message, (
+            "the refusal must name what is actually missing — an empty-caption payload — rather "
+            "than blame the cache setting"
         )
-    SignetConfig(
-        **_qwen_payload(qwen_edit={"caption_dropout_rate": 0.1, "cache_text_embeddings": False})
-    )
+        assert "Do NOT reach for cache_text_embeddings: false" in message, (
+            "the refusal must actively steer the operator off the remedy that costs eleven A100 "
+            "container starts"
+        )
+
+
+def test_cache_text_embeddings_declares_that_it_has_no_training_side_effect() -> None:
+    """The knob is preprocess-scoped; its description must say so, because its name does not.
+
+    `cache_text_embeddings` reads as a training switch and is not one. That gap is what made the
+    old dropout remedy plausible enough to ship.
+    """
+    description = QwenEditConfig.model_fields["cache_text_embeddings"].description or ""
+    assert "does NOT switch training to live text encoding" in description
+    assert "qwen_edit_preprocess" in description
 
 
 def test_row_ceiling_refuses_only_when_someone_measured_one() -> None:
@@ -425,3 +457,40 @@ def test_text_embed_dim_is_carried_as_an_unverified_assumption() -> None:
     description = QwenEditConfig.model_fields["text_embed_dim"].description or ""
     assert "UNVERIFIED" in description
     assert "txt_in" in description
+
+
+def test_the_timestep_weighting_ablation_has_a_config_surface() -> None:
+    """The ablation build_qwen_edit_step_fn documents must be reachable from YAML, not from an edit.
+
+    Its own docstring says the ablation should be "stated explicitly in a config rather than
+    achieved by deleting a line". Until this field existed there was no key for it and no caller
+    threaded it, so the only route to the unweighted loss was editing train/qwen_edit_step.py or
+    modal/fns.py — an untracked source change driving a metered A100, producing an adapter that no
+    config on disk explains. Default True is the locked recipe, so this changes no existing run.
+    """
+    assert QwenEditConfig().timestep_weighting is True
+    assert SignetConfig(**_qwen_payload()).qwen_edit.timestep_weighting is True
+    assert (
+        SignetConfig(
+            **_qwen_payload(qwen_edit={"timestep_weighting": False})
+        ).qwen_edit.timestep_weighting
+        is False
+    )
+    description = QwenEditConfig.model_fields["timestep_weighting"].description or ""
+    assert "ABLATION" in description
+
+
+def test_the_train_stage_threads_timestep_weighting_from_the_config() -> None:
+    """A field with no consumer is the defect the lean field-split exists to kill.
+
+    Source-scanned rather than executed: the threading point is inside ``qwen_edit_train``, a Modal
+    stage that cannot run without ~40.9 GiB of weights. A field that parses but never reaches the
+    builder would leave the ablation exactly as unreachable as it was before, while LOOKING landed.
+    """
+    stage = (
+        Path(__file__).resolve().parents[1] / "src/signet_trainer/modal/fns.py"
+    ).read_text(encoding="utf-8")
+    assert "timestep_weighting=config.qwen_edit.timestep_weighting" in stage, (
+        "qwen_edit_train no longer threads timestep_weighting from the config — the field is back "
+        "to being changeable only by editing source"
+    )

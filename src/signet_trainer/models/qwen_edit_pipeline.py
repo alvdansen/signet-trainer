@@ -286,6 +286,7 @@ def pin_qwen_edit_scheduler(
     shift: float = QWEN_EDIT_RENDER_SCHEDULER_SHIFT,
     dynamic: bool = False,
     inherit_config: bool = True,
+    shipped_config: Any = None,
 ) -> dict[str, Any]:
     """Override ``pipeline.scheduler`` AFTER the pipeline exists, then verify the override took.
 
@@ -304,6 +305,10 @@ def pin_qwen_edit_scheduler(
         until it has been re-READ off the pipeline.
     """
     base = getattr(getattr(pipeline, "scheduler", None), "config", None) if inherit_config else None
+    # When the caller supplied the checkpoint's own config, that is the authority to inherit from
+    # AND the authority to verify against — not whatever the pipeline ctor happened to attach.
+    if shipped_config is not None:
+        base = shipped_config
     scheduler = qwen_edit_static_scheduler(base, shift=shift, dynamic=dynamic)
     pipeline.register_modules(scheduler=scheduler)
     if getattr(pipeline, "scheduler", None) is not scheduler:
@@ -313,7 +318,9 @@ def pin_qwen_edit_scheduler(
             "attached, so this cannot be allowed to pass — a render under an unpinned scheduler is "
             "the muddy-output failure METHOD §8 names, and it reads as a bad adapter."
         )
-    return assert_qwen_edit_scheduler_pinned(pipeline, shift=shift, dynamic=dynamic)
+    return assert_qwen_edit_scheduler_pinned(
+        pipeline, shift=shift, dynamic=dynamic, shipped_config=shipped_config
+    )
 
 
 def assert_qwen_edit_scheduler_pinned(
@@ -321,6 +328,7 @@ def assert_qwen_edit_scheduler_pinned(
     *,
     shift: float = QWEN_EDIT_RENDER_SCHEDULER_SHIFT,
     dynamic: bool = False,
+    shipped_config: Any = None,
 ) -> dict[str, Any]:
     """Refuse to render unless the attached scheduler IS the §8 one. CPU-pure; no torch needed.
 
@@ -339,9 +347,25 @@ def assert_qwen_edit_scheduler_pinned(
 
     Accepts a pipeline or a bare scheduler so a test can drive it without constructing either.
 
+    ``shipped_config`` MAKES "INHERITED WHOLESALE" A CHECK RATHER THAN A CLAIM. Checks (1) and (2)
+    read ``shift`` and ``use_dynamic_shifting`` and nothing else, so a scheduler built from library
+    DEFAULTS instead of the checkpoint's own config passes both while stepping a schedule the
+    checkpoint never shipped with — ``shift_terminal``, ``time_shift_type``, ``base_shift`` /
+    ``max_shift`` and ``stochastic_sampling`` all silently revert. The render is a plausible image,
+    so the §8 divergence read blames the adapter: the exact failure this module exists to prevent,
+    with this function green. When the shipped config is supplied, every key in it EXCEPT the two
+    this recipe deliberately overrides must survive into the live scheduler.
+
+    A strict comparison is correct here and does not fire spuriously on ``from_config``'s
+    ``_use_default_values`` stripping: the keys that stripping removes are the ones the donor left
+    AT their default, so the rebuilt scheduler re-derives the identical value. A difference means
+    the donor set something non-default and it was lost — which is the whole bug.
+
     Returns:
-        ``{"class", "shift", "use_dynamic_shifting", "shift_terminal", "time_shift_type"}`` —
-        the numbers a render should print, read back off the live object rather than restated.
+        ``{"class", "shift", "use_dynamic_shifting", "shift_terminal", "time_shift_type",
+        "inherited"}`` — the numbers a render should print, read back off the live object rather
+        than restated. ``inherited`` names the fields compared against the shipped config, or is
+        ``None`` when no shipped config was supplied.
     """
     scheduler = getattr(pipeline_or_scheduler, "scheduler", pipeline_or_scheduler)
     if scheduler is None:
@@ -366,7 +390,38 @@ def assert_qwen_edit_scheduler_pinned(
         "use_dynamic_shifting": live_dynamic,
         "shift_terminal": config.get("shift_terminal", None),
         "time_shift_type": config.get("time_shift_type", None),
+        "inherited": None,
     }
+
+    #: The two fields this recipe overrides on purpose. Everything else in the shipped config is the
+    #: checkpoint's own schedule and must survive the rebuild untouched.
+    _OVERRIDDEN = ("shift", "use_dynamic_shifting")
+
+    if shipped_config is not None:
+        shipped = dict(shipped_config)
+        compared = {
+            key: value
+            for key, value in shipped.items()
+            if key not in _OVERRIDDEN and not str(key).startswith("_")
+        }
+        lost = {
+            key: (value, config.get(key, None))
+            for key, value in compared.items()
+            if config.get(key, None) != value
+        }
+        report["inherited"] = sorted(compared)
+        if lost:
+            raise RuntimeError(
+                f"[qwen-edit-pipeline] the pinned scheduler did NOT inherit the checkpoint's shipped "
+                f"config. Field(s) lost (shipped -> live): "
+                + ", ".join(f"{k}={v[0]!r} -> {v[1]!r}" for k, v in sorted(lost.items()))
+                + ". Only shift and use_dynamic_shifting may differ; every other field is the "
+                "schedule the checkpoint was shipped with. A scheduler rebuilt from diffusers' "
+                "library defaults passes the two checks above and still steps a schedule this "
+                "checkpoint never had — the render comes out plausible, so the §8 divergence read "
+                "attributes the difference to the ADAPTER. That is the muddy-render failure this "
+                "module exists for, arriving with its own guard green."
+            )
 
     if live_dynamic != bool(dynamic):
         raise RuntimeError(
@@ -412,6 +467,7 @@ def build_qwen_edit_pipeline(
     shift: float = QWEN_EDIT_RENDER_SCHEDULER_SHIFT,
     dynamic: bool = False,
     scheduler_config: Any = None,
+    allow_library_defaults: bool = False,
 ) -> Any:
     """Assemble a ``QwenImageEditPlusPipeline`` from already-loaded components (Modal-side ONLY).
 
@@ -454,6 +510,22 @@ def build_qwen_edit_pipeline(
     """
     from diffusers import QwenImageEditPlusPipeline  # noqa: PLC0415 — function-local
 
+    if scheduler_config is None and not allow_library_defaults:
+        raise ValueError(
+            '[qwen-edit-pipeline] scheduler_config is None. The checkpoint ships its own '
+            'scheduler/scheduler_config.json and it is the schedule this model was trained '
+            'and validated on; falling back to FlowMatchEulerDiscreteScheduler() library '
+            'defaults silently reverts shift_terminal, time_shift_type, base_shift/max_shift '
+            'and stochastic_sampling. That produces a plausible image on a schedule the '
+            'checkpoint never had, which the §8 read then attributes to the ADAPTER — and both '
+            'existing pin checks stay green, because they read only shift and '
+            'use_dynamic_shifting. WHAT LANDS IT: load it beside the weights, e.g. '
+            'FlowMatchEulerDiscreteScheduler.from_pretrained(<pipeline_root>, '
+            'subfolder="scheduler", local_files_only=True).config, and pass it as '
+            'scheduler_config. Pass allow_library_defaults=True ONLY where there is no '
+            'checkpoint to inherit from (a CPU test building a toy pipeline).'
+        )
+
     scheduler = qwen_edit_static_scheduler(scheduler_config, shift=shift, dynamic=dynamic)
     pipeline = QwenImageEditPlusPipeline(
         scheduler=scheduler,
@@ -466,7 +538,11 @@ def build_qwen_edit_pipeline(
     # THE OVERRIDE, AFTER the pipeline exists. §8 names this as the step, and the module docstring
     # records why doing it before is not enough in general.
     report = pin_qwen_edit_scheduler(
-        pipeline, shift=shift, dynamic=dynamic, inherit_config=scheduler_config is None
+        pipeline,
+        shift=shift,
+        dynamic=dynamic,
+        inherit_config=scheduler_config is None,
+        shipped_config=scheduler_config,
     )
     logger.info(
         "[qwen-edit-pipeline] %s assembled; recipe %s; scheduler %s",

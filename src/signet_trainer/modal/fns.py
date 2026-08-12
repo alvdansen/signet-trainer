@@ -5900,7 +5900,20 @@ def qwen_edit_train(config_yaml: str) -> None:
         device=device,
         dtype=torch_dtype,
     )
-    hooks = build_loop_hooks("qwen_edit", strategy=strategy, seed=config.training.seed)
+    # timestep_weighting comes from the CONFIG, not the builder default: leaving it at the default
+    # made the documented unweighted-loss ablation reachable only by editing source, i.e. an
+    # untracked change driving a metered A100 with nothing on disk recording that the run departed
+    # from the bell curve. Default True == the locked recipe, so this changes no existing run.
+    hooks = build_loop_hooks(
+        "qwen_edit",
+        strategy=strategy,
+        seed=config.training.seed,
+        timestep_weighting=config.qwen_edit.timestep_weighting,
+    )
+    print(
+        f"[qwen_edit_train] timestep_weighting={config.qwen_edit.timestep_weighting} "
+        f"({'the locked bsmntw bell curve — every proven house chain' if config.qwen_edit.timestep_weighting else 'UNWEIGHTED ABLATION — this run departs from the recipe'})."
+    )
 
     ckpt_manager = CheckpointManager(
         CHECKPOINTS_DIR / config.output_dir, keep_n=config.training.keep_checkpoints
@@ -6329,18 +6342,45 @@ def qwen_edit_sample(config_yaml: str) -> None:
             "the concrete class from the checkpoint's own processor_class, so an unexpected class "
             "here means the mounted snapshot is not a Qwen2.5-VL processor."
         )
+    # ── the checkpoint's OWN scheduler config, read off the Volume beside the weights ─────────────
+    # Not optional and not a nicety. §8 pins exactly two fields (shift, use_dynamic_shifting); every
+    # OTHER field of the schedule — shift_terminal, time_shift_type, base_shift/max_shift,
+    # stochastic_sampling — belongs to the checkpoint, and building from
+    # FlowMatchEulerDiscreteScheduler() library defaults silently substitutes diffusers' values for
+    # all of them. Both existing pin checks stay green through that substitution because they read
+    # only the two pinned fields, and the render still produces a plausible image — so the §8
+    # divergence read blames the adapter. build_qwen_edit_pipeline now REFUSES a None config, and
+    # assert_qwen_edit_scheduler_pinned verifies field-by-field that this config actually survived.
+    from diffusers import FlowMatchEulerDiscreteScheduler  # noqa: PLC0415 — function-local
+
+    shipped_scheduler_config = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        str(WEIGHTS_DIR / config.model.pipeline_root_id),
+        subfolder="scheduler",
+        local_files_only=True,
+    ).config
+    print(
+        f"[qwen_edit_sample] inheriting the checkpoint's shipped scheduler config from "
+        f"{config.model.pipeline_root_id}/scheduler — "
+        f"shift_terminal={shipped_scheduler_config.get('shift_terminal', None)!r} "
+        f"time_shift_type={shipped_scheduler_config.get('time_shift_type', None)!r} "
+        f"base_shift={shipped_scheduler_config.get('base_shift', None)!r} "
+        f"max_shift={shipped_scheduler_config.get('max_shift', None)!r}. Only shift and "
+        f"use_dynamic_shifting are overridden by §8; the rest is the checkpoint's own schedule."
+    )
+
     pipeline = build_qwen_edit_pipeline(
         transformer=adapted,
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         processor=processor,
+        scheduler_config=shipped_scheduler_config,
     )
     print(
         f"[qwen_edit_sample] pipeline assembled ({type(pipeline).__name__}); scheduler pinned to "
-        "the §8 STATIC reparameterisation AFTER construction and verified — the trap on this "
-        "family is that a pipeline factory rebuilds its own default-shift scheduler, and the "
-        "symptom is a muddy render that reads as a bad adapter."
+        "the §8 STATIC reparameterisation AFTER construction and verified field-by-field against "
+        "the shipped config — the trap on this family is that a pipeline factory rebuilds its own "
+        "default-shift scheduler, and the symptom is a muddy render that reads as a bad adapter."
     )
 
     # ── (8) render — base first, then each band member, resuming and committing per image ─────────
