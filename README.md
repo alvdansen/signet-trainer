@@ -344,3 +344,7 @@ signet-trainer harvests and ports a validated foundation from `enochiatron` and 
 whose block-swap offloader descends from **musubi-tuner** (kohya-ss). It contains ported code from
 **Lightricks/LTX-2** and transcribed code from **huggingface/diffusers**. Full attribution, change
 notices, and license texts are in [`NOTICE`](NOTICE) and [`LICENSES/`](LICENSES).
+
+A particular thank-you to **ostris** and [ai-toolkit](https://github.com/ostris/ai-toolkit) — for
+generous advice along the way, and for a trainer whose public example (not least its MiniMax-H3
+work) repeatedly sharpened our own thinking about how these models should be trained.
