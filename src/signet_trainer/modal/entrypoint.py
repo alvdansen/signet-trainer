@@ -797,6 +797,7 @@ def _wan_source_views(cfg: object) -> tuple[object, ...]:
             # is exactly why the enum is a mixin (config/sources.py records the bench-interpreter
             # reason). Reading ``.value`` is the cost of that, paid once, here.
             extraction=source.extraction.value,
+            directory=source.directory,
             target_frames=tuple(source.target_frames),
             frame_sample=source.frame_sample,
             num_repeats=source.num_repeats,

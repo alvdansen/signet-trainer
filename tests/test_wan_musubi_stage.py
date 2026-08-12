@@ -604,14 +604,32 @@ def test_an_unknown_extraction_is_refused_rather_than_priced() -> None:
 
 
 def test_the_batch_line_prices_the_real_example_and_names_what_it_cannot_read() -> None:
-    """The Kaboom method: 1 still + 2 head clips + 2 uniform windows = 5 instances per media file."""
+    """The Kaboom method, reported PER CORPUS — because the sources sit in different directories.
+
+    The line used to end "5 clip instance(s) per media file across 3 source(s)", summing an IMAGE
+    source and two VIDEO sources over DIFFERENT directories. Those addends count different files,
+    so the operator's multiplication was wrong in both directions: with 100 stills and 10 videos
+    the true clip-instance count is 100x1 + 10x2 + 10x2 = 140, while 5 x 110 = 550 (~4x over) and
+    5 x 10 = 50 (3x under). The banner exists to be checkable by eye against a real corpus, and in
+    that form it could not be.
+
+    Now one multiplier per corpus: Images x1, Videos x4 — each multiplied by the file count of that
+    directory, which is a number the operator can read off their own dataset. 100x1 + 10x4 = 140.
+    """
     from signet_trainer.modal.entrypoint import _wan_batch_note
 
     line = _wan_batch_note(load_config(_EXAMPLE))
     assert "stills=image:1x1=1" in line
     assert "appearance=head:2x1=2" in line
     assert "motion=uniform:2x1=2" in line
-    assert "5 clip instance(s) per media file" in line
+    assert "/dataset/Kaboom/Images x1" in line
+    assert "/dataset/Kaboom/Videos x4" in line, (
+        "the two video sources over ONE directory must be summed together (2 + 2), while the image "
+        "corpus stays separate"
+    )
+    assert "clip instance(s) per media file across" not in line, (
+        "the cross-corpus total is back — it adds counts of different files"
+    )
     # The two things an operator must not read off this line as if they were measured.
     assert "EPOCH-driven" in line and "--max_train_epochs 16" in line
     assert "training.max_steps=4000" in line and "NOT passed to the runner" in line
@@ -624,8 +642,8 @@ def test_a_corpus_dependent_source_makes_the_TOTAL_decline_to_exist() -> None:
 
     estimate = wan_batch_estimate(
         sources=[
-            WanSourceView("a", "video", "head", (21,), 1, 1),
-            WanSourceView("b", "video", "chunk", (21,), 1, 3),
+            WanSourceView("a", "video", "head", (21,), 1, 1, "/dataset/K/Videos"),
+            WanSourceView("b", "video", "chunk", (21,), 1, 3, "/dataset/K/Videos"),
         ],
         max_train_epochs=16,
         declared_max_steps=4000,
@@ -640,7 +658,7 @@ def test_num_repeats_multiplies_the_instances() -> None:
     from signet_trainer.modal.cost import WanSourceView, wan_batch_estimate
 
     estimate = wan_batch_estimate(
-        sources=[WanSourceView("a", "video", "head", (1, 21), 1, 3)],
+        sources=[WanSourceView("a", "video", "head", (1, 21), 1, 3, "/dataset/K/Videos")],
         max_train_epochs=16,
         declared_max_steps=10,
         est_hours=1.0,

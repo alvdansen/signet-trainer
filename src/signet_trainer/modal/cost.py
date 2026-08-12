@@ -222,6 +222,9 @@ class WanSourceView:
     target_frames: tuple[int, ...]
     frame_sample: int
     num_repeats: int
+    #: The source's media directory. Carried because clip instances are only summable WITHIN
+    #: one corpus — two sources over different directories count different files.
+    directory: str
 
 
 @dataclass(frozen=True)
@@ -234,6 +237,7 @@ class WanSourceClips:
     clips_per_media: int | None
     num_repeats: int
     instances_per_media: int | None
+    directory: str = ""
 
     def describe(self) -> str:
         if self.clips_per_media is None:
@@ -257,18 +261,48 @@ class WanBatchEstimate:
     est_hours: float
 
     def describe(self) -> str:
+        """Per-source breakdown, then a PER-CORPUS multiplier — never one cross-corpus total.
+
+        ⛔ THE OLD TOTAL WAS IN INCOMMENSURABLE UNITS. It summed instances_per_media across every
+        source and reported one number "per media file", but this feature's defining case is an
+        IMAGE source and VIDEO sources over DIFFERENT directories — so the addends counted different
+        files and the product was wrong in both directions. On the shipped example it printed
+        "5 clip instance(s) per media file across 3 source(s)"; with 100 stills and 10 videos the
+        true count is 100x1 + 10x2 + 10x2 = 140, while the printed recipe yields 5 x 110 = 550
+        (~4x over) or 5 x 10 = 50 (3x under) depending on which count the operator substitutes.
+
+        The banner's stated purpose is to be checkable BY EYE against the corpus the operator
+        actually has. Grouping by directory is what makes that possible: one multiplier per corpus,
+        each multiplied by the file count of that corpus, which is a number the operator can read
+        off their own dataset.
+        """
         breakdown = "; ".join(s.describe() for s in self.per_source) or "no sources"
-        if self.instances_per_media_total is None:
-            total = (
-                "total NOT SIZEABLE — at least one source uses chunk/slide, whose clip count "
-                "depends on video LENGTH (a Volume-side fact)"
-            )
-        else:
-            total = (
-                f"{self.instances_per_media_total} clip instance(s) per media file across "
-                f"{len(self.per_source)} source(s)"
-            )
-        return f"{breakdown} -> {total}"
+        if not self.per_source:
+            return f"{breakdown} -> no corpora"
+        by_corpus: dict[str, int | None] = {}
+        for source in self.per_source:
+            corpus = source.directory or "<undeclared directory>"
+            if corpus not in by_corpus:
+                by_corpus[corpus] = 0
+            if by_corpus[corpus] is None or source.instances_per_media is None:
+                by_corpus[corpus] = None  # None propagates WITHIN its corpus, never across
+            else:
+                by_corpus[corpus] += source.instances_per_media
+        parts = []
+        for corpus, instances in by_corpus.items():
+            if instances is None:
+                parts.append(
+                    f"{corpus} NOT SIZEABLE (chunk/slide clip count depends on video LENGTH, a "
+                    f"Volume-side fact)"
+                )
+            else:
+                parts.append(f"{corpus} x{instances}")
+        per_corpus = "; ".join(parts)
+        return (
+            f"{breakdown} -> PER CORPUS: {per_corpus} — multiply each by the number of media files "
+            f"in THAT directory. There is deliberately no single total: clip instances from "
+            f"different directories count different files and cannot be added."
+        )
 
 
 def wan_batch_estimate(
@@ -302,6 +336,7 @@ def wan_batch_estimate(
                 clips_per_media=clips,
                 num_repeats=view.num_repeats,
                 instances_per_media=None if clips is None else clips * view.num_repeats,
+                directory=view.directory,
             )
         )
     # None propagates: a total that silently drops an unknown source would UNDER-count, and this
