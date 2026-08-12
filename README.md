@@ -233,6 +233,18 @@ python -m signet_trainer.local --config <your.yaml> --weights-root <dir> --appro
 - The runner keeps the gate discipline (dry-run gate → plan print → explicit `--approve`) even
   though nothing is metered — the meter here is your wall-clock and an untested path.
 
+## How this is built
+
+We are **domain experts, not career software engineers** — this trainer comes out of a working
+video-LoRA practice, and we build it in heavy collaboration with Claude Code, with close oversight
+on our part at every step: every training decision, recipe, and merge is reviewed against real
+runs on real GPUs. **We ship what works and label what's untested** (you'll see BETA and ALPHA
+tags on exactly the surfaces that haven't earned trust yet), and we always welcome feedback from
+established engineers — issues and PRs pointing out sharper ways to do things are genuinely
+appreciated, not just tolerated.
+
+---
+
 ## Beta status
 
 This is a **private beta** cut with fresh history.
@@ -281,26 +293,9 @@ message naming `SIGNET_PROJECT_ROOT` rather than a stack trace.
 
 ## License
 
-**signet-trainer is source-available, not open source.** It ships under the **Signet Trainer License
-1.0.0** (a PolyForm Small Business 1.0.0 derivative with a modified eligibility threshold).
-
-**Free, with no need to ask, for:**
-
-- individuals — personal, creative, freelance, or educational use, at any income;
-- researchers and educational institutions;
-- nonprofits and charities;
-- organizations that, with their affiliates, had **under USD 2,000,000** in gross revenue last
-  fiscal year **and** have raised **under USD 2,000,000** in total capital.
-
-Cross either threshold and you need a commercial license (with a 90-day grace period; past use is
-not retroactively a violation). Contact **minta@promptcrafted.com**.
-
-Read [`LICENSE`](LICENSE) for the binding text and [`NOTICE`](NOTICE) for the third-party
-attribution inventory — including Apache-2.0 obligations for musubi-tuner-derived and
-diffusers-derived code, MIT-licensed upstreams, and ported Lightricks/LTX-2 code. Both files must
-travel with any copy you distribute.
-
-> ⚠ The license text is not legal advice. Have counsel review it before relying on it.
+Source-available under the **Signet Trainer License 1.0.0** — see [`LICENSE`](LICENSE) for the
+binding text and [`NOTICE`](NOTICE) for third-party attribution. Both files must travel with any
+copy you distribute. Licensing questions: **minta@promptcrafted.com**.
 
 ---
 
