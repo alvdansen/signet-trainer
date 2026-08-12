@@ -29,12 +29,15 @@ from pathlib import Path
 import pytest
 
 from signet_trainer.inference.h3_pipeline_source import (
+    H3_DECODE_FLOOR_FRAMES,
     H3_REF2VA_TRANSFORMER,
     assert_h3_components_loaded_locally,
     assert_h3_frame_count_is_renderable,
     assert_h3_sources_are_local,
     h3_aligned_num_frames,
+    h3_decoder_num_chunks,
     h3_renderable_frame_bounds,
+    h3_video_latent_num_frames,
     read_h3_pipeline_index,
     resolve_h3_component_sources,
 )
@@ -348,6 +351,62 @@ def test_the_refusal_names_the_renderable_counts() -> None:
     message = str(excinfo.value)
     assert "124" in message  # the actionable list, not just a band
     assert "eval-design decision" in message
+
+
+# ── The off-band waiver, and the decode floor it deliberately cannot reach ───────────────────────
+#
+# A campaign that trains STILLS stages them as the shortest legal `17n + 5` clip, so its trained
+# length is off-band by construction. These pin the THREE laws apart: the 17n+5 form, the 5-15 s
+# GENERATION BAND (policy — waivable), and the VIDEO VAE DECODE FLOOR (arithmetic — never waived).
+
+
+def test_the_decode_floor_is_derived_from_the_vae_arithmetic_not_remembered() -> None:
+    """22 is not a magic number: it is the shortest `17n + 5` the decoder yields a chunk for."""
+    legal = [n for n in range(5, 200) if n % 17 == 5]
+    decodable = [n for n in legal if h3_decoder_num_chunks(n) >= 1]
+    assert min(decodable) == H3_DECODE_FLOOR_FRAMES == 22
+    # Below it the failure is the EMPTY chunk list, not a small-but-valid decode.
+    assert h3_decoder_num_chunks(5) == 0
+    # The ENCODER is perfectly happy at 5 — which is why the round trip is asymmetric, and why
+    # training at 5 is legal while rendering at 5 is not.
+    assert h3_video_latent_num_frames(5) == 2
+    assert h3_video_latent_num_frames(22) == 7
+
+
+def test_allow_offband_waives_the_band_and_says_so_loudly() -> None:
+    # 22 frames = 0.917 s: legal 17n+5, off-band, and above the decode floor.
+    with pytest.raises(RuntimeError, match="outside the"):
+        assert_h3_frame_count_is_renderable(22, where="validation.frame_count")
+    allowed = assert_h3_frame_count_is_renderable(
+        22, where="validation.frame_count", allow_offband=True
+    )
+    assert "OFF-BAND" in allowed
+    # The waiver must not read as an endorsement: the checkpoint was RELEASED for 5-15 s, and an
+    # off-band render's quality is the very thing being measured.
+    assert "RELEASED" in allowed
+
+
+def test_allow_offband_does_NOT_waive_the_decode_floor() -> None:
+    """The point of the split: below 22 the failure is a crash, not a shorter clip."""
+    for frames in (5, 22 - 17):  # 5 is the shortest legal training bucket
+        with pytest.raises(RuntimeError, match="DECODE FLOOR") as excinfo:
+            assert_h3_frame_count_is_renderable(
+                frames, where="validation.frame_count", allow_offband=True
+            )
+        message = str(excinfo.value)
+        # It must name WHERE it would have failed: the cost of learning this late is a fully
+        # paid denoise loop.
+        assert "torch.cat" in message
+        assert "decode shim" in message
+
+
+def test_a_render_inside_the_band_is_unchanged_by_the_flag() -> None:
+    """The flag WIDENS, never replaces — so it cannot change a legal render's meaning."""
+    assert assert_h3_frame_count_is_renderable(
+        124, where="validation.frame_count"
+    ) == assert_h3_frame_count_is_renderable(
+        124, where="validation.frame_count", allow_offband=True
+    )
 
 
 @pytest.mark.parametrize("path", SAMPLE_CONFIGS, ids=lambda p: p.name)

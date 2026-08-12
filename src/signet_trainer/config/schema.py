@@ -325,14 +325,18 @@ class H3Config(_Base):
     )
     references_per_sample: int = Field(
         default=H3_PHASE10_REFERENCES_PER_SAMPLE,
-        description="The reference SLOT COUNT, fixed at 2 for every sample (operator ruling). A "
+        description="The reference SLOT COUNT. 2 (the default) is the Ref2VA operator ruling: a "
         "non-environment segment gets two rotating character refs; an environment segment gets one "
         "rotating character ref plus the environment ref, which SUBSTITUTES for the second character "
         "slot rather than being appended. Feeding all three character refs every time would make "
         "conditioning CONSTANT across the corpus, so the model could not learn what varies and would "
         "be free to copy the reference wholesale (the [precedent] copy-collapse failure) — rotating "
         "pairs make identity the INVARIANT. D-10-ASYM is still honored: the reference REGIME "
-        "(character+character vs character+environment) still varies; only the COUNT is fixed.",
+        "(character+character vs character+environment) still varies; only the COUNT is fixed. "
+        "0 = NO-REFERENCE training (ALPHA — smoke-tested only, no end-to-end run exists): no slot "
+        "resolution, no ref latent rows, no Qwen vision blocks, loss over every target row; the "
+        "ref-only knobs (reference_dropout etc.) must stay at their defaults (reverse guard below). "
+        "PR #6 (single-control) adds 1 — the allowlist unions to {0, 1, 2} on merge.",
     )
     environment_ref_last: bool = Field(
         default=True,
@@ -522,17 +526,66 @@ class H3Config(_Base):
     @field_validator("references_per_sample")
     @classmethod
     def _check_references_per_sample(cls, v: int) -> int:
-        if v != H3_PHASE10_REFERENCES_PER_SAMPLE:
+        # THE UNION, LIVE (2026-08-11): #6 (single-control, adds 1) merged to main and the no-ref
+        # ALPHA (adds 0) rebased onto it -- the documented one-token union {0, 1, 2}.
+        # 1 -- single-control tasks (operator ruling 2026-08-07: hero keyframe model, one start
+        #      extreme in / one end extreme out); everything downstream already handled 1 and a
+        #      single reference is strictly CHEAPER (5,040 vs 7,848 packed rows at 16:9).
+        # 0 -- NO-REFERENCE training (ALPHA -- smoke-tested only: one 50-step metered smoke, no
+        #      end-to-end run; --mode sample refused at 0 pending the t2va render leg).
+        # 3 remains refused, and that bound carries the real weight: three slots were never priced,
+        # and an environment reference SUBSTITUTES for the last character slot rather than being
+        # appended -- feeding all three character refs every time would make conditioning CONSTANT
+        # across the corpus and invite copy-collapse.
+        if v not in (0, 1, H3_PHASE10_REFERENCES_PER_SAMPLE):
             raise ValueError(
-                f"invalid references_per_sample {v}: Phase 10 fixes the reference slot count at "
-                f"{H3_PHASE10_REFERENCES_PER_SAMPLE} for EVERY sample (operator ruling). A "
+                f"invalid references_per_sample {v}: the slot count is 0 (NO-REFERENCE training, "
+                f"ALPHA), 1 (single-control), or {H3_PHASE10_REFERENCES_PER_SAMPLE} (Ref2VA -- a "
                 f"non-environment segment gets two rotating character refs; an environment segment "
                 f"gets one rotating character ref plus the environment ref, which SUBSTITUTES for "
-                f"the second character slot — it is never appended, so there is no 3-reference "
-                f"case. Feeding all three character refs every time would make conditioning "
-                f"CONSTANT across the corpus and invite copy-collapse."
+                f"the second character slot). There is no 3-reference case: three slots were never "
+                f"priced by the packed-sequence budget and would OOM a metered container."
             )
         return v
+
+    @model_validator(mode="after")
+    def _check_no_reference_fields(self) -> "H3Config":
+        # NO-REFERENCE (ALPHA) reverse guard — the same bidirectional lean field-split shape as the
+        # ic_lora / inpaint / a2v guards on their blocks: a ref-only knob set while the slot count
+        # is 0 would be SILENTLY ignored (there are no slots for it to act on), so it dies at
+        # config load naming the offending field(s). The budget triple / prompt estimate / aspect /
+        # audio_in_loss / text_encoder_layer still act at 0 and stay free. The three render_* knobs
+        # (render_checkpoint_name / render_merge_adapter / render_offload_reserve) are DELIBERATELY
+        # left free even though --mode sample is REFUSED at 0 slots today: they are inert until the
+        # t2va render leg lands (the tracked no-ref follow-up), and rejecting them would force a
+        # config edit the moment it does. Inert-but-free is a documented choice here, not drift.
+        if self.references_per_sample != 0:
+            return self
+        # Defaults are read off the FIELD DEFINITIONS (not a pristine instance — instantiating one
+        # inside its own model_validator would recurse), so a default change is covered automatically
+        # and the guard cannot drift out of sync (the T-10-05-T doctrine, same as the family guard).
+        ref_only = (
+            "reference_image_short_edge",
+            "reference_dropout",
+            "reference_pair_seed",
+            "environment_ref_last",
+            "t_visual_cond",
+            "character_reference_sizes",
+            "environment_reference_sizes",
+        )
+        nondefault = [
+            name
+            for name in ref_only
+            if getattr(self, name) != H3Config.model_fields[name].get_default(call_default_factory=True)
+        ]
+        if nondefault:
+            raise ValueError(
+                f"H3 reference field(s) {nondefault} set while references_per_sample is 0 "
+                f"(NO-REFERENCE, ALPHA): with zero reference slots these knobs act on nothing and "
+                f"would be silently ignored (lean field-split — no silently-ignored config block). "
+                f"Remove them, or set references_per_sample: 2 for Ref2VA."
+            )
+        return self
 
 
 class QwenEditRenderInput(_Base):
@@ -1418,6 +1471,29 @@ class ValidationConfig(_Base):
     two_stage_upscale: bool = Field(
         default=False, description="D-DEPTH-1: two-stage spatial upscaler, default OFF"
     )
+    # Phase 10 (H3) — waive MiniMax-H3's 5-15 s GENERATION band for this render.
+    #
+    # WHY A WAIVER EXISTS. A campaign that trains STILLS stages each one as the shortest legal
+    # `17n + 5` clip, so its trained length sits BELOW the band by construction and every
+    # evaluation it will ever run is off-band. Rendering ~18x longer than trained is not a
+    # neutral substitute for rendering at the trained length — it is a different question about
+    # the same weights, and telling those two apart is the whole point.
+    #
+    # WHAT IT WAIVES, AND WHAT IT CANNOT. The band is a POLICY: the pipeline reads it off two
+    # `@property` on `MiniMaxH3ModularPipeline`, and the render widens them for itself. It does
+    # NOT waive the video VAE's 22-frame DECODE FLOOR (`H3_DECODE_FLOOR_FRAMES`), which is
+    # arithmetic — below it the decoder's chunk list is empty and `torch.cat([])` raises AFTER
+    # the whole denoise has been paid for. Nor does it waive the `17n + 5` law.
+    #
+    # Config-first per D-NOHARDCODE, default False so every existing config renders
+    # byte-identically and still gets the pre-flight refusal.
+    allow_offband_frame_count: bool = Field(
+        default=False,
+        description="H3: allow validation.frame_count outside MiniMax-H3's 5-15 s generation "
+        "band, to evaluate a model AT ITS TRAINED LENGTH when that length is off-band. Widens "
+        "the pipeline's min/max duration for this render only. Does NOT waive the 22-frame VAE "
+        "decode floor or the 17n+5 law. Default False = historical behaviour.",
+    )
     # Phase 10 (H3 / ref2v) — WHICH manifest row supplies the reference slots this render conditions
     # on. Named by the config's own declared subject-id vocabulary
     # (``h3.character_reference_sizes`` / ``h3.environment_reference_sizes``, third tuple element),
@@ -2269,6 +2345,20 @@ class SignetConfig(_Base):
                     self.h3.reference_image_short_edge,
                 )
                 validate_h3_seq_len_budget(layout.total, max_rows)
+            # NO-REFERENCE (ALPHA) cross-block guard: reference_subject_ids selects which manifest
+            # row supplies a render's reference slots — with zero slots there is nothing to select,
+            # and h3_sample refuses no-reference rendering outright (the pinned diffusers ref2va
+            # workflow is reference-conditioned), so a value here could only ever be silently
+            # ignored. Same lean-field-split shape as the mask/audio condition-kind guard below;
+            # cross-field (h3 block vs validation block), so it lives here.
+            if self.h3.references_per_sample == 0 and self.validation.reference_subject_ids:
+                raise ValueError(
+                    f"validation.reference_subject_ids "
+                    f"{list(self.validation.reference_subject_ids)} is set while "
+                    f"h3.references_per_sample is 0 (NO-REFERENCE, ALPHA): there are no reference "
+                    f"slots for it to select, and no-reference `--mode sample` is refused outright "
+                    f"(lean field-split — no silently-ignored config block). Remove it."
+                )
         elif self.model.family == "qwen_edit":
             # Family #3 FAMILY-EXACT geometry. Note what is NOT here: no pre-screen was widened for
             # qwen_edit, and none needed to be. Its frame law (F == 1 exactly) is a strict SUBSET of

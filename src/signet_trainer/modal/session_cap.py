@@ -41,19 +41,98 @@ blanket's ``spent_usd`` (so a ``cap_usd`` blanket can no longer authorize unboun
 appends a ``spend`` entry (so blanket spend is visible to the cumulative session cap). Blanket
 attribution is unambiguous: ``blanket_authorizes`` returns ``CapDecision.blanket_index`` naming WHICH
 blanket authorized, and that index is fed straight to ``consume_blanket``.
+
+CR-02 — multi-writer safety: the ledger has SEVERAL concurrent writers by design (N parallel
+watchers, one per output_dir, plus the agent's own per-dispatch appends — all against the ONE
+project ledger). Both writers therefore hold an exclusive sidecar lock (``_ledger_lock``) across
+their whole read-modify-write and stage through a per-writer-unique temp file — without both, a
+stale snapshot silently overwrites (LOSES) a concurrent writer's entry and the cumulative cap
+under-counts real spend. Lock tuning lives in the ``DEFAULT_LOCK_*`` constants below.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 # RESEARCH A3 — a proposed house default the operator confirms at setup. Config-driven live value lives on
 # ModalConfig.session_cap_usd (never hardcoded in a skill, D-NOHARDCODE).
 DEFAULT_SESSION_CAP_USD = 10.0
+
+# CR-02 — ledger multi-writer safety tuning (documented defaults, never inline literals). The ledger
+# is MULTI-WRITER by design: N parallel watchers (watch_parallel_inference.py, one per output_dir)
+# plus the agent's own append_spend after each dispatch all append to the ONE project ledger
+# (ModalConfig.session_spend_ledger_path). Each read-modify-write therefore holds an exclusive
+# sidecar lockfile (``<ledger>.lock``, O_CREAT|O_EXCL — works on POSIX and Windows, stdlib-only per
+# Anti-Pattern 6) for the WHOLE read→append→replace, or a concurrent writer's entry is silently
+# lost and the cumulative cap under-counts real spend (fail OPEN).
+DEFAULT_LOCK_TIMEOUT_S = 10.0  # a ledger write takes ms; 10s of contention means something is wrong
+DEFAULT_LOCK_POLL_S = 0.02  # spin/backoff interval while another writer holds the lock
+DEFAULT_LOCK_STALE_S = 30.0  # a lock older than this is a crashed writer's leftover — break it
+DEFAULT_REPLACE_RETRIES = 25  # Windows: os.replace fails while a reader holds the file open; retry
+
+
+@contextmanager
+def _ledger_lock(
+    path: Path,
+    timeout_s: float | None = None,
+    poll_s: float | None = None,
+    stale_s: float | None = None,
+) -> Iterator[None]:
+    """Exclusive cross-process lock over one ledger's read-modify-write (CR-02).
+
+    A sidecar ``<name>.lock`` created with ``os.open(O_CREAT | O_EXCL)`` — atomic on both POSIX and
+    Windows, no new deps (Anti-Pattern 6: stdlib-only). Contending writers spin with backoff until
+    the holder unlinks the lock; a lock older than ``stale_s`` is treated as a crashed writer's
+    leftover and broken (a ledger write takes milliseconds, so a stale lock can only be a corpse).
+    Acquisition past ``timeout_s`` raises ``TimeoutError`` LOUDLY — a spend append must never be
+    silently skipped (CR-01 airtight accounting fails CLOSED, not open).
+
+    ``None`` tuning args resolve to the module defaults at CALL time (not def time) so tests can
+    monkeypatch the constants.
+    """
+    timeout_s = DEFAULT_LOCK_TIMEOUT_S if timeout_s is None else timeout_s
+    poll_s = DEFAULT_LOCK_POLL_S if poll_s is None else poll_s
+    stale_s = DEFAULT_LOCK_STALE_S if stale_s is None else stale_s
+    lock = path.with_name(path.name + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_s
+    fd: int | None = None
+    while fd is None:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except (FileExistsError, PermissionError):
+            # PermissionError: Windows raises EACCES (not EEXIST) while the holder's unlink of the
+            # lock is still delete-pending — same meaning as contended, so re-poll, don't crash.
+            try:
+                if time.time() - lock.stat().st_mtime > stale_s:
+                    lock.unlink()  # crashed writer's leftover — break it and re-contend
+                    continue
+            except OSError:
+                pass  # lock vanished or is contended mid-check — just re-poll
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"could not acquire ledger lock {lock} within {timeout_s:.1f}s -- another "
+                    "writer is wedged (or its stale lock is younger than "
+                    f"{stale_s:.1f}s). The spend append was NOT recorded; fails CLOSED (CR-01)."
+                )
+            time.sleep(poll_s)
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))  # holder pid, for post-mortem only
+        yield
+    finally:
+        os.close(fd)
+        try:
+            lock.unlink()
+        except OSError:
+            pass  # already broken as stale by a contender — nothing to release
 
 
 @dataclass(frozen=True)
@@ -125,16 +204,36 @@ def session_cap_check(
 def _atomic_write_json(path: Path, data: dict) -> None:
     """Write ``data`` as pretty JSON to ``path`` ATOMICALLY (P8-IN-04 / T-09-03-01 Tampering).
 
-    Writes to a sibling ``<name>.tmp`` then ``os.replace(tmp, path)`` — an atomic rename on both
-    POSIX and Windows (``os.replace`` overwrites the destination). A crash mid-write therefore
-    leaves the OLD, still-valid ledger intact rather than a truncated / half-written JSON that
-    ``read_ledger`` would reject LOUDLY (fail CLOSED) and wedge the harness. The single whole-file
-    writer for both ``append_spend`` and ``consume_blanket``.
+    Writes to a sibling ``<name>.<pid>.<uuid>.tmp`` then ``os.replace(tmp, path)`` — an atomic
+    rename on both POSIX and Windows (``os.replace`` overwrites the destination). A crash mid-write
+    therefore leaves the OLD, still-valid ledger intact rather than a truncated / half-written JSON
+    that ``read_ledger`` would reject LOUDLY (fail CLOSED) and wedge the harness. The single
+    whole-file writer for both ``append_spend`` and ``consume_blanket``.
+
+    CR-02: the staging name is UNIQUE per writer (pid + uuid) — a fixed shared ``<name>.tmp`` let
+    concurrent writers stage over each other (and collide with ``PermissionError`` on Windows).
+    On Windows ``os.replace`` also fails with ``PermissionError`` while a READER (``read_ledger``
+    in another process) transiently holds the destination open — that is retried with backoff
+    (``DEFAULT_REPLACE_RETRIES``); POSIX never hits it. Any other ``OSError`` propagates unretried.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        for attempt in range(DEFAULT_REPLACE_RETRIES):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:  # Windows sharing violation: a reader holds the destination
+                if attempt == DEFAULT_REPLACE_RETRIES - 1:
+                    raise
+                time.sleep(DEFAULT_LOCK_POLL_S)
+    except BaseException:
+        try:
+            tmp.unlink()  # never leave an orphaned staging file next to the ledger
+        except OSError:
+            pass
+        raise
 
 
 def read_ledger(ledger_path: str | Path) -> float:
@@ -187,6 +286,11 @@ def append_spend(ledger_path: str | Path, est_usd: float, run_ref: str | None = 
     Creates the file (with a minimal skeleton) when absent; preserves any existing setup-gate keys
     (``triage_mode`` / ``session_cap_usd`` / ``blankets``) — this operates ONLY on ``spend``.
 
+    CR-02: the whole read-modify-write runs under ``_ledger_lock`` — the ledger is multi-writer
+    (N parallel watchers + the agent's own dispatch appends), and an unlocked interleaving lets a
+    stale snapshot overwrite (silently LOSE) a concurrent writer's entry, under-counting the
+    cumulative cap. Raises ``TimeoutError`` if the lock cannot be acquired (never skip recording).
+
     WR-06: a negative or NaN ``est_usd`` is REJECTED — a negative append would silently reduce the
     counted cumulative spend (fail open against the cap), and NaN would poison every later sum.
     """
@@ -196,21 +300,22 @@ def append_spend(ledger_path: str | Path, est_usd: float, run_ref: str | None = 
             "(a negative amount would reduce the counted cumulative spend — fail open)."
         )
     path = Path(ledger_path)
-    if path.exists():
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+    with _ledger_lock(path):
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        else:
             data = {}
-    else:
-        data = {}
-    data.setdefault("spend", [])
-    data["spend"].append(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "est_usd": float(est_usd),
-            "run_ref": run_ref,
-        }
-    )
-    _atomic_write_json(path, data)
+        data.setdefault("spend", [])
+        data["spend"].append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "est_usd": float(est_usd),
+                "run_ref": run_ref,
+            }
+        )
+        _atomic_write_json(path, data)
 
 
 def consume_blanket(
@@ -234,7 +339,8 @@ def consume_blanket(
     that authorized this run. Raises ``ValueError`` on a negative ``est_usd`` (a negative amount would
     silently REDUCE both the blanket and the cumulative counters — fail open) or an out-of-range
     ``blanket_index``. This operates on the SAME SESSION-STATE.json ``append_spend`` uses; both are
-    pure-stdlib (no modal).
+    pure-stdlib (no modal), and both hold ``_ledger_lock`` across the whole read-modify-write
+    (CR-02 — same lost-update exposure as ``append_spend``, same lock, same TimeoutError posture).
     """
     if est_usd < 0 or est_usd != est_usd:  # negative OR NaN (NaN != NaN) fails closed.
         raise ValueError(
@@ -242,36 +348,37 @@ def consume_blanket(
             "(a negative/NaN amount would corrupt the blanket + cumulative spend accounting)."
         )
     path = Path(ledger_path)
-    if path.exists():
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+    with _ledger_lock(path):
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        else:
             data = {}
-    else:
-        data = {}
-    blankets = data.get("blankets", [])
-    if not isinstance(blankets, list) or not (0 <= blanket_index < len(blankets)):
-        n = len(blankets) if isinstance(blankets, list) else 0
-        raise ValueError(
-            f"consume_blanket: blanket_index {blanket_index} is out of range for {n} blanket(s) in "
-            f"{path} — pass the CapDecision.blanket_index returned by blanket_authorizes."
+        blankets = data.get("blankets", [])
+        if not isinstance(blankets, list) or not (0 <= blanket_index < len(blankets)):
+            n = len(blankets) if isinstance(blankets, list) else 0
+            raise ValueError(
+                f"consume_blanket: blanket_index {blanket_index} is out of range for {n} blanket(s) "
+                f"in {path} — pass the CapDecision.blanket_index returned by blanket_authorizes."
+            )
+        blanket = blankets[blanket_index]
+        if not isinstance(blanket, dict):
+            raise ValueError(
+                f"consume_blanket: blankets[{blanket_index}] in {path} is not a dict "
+                f"({type(blanket).__name__}) — malformed SESSION-STATE, refusing to attribute spend."
+            )
+        blanket["spent_usd"] = float(blanket.get("spent_usd", 0.0)) + float(est_usd)
+        data.setdefault("spend", [])
+        data["spend"].append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "est_usd": float(est_usd),
+                "run_ref": run_ref,
+                "blanket_index": blanket_index,
+            }
         )
-    blanket = blankets[blanket_index]
-    if not isinstance(blanket, dict):
-        raise ValueError(
-            f"consume_blanket: blankets[{blanket_index}] in {path} is not a dict "
-            f"({type(blanket).__name__}) — malformed SESSION-STATE, refusing to attribute spend."
-        )
-    blanket["spent_usd"] = float(blanket.get("spent_usd", 0.0)) + float(est_usd)
-    data.setdefault("spend", [])
-    data["spend"].append(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "est_usd": float(est_usd),
-            "run_ref": run_ref,
-            "blanket_index": blanket_index,
-        }
-    )
-    _atomic_write_json(path, data)
+        _atomic_write_json(path, data)
 
 
 def _is_expired(expires: str, now: datetime) -> bool:

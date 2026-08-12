@@ -119,11 +119,23 @@ def _watch_dispatch(fc: object, watch_seconds: float, label: str) -> None:
     try:
         fc.get(timeout=watch_seconds)
     except TimeoutError:
-        print(
-            f"[signet-entrypoint] {label} still RUNNING after {watch_seconds:g}s — this client is "
-            f"disengaging, the run is NOT cancelled (async dispatch). Track it via FunctionCall id "
-            f"{fc.object_id}, `modal app logs <app-id>`, or the output Volume."
-        )
+        if "--detach" in sys.argv:
+            print(
+                f"[signet-entrypoint] {label} still RUNNING after {watch_seconds:g}s — this client "
+                f"is disengaging, the run is NOT cancelled (async dispatch). Track it via "
+                f"FunctionCall id {fc.object_id}, `modal app logs <app-id>`, or the output Volume."
+            )
+        else:
+            # Honesty fix (audit 2026-08-11): without --detach the ephemeral app STOPS when this
+            # client exits and the spawned call is stopped with it — the old unconditional "NOT
+            # cancelled" print was FALSE in exactly the case the startup warning above describes.
+            print(
+                f"[signet-entrypoint] {label} still RUNNING after {watch_seconds:g}s — this client "
+                f"is disengaging WITHOUT --detach, so the ephemeral app (and this call, "
+                f"FunctionCall id {fc.object_id}) will be STOPPED with it. Treat this run as LOST "
+                "and re-launch with --detach.",
+                file=sys.stderr,
+            )
         return
     print(f"[signet-entrypoint] {label} COMPLETED inside the {watch_seconds:g}s watch window.")
 
@@ -881,6 +893,26 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
                 f"shell BEFORE `modal run` so app.py captures it at import (WR-01). Aborting "
                 f"pre-approval, no dispatch.{silent_note}"
             )
+
+    # (1c) H3 NO-REFERENCE (ALPHA) routing — pre-approval, zero-spend. No new mode and no new entry
+    #      point: no-reference rides --mode train/preprocess through THIS same gate. `sample` is
+    #      REFUSED here (and again in-container, belt to this brace): h3_sample is transcribed for
+    #      the reference-conditioned ref2va workflow only, and the t2va workflow a no-reference
+    #      render needs is not transcribed in this repo — faking it as "ref2va with no references"
+    #      would render an unvalidated request under a no-reference label.
+    if cfg.model.family == "h3" and cfg.h3.references_per_sample == 0:
+        if mode == "sample":
+            raise SystemExit(
+                "[signet-entrypoint] h3.references_per_sample is 0 (NO-REFERENCE, ALPHA) and "
+                "--mode sample was requested: no-reference H3 rendering is NOT supported (the "
+                "pinned diffusers ref2va workflow is reference-conditioned end to end; the t2va "
+                "workflow is not transcribed in this repo). Aborting pre-approval, no dispatch. "
+                "Train/preprocess ride --mode train/preprocess; for renders, file an issue."
+            )
+        print(
+            "[signet-entrypoint] H3 NO-REFERENCE TRAINING IS ALPHA - smoke-tested only, no "
+            "end-to-end run exists; file issues"
+        )
 
     # (2) Dry-run hard gate (CONF-03) on the already-loaded cfg — must pass before ANY remote
     #     dispatch. Non-zero -> abort.

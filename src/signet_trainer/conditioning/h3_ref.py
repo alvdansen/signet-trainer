@@ -714,7 +714,9 @@ class H3RefStrategy(TrainingStrategy):
 
     Args:
         references_per_sample: Fixed slot count (2). The environment ref SUBSTITUTES for the second
-            character slot rather than being appended.
+            character slot rather than being appended. 0 = NO-REFERENCE training (ALPHA): the
+            reference source is never read, the text conditions on the PROMPT-ONLY state, and the
+            packed batch carries zero conditioning-video rows — through the same packer.
         reference_dropout: D-10-REFDROP probability, per ``(segment, step)``.
         reference_pair_seed: D-10-PAIRSEED. One seed feeds three domain-separated streams (pair,
             single-character, dropout), so the schedules are reproducible AND uncorrelated.
@@ -771,14 +773,21 @@ class H3RefStrategy(TrainingStrategy):
         self.expected_layout = expected_layout
 
     def get_data_sources(self) -> Sequence[Any]:
-        """The four H3 precomputed sources this strategy reads.
+        """The H3 precomputed sources this strategy reads — four for Ref2VA, three at zero slots.
 
         Mirrors ``ic_lora.py:102-108``'s third-source declaration, one source further: H3 needs a
         FOURTH (``h3_audio_latents``) because target audio rows stay in the packed sequence even
         though they are out of the loss (D-10-AUDIO). All four are ``h3_``-prefixed so they can never
         be paired with the LTX-encoded sources of the same role — different VAE, different text
         encoder, silently wrong at the correct shape.
+
+        NO-REFERENCE (ALPHA, ``references_per_sample == 0``): ``h3_reference_latents`` is NOT
+        declared — ``PrecomputedDataset`` raises on a configured source whose dir does not exist, so
+        declaring it would make a no-reference cache (which has no reference dir) unloadable. A
+        REF-BEARING cache stays consumable: the dataset simply never reads its reference dir.
         """
+        if self.references_per_sample == 0:
+            return [name for name in H3_DATA_SOURCES if name != "h3_reference_latents"]
         return list(H3_DATA_SOURCES)
 
     def _absent_target_audio_rows(self) -> int:
@@ -890,11 +899,14 @@ class H3RefStrategy(TrainingStrategy):
             self.patch_size,
         )
 
+        # NO-REFERENCE (ALPHA): zero slots means no dropout draw at all — there is no reference
+        # regime to drop out of, and the schema already pinned reference_dropout at its default.
+        no_reference = self.references_per_sample == 0
         # ⛔ The D-10-REFDROP draw is made HERE, before the text is read, because it now selects
         # WHICH text state this step conditions on. Previously the drop removed the reference LATENT
         # rows while the cached text kept describing both references — a regime that occurs nowhere
         # at inference, leaking identity into ~20% of steps.
-        dropped = reference_dropout_for(
+        dropped = not no_reference and reference_dropout_for(
             segment_index,
             step,
             dropout=self.reference_dropout,
@@ -905,8 +917,14 @@ class H3RefStrategy(TrainingStrategy):
         # TEXT — >90% of the text stream modulating with the wrong AdaLN row, silently, on every
         # step. `read_h3_text_state` also REFUSES the stale version-1 cache (a bare tensor), which is
         # what is on the Volume today.
+        #
+        # A NO-REFERENCE step reads the PROMPT-ONLY state for the same reason a dropped step does:
+        # it is the presentation with no vision blocks, which is what makes the request genuinely
+        # reference-free — and it is what keeps a REF-BEARING cache consumable by a no-reference
+        # train (the reference-bearing state would describe references this run never shows).
         text_state, vision_spans = read_h3_text_state(
-            _lookup(batch, H3_TEXT_BATCH_KEYS, "text condition"), reference_dropped=dropped
+            _lookup(batch, H3_TEXT_BATCH_KEYS, "text condition"),
+            reference_dropped=dropped or no_reference,
         )
         text = _as_rows(text_state, "text conditions")
 
@@ -924,18 +942,33 @@ class H3RefStrategy(TrainingStrategy):
         video_targets = target - video_noise
 
         # ── references: resolve, order, gather. CLEAN — no latent noise here (D-10-REFPIN) ───────
-        pool = _parse_reference_pool(
-            _lookup(batch, H3_REFERENCE_BATCH_KEYS, "reference latent"), self.patch_size
-        )
-        if dropped:
-            # A genuine conditioning-REGIME variation, which is the point (D-10-ASYM): varying the
-            # number and kind of references across the corpus stops the adapter binding to a fixed
-            # reference regime, and is one of the three copy-collapse levers.
+        if no_reference:
+            # NO-REFERENCE (ALPHA): the reference source is NEVER read — not looked up, not parsed.
+            # That is the whole train-side contract: a ref-bearing cache stays consumable because
+            # its h3_reference_latents dir is simply ignored, and a no-reference cache needs none.
+            # Zero rows through the SAME packer below; h3_row_timesteps / h3_loss_mask both handle
+            # n_cond_video == 0 (the packing math is reused, never forked).
             references: list[H3Reference] = []
             reference_rows = torch.zeros(
                 (1, 0, deps.patch_dim), dtype=target.dtype, device=target.device
             )
+        elif dropped:
+            # The pool is still PARSED on a dropped step (the cache contract is validated every
+            # step, exactly as before) — only its rows go unused this step.
+            _parse_reference_pool(
+                _lookup(batch, H3_REFERENCE_BATCH_KEYS, "reference latent"), self.patch_size
+            )
+            # A genuine conditioning-REGIME variation, which is the point (D-10-ASYM): varying the
+            # number and kind of references across the corpus stops the adapter binding to a fixed
+            # reference regime, and is one of the three copy-collapse levers.
+            references = []
+            reference_rows = torch.zeros(
+                (1, 0, deps.patch_dim), dtype=target.dtype, device=target.device
+            )
         else:
+            pool = _parse_reference_pool(
+                _lookup(batch, H3_REFERENCE_BATCH_KEYS, "reference latent"), self.patch_size
+            )
             references = self._resolve_slots(segment_index, pool)
             by_path = {reference.path: rows for reference, rows in pool}
             reference_rows = torch.cat([by_path[r.path] for r in references], dim=1)

@@ -8,9 +8,11 @@ backward/roundtrip) run only Modal-side in the metered preflight; here we assert
       pulled in (heavy imports are function-local — mirrors ``tests/test_loop_purity.py``);
   (2) the dimension constants the gate asserts against are the SAME single-source values imported
       from ``signet_trainer.models.loader`` (no duplicated literals);
-  (3) check #3's matcher (``resolve_lora_targets``) resolves the FULL ``P1_FF_LORA_TARGETS`` list —
-      including the ``ff.net.0.proj`` / ``ff.net.2`` entries (the fix) — against a FAKE ``nn.Module``
-      whose ``named_modules()`` mimic the real ``transformer_blocks.<i>.attn{1,2}.* / ff.net.*`` keys;
+  (3) check #3 probes the set THE RUN WILL INJECT (``config.lora.target_modules``) with the
+      PEFT-faithful matchers from ``lora/peft.py`` — including the a2v regression (a video-only
+      arch must FAIL the gate when the run injects the 14-entry a2v set), the dot-bounded matcher
+      semantics (no ``xattn1.to_q`` coincidence match), and the bare-``str`` regex (H3) form —
+      against FAKE ``nn.Module``s whose ``named_modules()`` mimic the real key layouts;
   (4) ``CheckResult`` is a structured record with ``name`` / ``status`` (+ ``hard_gate``) fields and
       check #6 is flagged as the hard gate.
 
@@ -137,7 +139,7 @@ def test_check3_matcher_resolves_full_target_list_on_fake_module() -> None:
     resolution = resolve_lora_targets(_FakeTransformer(n_blocks=2), P1_FF_LORA_TARGETS)
 
     assert resolution["unmatched"] == [], (
-        f"all locked targets must resolve via name.endswith; unmatched={resolution['unmatched']}"
+        f"all locked targets must resolve on the fake arch; unmatched={resolution['unmatched']}"
     )
     assert set(resolution["matched"]) == set(P1_FF_LORA_TARGETS)
 
@@ -157,6 +159,154 @@ def test_check3_matcher_reports_unmatched_target() -> None:
     )
     assert "attn1.to_q" in resolution["matched"]
     assert resolution["unmatched"] == ["nonexistent.module"]
+
+
+def test_check3_matcher_is_dot_bounded_like_peft() -> None:
+    """The matcher mirrors PEFT: ``attn1.to_q`` must NOT match a coincidental ``xattn1.to_q``.
+
+    The original port used a bare ``name.endswith(target)``, which is looser than PEFT's
+    dot-bounded suffix matching — the gate would count modules PEFT never injects into.
+    """
+    from signet_trainer.train.validate_gate import resolve_lora_targets
+
+    decoy = nn.Module()
+    decoy.xattn1 = nn.Module()
+    decoy.xattn1.to_q = nn.Linear(4, 4)
+    resolution = resolve_lora_targets(decoy, ["attn1.to_q"])
+    assert resolution["unmatched"] == ["attn1.to_q"], (
+        "a coincidental 'xattn1.to_q' must not satisfy target 'attn1.to_q' (PEFT is dot-bounded)"
+    )
+
+
+# --------------------------------------------------------------------------------------------------
+# (3b) check #3 probes the CONFIG's injected set — the a2v-blind-adapter regression
+# --------------------------------------------------------------------------------------------------
+
+
+def _lora_config_ns(target_modules):
+    """A minimal config namespace shaped like SignetConfig for the gate's getattr chain."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(lora=SimpleNamespace(target_modules=target_modules))
+
+
+def test_check3_fails_when_a2v_targets_missing_from_arch() -> None:
+    """An a2v run (14-entry injected set) on a video-only arch must FAIL check #3.
+
+    Regression for the gate-honesty blocker: probing the hardcoded P1_FF_LORA_TARGETS reported
+    'PASS 10/10' while all four cross-modal audio_to_video_attn.* targets were unmatched — the
+    metered run would train an adapter structurally blind to the driving audio.
+    """
+    from types import SimpleNamespace
+
+    from signet_trainer.lora.peft import A2V_CROSS_MODAL_LORA_TARGETS, P1_A2V_LORA_TARGETS
+    from signet_trainer.train.validate_gate import check_lora_targets
+
+    components = SimpleNamespace(transformer=_FakeTransformer(n_blocks=2))
+    result = check_lora_targets(components, _lora_config_ns(list(P1_A2V_LORA_TARGETS)))
+
+    assert result.status == "FAIL", result.message
+    assert set(result.details["unmatched"]) == set(A2V_CROSS_MODAL_LORA_TARGETS)
+    for target in A2V_CROSS_MODAL_LORA_TARGETS:
+        assert target in result.message  # the refusal names the missing cross-modal targets
+
+
+def test_check3_passes_when_config_set_resolves_and_counts_are_reported() -> None:
+    """The locked LTX set (config-carried) passes on the fake LTX arch, with per-target counts."""
+    from types import SimpleNamespace
+
+    from signet_trainer.lora.peft import P1_FF_LORA_TARGETS
+    from signet_trainer.train.validate_gate import check_lora_targets
+
+    components = SimpleNamespace(transformer=_FakeTransformer(n_blocks=2))
+    result = check_lora_targets(components, _lora_config_ns(list(P1_FF_LORA_TARGETS)))
+
+    assert result.status == "PASS", result.message
+    assert result.details["counts"]["ff.net.2"] == 2
+    assert "per-target counts" in result.message
+
+
+def test_check3_falls_back_to_locked_list_when_config_carries_no_targets() -> None:
+    """target_modules None -> the same ``or P1_FF_LORA_TARGETS`` fallback check #5 uses."""
+    from types import SimpleNamespace
+
+    from signet_trainer.lora.peft import P1_FF_LORA_TARGETS
+    from signet_trainer.train.validate_gate import check_lora_targets
+
+    components = SimpleNamespace(transformer=_FakeTransformer(n_blocks=2))
+    result = check_lora_targets(components, _lora_config_ns(None))
+
+    assert result.status == "PASS", result.message
+    assert set(result.details["matched"]) == set(P1_FF_LORA_TARGETS)
+
+
+class _FakeH3Block(nn.Module):
+    """A fake H3 single-stream block (``attn.*`` + ``ff.net.*`` leaves)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attn = nn.Module()
+        self.attn.to_q = nn.Linear(4, 4)
+        self.attn.to_k = nn.Linear(4, 4)
+        self.attn.to_v = nn.Linear(4, 4)
+        self.attn.to_out = nn.ModuleList([nn.Linear(4, 4)])
+        self.ff = nn.Module()
+        proj = nn.Module()
+        proj.proj = nn.Linear(4, 8)
+        self.ff.net = nn.ModuleList([proj, nn.GELU(), nn.Linear(8, 4)])
+
+
+class _FakeH3Transformer(nn.Module):
+    def __init__(self, n_blocks: int = 2) -> None:
+        super().__init__()
+        self.transformer_blocks = nn.ModuleList(_FakeH3Block() for _ in range(n_blocks))
+
+
+def test_check3_bare_str_target_is_probed_as_regex_not_char_exploded() -> None:
+    """A bare-``str`` target (the H3 PEFT-regex form) routes to the regex probe, never list(str).
+
+    Iterating the string as a list would probe single characters ('t', 'r', ...) — the
+    char-explosion hazard the schema's ``list[str] | str`` union carries.
+    """
+    from types import SimpleNamespace
+
+    from signet_trainer.lora.peft import H3_LORA_TARGET_REGEX
+    from signet_trainer.train.validate_gate import check_lora_targets
+
+    components = SimpleNamespace(transformer=_FakeH3Transformer(n_blocks=2))
+    result = check_lora_targets(components, _lora_config_ns(H3_LORA_TARGET_REGEX))
+
+    assert result.status == "PASS", result.message
+    assert result.details["total"] == 12  # 2 blocks x 6 leaves
+    assert all(n == 2 for n in result.details["per_leaf"].values())
+
+
+def test_check3_bare_str_h3_regex_fails_on_per_leaf_zero() -> None:
+    """The H3 family regex on an attn-less arch FAILs (per-leaf zero), naming the cold leaves."""
+    from types import SimpleNamespace
+
+    from signet_trainer.lora.peft import H3_LORA_TARGET_REGEX
+    from signet_trainer.train.validate_gate import check_lora_targets
+
+    # An arch carrying ONLY the ff leaves: the four attn.* leaves match zero modules.
+    class _FfOnlyBlock(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ff = nn.Module()
+            proj = nn.Module()
+            proj.proj = nn.Linear(4, 8)
+            self.ff.net = nn.ModuleList([proj, nn.GELU(), nn.Linear(8, 4)])
+
+    class _FfOnly(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transformer_blocks = nn.ModuleList([_FfOnlyBlock()])
+
+    components = SimpleNamespace(transformer=_FfOnly())
+    result = check_lora_targets(components, _lora_config_ns(H3_LORA_TARGET_REGEX))
+
+    assert result.status == "FAIL", result.message
+    assert "ZERO-MATCH leaves" in result.message
 
 
 # --------------------------------------------------------------------------------------------------

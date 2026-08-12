@@ -203,6 +203,48 @@ tooling and private run history that are **not** part of this release.
 
 ---
 
+## Local training (BETA — **UNTESTED**, issues wanted)
+
+For users with a workstation GPU rather than Modal credits, there is a local runner that drives
+the **same** training loop, architecture gate, and block-swap offloader as the Modal path — with
+local paths and no Volume/commit machinery:
+
+```bash
+python -m signet_trainer.local --config configs/ltx23_lora.example.yaml \
+    --weights-root /path/to/weights --dry-run-only    # free: refusals + shape gate + plan only
+python -m signet_trainer.local --config <your.yaml> --weights-root <dir> --approve
+```
+
+**⚠ Read before relying on it:**
+
+- **No end-to-end local run on real weights has been performed.** The mechanics are unit-tested
+  on CPU; the full path is exactly what this label disclaims. **You are the test — please file
+  everything you hit**, good or bad: local support is being tackled next and tickets filed now
+  directly shape it. Roadmap: [#25](https://github.com/alvdansen/signet-trainer/issues/25).
+- Scope today: **LTX family**, conditioning modes `none` / `single_frame` / `multi_frame`.
+  Everything else (h3/qwen families, `ic_lora`/`inpaint`/`audio_to_video`, frozen-adapter
+  stacking, in-loop sampling) is **refused loudly at startup** with a pointer — never half-run.
+- It consumes a **pre-encoded** dataset (the `PrecomputedDataset` layout). Local pre-encoding is
+  a roadmap item; today, encode via the gated Modal preprocess and `modal volume get` the result.
+- VRAM reality: the 22B peaked at **62.8 GiB at `blocks_to_swap: 16` on an A100-80GB**. Smaller
+  cards need deeper swapping and are **unmeasured**; a 24 GB card does not fit the 22B at all.
+  The offloader's long-run adapter *quality* is itself an open item (OFFL-02) — one more reason
+  this is a beta.
+- The runner keeps the gate discipline (dry-run gate → plan print → explicit `--approve`) even
+  though nothing is metered — the meter here is your wall-clock and an untested path.
+
+## How this is built
+
+We are **domain experts, not career software engineers** — this trainer comes out of a working
+video-LoRA practice, and we build it in heavy collaboration with Claude Code, with close oversight
+on our part at every step: every training decision, recipe, and merge is reviewed against real
+runs on real GPUs. **We ship what works and label what's untested** (you'll see BETA and ALPHA
+tags on exactly the surfaces that haven't earned trust yet), and we always welcome feedback from
+established engineers — issues and PRs pointing out sharper ways to do things are genuinely
+appreciated, not just tolerated.
+
+---
+
 ## Beta status
 
 This is a **private beta** cut with fresh history.
@@ -220,6 +262,17 @@ This is a **private beta** cut with fresh history.
   output.
 
 ### Known beta gaps
+
+Two operational caveats from the most recent deep audit (fixes are staged for the next round —
+tracked in issue #45):
+
+- **The parallel-render watcher's unattended completion-detection has known gaps** (it can declare
+  a long render stalled or complete at the wrong moment). For now, prefer attended renders and
+  re-run the grid script manually to refresh a live grid; the artifacts themselves always commit
+  to the Volume regardless.
+- **The cost line prices ONE container life.** Arms that carry server-side retries can multiply
+  the worst-case metered spend well past the printed estimate if a run is repeatedly preempted or
+  times out. Watch long metered runs; do not fire-and-forget under a tight budget.
 
 `python -m pytest` is **not** green out of the box, for reasons that are known rather than
 mysterious. Expect roughly **48 failed, ~1890 passed, 27 skipped**, in three groups:
@@ -251,26 +304,9 @@ message naming `SIGNET_PROJECT_ROOT` rather than a stack trace.
 
 ## License
 
-**signet-trainer is source-available, not open source.** It ships under the **Signet Trainer License
-1.0.0** (a PolyForm Small Business 1.0.0 derivative with a modified eligibility threshold).
-
-**Free, with no need to ask, for:**
-
-- individuals — personal, creative, freelance, or educational use, at any income;
-- researchers and educational institutions;
-- nonprofits and charities;
-- organizations that, with their affiliates, had **under USD 2,000,000** in gross revenue last
-  fiscal year **and** have raised **under USD 2,000,000** in total capital.
-
-Cross either threshold and you need a commercial license (with a 90-day grace period; past use is
-not retroactively a violation). Contact **minta@promptcrafted.com**.
-
-Read [`LICENSE`](LICENSE) for the binding text and [`NOTICE`](NOTICE) for the third-party
-attribution inventory — including Apache-2.0 obligations for musubi-tuner-derived and
-diffusers-derived code, MIT-licensed upstreams, and ported Lightricks/LTX-2 code. Both files must
-travel with any copy you distribute.
-
-> ⚠ The license text is not legal advice. Have counsel review it before relying on it.
+Source-available under the **Signet Trainer License 1.0.0** — see [`LICENSE`](LICENSE) for the
+binding text and [`NOTICE`](NOTICE) for third-party attribution. Both files must travel with any
+copy you distribute. Licensing questions: **minta@promptcrafted.com**.
 
 ---
 

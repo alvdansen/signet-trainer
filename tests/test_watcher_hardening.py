@@ -5,10 +5,12 @@ the structural money-safety invariants the audit demands, without importing them
 run their module-level ``load_config`` + ``sys.exit`` usage). The watchers drive METERED renders,
 so their correctness is verified by static structure, not by execution.
 
-Scope drift is asserted EXPLICITLY (the plan's #1-is-campaign-fork-only rule):
-  * #1 (detached dispatch + artifact-freshness gate) — CAMPAIGN FORK ONLY. The generalized watcher
-    stays ATTACHED here (its coupled detach+freshness is Wave 2 #6); a test asserts its ``--detach``
-    is ABSENT so detach never lands without its freshness gate.
+Scope (updated audit 2026-08-11 — Wave 2 #6 has LANDED):
+  * #1 (detached dispatch + artifact-freshness gate) — BOTH watchers now. The generalized watcher's
+    original attached-dispatch scope guard was written against the pre-D-10-DEF-17 synchronous
+    ``.remote()`` dispatch; after the ``.spawn()`` change an attached watcher re-dispatched and
+    re-billed the same render every poll. Detach + freshness landed together, as the coupling rule
+    demands.
   * #2 (success-gated bookkeeping) + #4 (pre-dispatch session-cap gate) — BOTH watchers.
 """
 
@@ -64,10 +66,19 @@ def test_fork_dispatches_detached():
     assert "--detach" in _src(FORK)
 
 
-def test_generalized_stays_attached():
-    # Scope guard: the generalized watcher must NOT have --detach in this plan — its coupled
-    # detach+freshness pair is Wave 2 #6. Detach never lands without its freshness gate.
-    assert "--detach" not in _src(GENERALIZED)
+def test_generalized_dispatches_detached_with_freshness():
+    # Wave 2 #6 LANDED (audit 2026-08-11): the generalized watcher now carries the SAME coupled
+    # detach+freshness pair as the fork. The old scope guard asserted --detach ABSENT — that pin was
+    # written when dispatch was attached-synchronous .remote(); after D-10-DEF-17 moved the
+    # entrypoint to .spawn() + a dispatch_watch_seconds disengage, an attached watcher re-dispatched
+    # and re-billed the same render every poll (the app teardown killed each spawned render). Detach
+    # lands together with its freshness gate, never alone:
+    s = _src(GENERALIZED)
+    assert "--detach" in _func_body(GENERALIZED, "dispatch_render")
+    assert "render_stall_minutes" in s, "freshness threshold must be config-derived (D-NOHARDCODE)"
+    assert "RENDER_STALL_MIN" in s
+    assert "render_landed(" in _main_body(GENERALIZED), "completion must be ARTIFACT-gated in main()"
+    assert "pending_step" in _main_body(GENERALIZED), "single-flight pending state must exist"
 
 
 def test_fork_detach_removes_client_kill_timeout():

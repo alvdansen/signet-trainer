@@ -439,6 +439,36 @@ def _assert_h3_contract(cfg: SignetConfig, mi: ModelInputs) -> None:
     }
     assert priced == realized, f"realized row counts {realized} != priced layout {priced}"
 
+    # --- (a0) NO-REFERENCE (ALPHA, references_per_sample == 0) — the reduced-sequence proof -------
+    # Mirrors the ic_lora arm's structural role: prove the no-reference geometry BEFORE any spend.
+    # Zero ref latent rows, zero vision doubling (the each-image-bills-TWICE rule removes BOTH
+    # contributions), text = the bare prompt estimate, and the budget totals over the REDUCED
+    # sequence — so a regression that re-grows either contribution fails here, on CPU, for free.
+    if cfg.h3.references_per_sample == 0:
+        assert batch.n_cond_video == 0 and layout.n_cond_video == 0, (
+            f"no-reference: expected ZERO reference latent rows, got batch {batch.n_cond_video} / "
+            f"layout {layout.n_cond_video}."
+        )
+        assert layout.n_vision == 0, (
+            f"no-reference: expected ZERO Qwen vision rows (no vision-token doubling), got "
+            f"{layout.n_vision}."
+        )
+        assert not _h3_vision_spans(cfg, budget), (
+            "no-reference: the synthetic batch must carry NO vision spans."
+        )
+        assert layout.n_text == cfg.h3.prompt_tokens_estimate, (
+            f"no-reference: n_text {layout.n_text} != prompt_tokens_estimate "
+            f"{cfg.h3.prompt_tokens_estimate} — a reference-free presentation is the bare prompt, "
+            f"no label blocks and no sentinels."
+        )
+        assert layout.total == (
+            layout.n_text + layout.n_cond_audio + layout.n_target_audio + layout.n_target_video
+        ), f"no-reference: budget total {layout.total} does not sum over the reduced sequence."
+        assert bool(mi.video_loss_mask.all()), (
+            "no-reference: the loss mask must cover EVERY video row — there is no reference "
+            "prefix to exclude."
+        )
+
     # --- (a) THE L-3 guard -------------------------------------------------------------------------
     assert mi.ref_seq_len > 0 or not budget.references, (
         "a declared reference corpus must produce a non-empty reference prefix"
@@ -1762,11 +1792,13 @@ def _h3_ok_banner(cfg: SignetConfig, budget: H3DryrunBudget) -> str:
     frames = cfg.training_dims[2]
     canvas_height, canvas_width = resolve_canvas_size(*cfg.h3.target_aspect)
     aspect_w, aspect_h = cfg.h3.target_aspect
-    pair = (
-        f"worst pair {budget.worst_pair_label}"
-        if budget.worst_pair_label
-        else "no references declared"
-    )
+    if budget.worst_pair_label:
+        pair = f"worst pair {budget.worst_pair_label}"
+    elif cfg.h3.references_per_sample == 0:
+        # The ALPHA marking is deliberate banner text: every no-reference dryrun says so.
+        pair = "NO-REFERENCE (ALPHA - smoke-tested only)"
+    else:
+        pair = "no references declared"
     return (
         f"[signet-dryrun] OK — H3 config valid, synthetic packed batch built on CPU: "
         f"family={cfg.model.family}, canvas {canvas_width}x{canvas_height} "

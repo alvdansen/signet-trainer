@@ -881,9 +881,13 @@ def h3_vae_smoke_encode(
         vae: The H3 video VAE, already loaded and on its device.
         clip_pixels: One real decoded clip, ``[C, F, H, W]`` uint8 — the target-video modality.
         reference_image: One real reference image (Pillow-like) — the single-frame modality.
+            ``None`` on a NO-REFERENCE (ALPHA) encode: the single-frame branch is then unreachable
+            by design (no reference is ever encoded on that run), so the smoke covers the clip
+            modality only and says so in its report.
         reference_short_edge: The config's ``reference_image_short_edge``.
         reference_descriptor: That reference's manifest descriptor (``path`` / ``kind`` /
             ``subject_id``), passed through so the payload builder's real refusals run too.
+            ``None`` iff ``reference_image`` is ``None``.
         latents_mean: Per-channel ``latents_mean`` from the video VAE config.
         latents_std: Per-channel ``latents_std``.
         clip_pixel_frames: The clip's source frame count, so the ``17n+5 -> 5n+2`` law is checked.
@@ -899,6 +903,18 @@ def h3_vae_smoke_encode(
         latents_std,
         pixel_frames=int(clip_pixel_frames),
     )
+    if reference_image is None:
+        # NO-REFERENCE (ALPHA): a run with zero reference slots never reaches the num_frames == 1
+        # branch, so there is nothing for the reference leg to prove — and there is no reference to
+        # encode it with. Skipped LOUDLY, not silently: the report names the reduced coverage.
+        video_latents = video["latents"]
+        return (
+            f"[h3-vae-smoke] CLIP modality encoded on the real VAE — clip "
+            f"{clip_pixel_frames}f -> latents {list(video_latents.shape)} "
+            f"({video['num_frames']}f x {video['height']}x{video['width']}). NO-REFERENCE (ALPHA) "
+            f"run: the single-frame reference branch (D-10-DEF-9 / D-10-DEF-12) is unreachable by "
+            f"design on this encode and was NOT smoked."
+        )
     # ⛔ references_per_sample=1 is not a shortcut, it is the point: ONE reference is enough to reach
     # the num_frames == 1 branch, and the campaign's real slot count is checked by the loop itself.
     # Encoding all of them here would multiply the cost of a preflight whose value is that it is

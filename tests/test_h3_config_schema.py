@@ -131,7 +131,7 @@ def test_h3_config_carries_the_locked_d10_defaults() -> None:
     assert h3.reference_image_short_edge == 896  # Phase 10 VRAM decision (spec is 2048)
     assert h3.reference_dropout == pytest.approx(0.2)  # D-10-REFDROP
     assert h3.reference_pair_seed == 42  # D-10-PAIRSEED
-    assert h3.references_per_sample == 2  # exactly-2-slot operator ruling
+    assert h3.references_per_sample == 2  # Ref2VA default; 1 is legal for single-control tasks
     assert h3.environment_ref_last is True  # D-10-REFORDER
     assert h3.prompt_tokens_estimate == 96
     assert h3.text_encoder_layer == 50  # Qwen3-VL hidden_states[50] of 64
@@ -485,3 +485,35 @@ def test_dims_invalid_under_both_families_still_die_at_the_field_level() -> None
     """32 satisfies neither ``(F-1)%8`` nor ``17n+5`` — the pre-screen still rejects it outright."""
     with pytest.raises(ValidationError):
         SignetConfig.model_validate(_ltx_payload(training_dims=[768, 512, 32]))
+
+
+# ── references_per_sample is 1 OR 2 — and 3 is still refused ─────────────────────────────────────
+#
+# The original ruling fixed the count at 2 because Phase 10's corpus is Ref2VA. It was never a
+# claim that the architecture requires two, and a SINGLE-CONTROL task (one image in, one image
+# out) is a legitimate shape the same stack already handles end to end.
+
+
+def test_a_single_control_task_may_declare_one_reference_slot() -> None:
+    assert H3Config(references_per_sample=1).references_per_sample == 1
+    assert H3Config(references_per_sample=2).references_per_sample == 2
+
+
+def test_three_reference_slots_are_still_refused_and_the_refusal_says_why() -> None:
+    """The bound that carries real weight: three slots were never priced by the row budget."""
+    with pytest.raises(ValidationError) as excinfo:
+        H3Config(references_per_sample=3)
+    message = str(excinfo.value)
+    # An environment ref SUBSTITUTES for the second character slot rather than being appended,
+    # so a 3-reference case does not exist to be priced in the first place.
+    assert "SUBSTITUTES" in message
+    assert "OOM" in message
+
+
+def test_zero_reference_slots_are_alpha_no_reference() -> None:
+    """SUPERSEDED premise (this test once refused 0): 0 is now NO-REFERENCE training (ALPHA,
+    2026-08-11) — text-only is a supported workflow on the same packing, with the ref-only
+    fields reverse-guarded. The bound that still carries weight is 3 (never priced)."""
+    assert H3Config(references_per_sample=0).references_per_sample == 0
+    with pytest.raises(ValidationError):
+        H3Config(references_per_sample=3)

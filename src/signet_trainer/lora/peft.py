@@ -490,7 +490,7 @@ def save_adapter(
 def load_adapter_into(
     model: nn.Module, ckpt_dir: str | Path, adapter_name: str = "default"
 ) -> Any:
-    """Load ``adapter_model.safetensors`` from ``ckpt_dir`` into ``model`` via PEFT.
+    """Load ``adapter_model.safetensors`` from ``ckpt_dir`` into ``model`` via PEFT — FAIL-LOUD.
 
     Keeps PEFT-native keys (the saved file already carries the ``base_model.model.`` prefix that
     ``set_peft_model_state_dict`` expects). An adapter-only file legitimately leaves the frozen
@@ -498,6 +498,21 @@ def load_adapter_into(
     is that no UNEXPECTED keys appear. This is also the resume adapter-reload seam (landmine #1,
     03-04): ``set_peft_model_state_dict`` is what re-hydrates the LoRA weights that
     ``CheckpointManager.resume()`` does NOT restore.
+
+    THE CONTRACT IS ENFORCED, not just documented. ``set_peft_model_state_dict`` never raises on a
+    key mismatch — it returns ``_IncompatibleKeys`` and applies whatever happened to line up. Every
+    caller of this seam (the D-9-CHAINED / h3_train warm starts, the h3_sample render inject, the
+    local runner) intends the file to apply IN FULL: a lora_B left at its zero init is an exact
+    identity, so a silently unapplied adapter trains (or renders) the untouched base under an
+    adapter label — the paid-run failure the audit named. Three raises close it:
+
+      1. EMPTY FILE — zero tensors can warm-start nothing (sibling of the T-03-41 guard in
+         ``CheckpointManager.resume``, checkpoint.py).
+      2. UNEXPECTED KEYS — file tensors that landed NOWHERE on the model (a target-set / family /
+         key-layout mismatch between the saved adapter and the freshly injected model).
+      3. COLD KEYS — model lora tensors of ``adapter_name`` the file did NOT supply (the partial
+         warm start: saved={ff.net.2} into model={ff.net.2, attn1.to_q} applies half the adapter
+         with unexpected_keys empty — the plausible case, and the worst one).
 
     P7-IN-04: :func:`save_adapter` routes through ``save_pretrained(selected_adapters=[name])``, which
     writes the ``"default"`` adapter to ``ckpt_dir`` root but every NON-default adapter into a
@@ -507,8 +522,17 @@ def load_adapter_into(
     adapter_dir = Path(ckpt_dir)
     if adapter_name != "default":
         adapter_dir = adapter_dir / adapter_name
-    weights = load_file(str(adapter_dir / ADAPTER_FILENAME))
-    return load_adapter_state_into(model, weights, adapter_name=adapter_name, what=str(adapter_dir))
+    adapter_file = adapter_dir / ADAPTER_FILENAME
+    weights = load_file(str(adapter_file))
+    if not weights:
+        # Raise (1), from main: a zeroed/empty adapter must NOT silently continue (T-03-41).
+        raise RuntimeError(
+            f"Adapter load aborted: empty adapter state_dict in {adapter_file} -- zero tensors "
+            f"to apply, so the model would keep its zero-init (identity) adapter."
+        )
+    return load_adapter_state_into(
+        model, weights, adapter_name=adapter_name, what=str(adapter_file)
+    )
 
 
 def is_quanto_quantized(model: nn.Module) -> bool:
@@ -575,7 +599,40 @@ def load_adapter_state_into(
         wrong.
     """
     if not is_quanto_quantized(model):
-        return set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
+        result = set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
+        # Raises (2) and (3) come from main, which hardened load_adapter_into independently while
+        # this branch was replacing its body. They are kept rather than picked between: main's are
+        # about COVERAGE (did every file tensor land, did every injected tensor get supplied), this
+        # branch's are about the quantized PATH. Both failures are silent — a half-applied adapter
+        # renders the untouched base under an adapter label — so each side keeps its guarantee.
+        unexpected = list(getattr(result, "unexpected_keys", None) or [])
+        if unexpected:
+            raise RuntimeError(
+                f"Adapter load aborted ({what}): {len(unexpected)} of {len(adapter_weights)} "
+                f"tensors matched NO parameter of adapter {adapter_name!r} (examples: "
+                f"{unexpected[:3]}). The saved adapter's targets/key layout do not line up with "
+                f"this model -- check lora.target_modules parity across rounds and the family."
+            )
+        marker = f".{adapter_name}."  # dot-bounded component, the stack_frozen_adapter doctrine
+        cold = sorted(
+            name.replace(marker, ".", 1)
+            for name, _ in model.named_parameters()
+            if ".lora_" in name
+            and marker in name
+            and name.replace(marker, ".", 1) not in adapter_weights
+            and name not in adapter_weights
+        )
+        if cold:
+            # Wording is main's, deliberately verbatim: tests/test_lora_roundtrip.py matches on
+            # "NOT in .* and stayed at their init". Rewording it broke their test while the
+            # behaviour was identical — the message IS the contract here, not just prose.
+            raise RuntimeError(
+                f"Adapter load aborted: {len(cold)} lora tensor(s) of adapter {adapter_name!r} "
+                f"were NOT in {what} and stayed at their init (examples: {cold[:3]}). A partially "
+                f"warm-started adapter is silently half-cold -- the saved target set must cover "
+                f"every injected target."
+            )
+        return result
 
     live = dict(model.named_parameters())
     missing: list[str] = []

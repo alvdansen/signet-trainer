@@ -3471,6 +3471,17 @@ def h3_preprocess(
             "conditioning at a perfectly valid shape. Aborting before any encode."
         )
 
+    # NO-REFERENCE (ALPHA, references_per_sample == 0): no slot resolution, no reference encode,
+    # no h3_reference_latents/ dir — the manifest needs no reference keys at all. The text payload
+    # still carries BOTH states (identical, both prompt-only), so the cache is readable by either
+    # regime's reader.
+    no_reference = int(references_per_sample) == 0
+    if no_reference:
+        print(
+            "[h3_preprocess] H3 NO-REFERENCE TRAINING IS ALPHA - smoke-tested only, no end-to-end "
+            "run exists; file issues"
+        )
+
     rows = _h3_manifest_rows(metadata_path)
     data_root = Path(metadata_path).parent
     canvas_height, canvas_width = resolve_canvas_size(*target_aspect)
@@ -3494,13 +3505,20 @@ def h3_preprocess(
     # The VAE is loaded and FREED again here rather than kept: it is seconds to reload (3 shards),
     # and Qwen3-VL-32B has to have the card essentially to itself for PHASE A.
     smoke_row = rows[0]
-    smoke_references = _h3_resolve_references(
-        smoke_row,
-        0,
-        data_root,
-        references_per_sample=references_per_sample,
-        reference_pair_seed=reference_pair_seed,
-        environment_ref_last=environment_ref_last,
+    # NO-REFERENCE: no slots to resolve, so the smoke covers the CLIP modality only — the
+    # single-frame VAE branch (D-10-DEF-9 / D-10-DEF-12) is unreachable by design on this run
+    # because no reference is ever encoded.
+    smoke_references = (
+        []
+        if no_reference
+        else _h3_resolve_references(
+            smoke_row,
+            0,
+            data_root,
+            references_per_sample=references_per_sample,
+            reference_pair_seed=reference_pair_seed,
+            environment_ref_last=environment_ref_last,
+        )
     )
     smoke_vae = _h3_load_component(str(WEIGHTS_DIR / vae_id), device="cuda", dtype=torch.float32)
     smoke_mean, smoke_std = _h3_vae_latent_stats(smoke_vae)
@@ -3513,9 +3531,11 @@ def h3_preprocess(
                 canvas_height,
                 canvas_width,
             ),
-            reference_image=_h3_open_reference_image(smoke_references[0]["source"]),
+            reference_image=(
+                None if no_reference else _h3_open_reference_image(smoke_references[0]["source"])
+            ),
             reference_short_edge=reference_image_short_edge,
-            reference_descriptor=smoke_references[0],
+            reference_descriptor=None if no_reference else smoke_references[0],
             latents_mean=smoke_mean,
             latents_std=smoke_std,
             clip_pixel_frames=int(target_frames),
@@ -3560,13 +3580,19 @@ def h3_preprocess(
     per_sample: dict[str, dict] = {}
     for index, row in enumerate(rows):
         rel = _h3_output_rel(row["media_path"])
-        references = _h3_resolve_references(
-            row,
-            index,
-            data_root,
-            references_per_sample=references_per_sample,
-            reference_pair_seed=reference_pair_seed,
-            environment_ref_last=environment_ref_last,
+        # NO-REFERENCE: nothing to resolve — the manifest needs no reference keys, and
+        # _h3_resolve_references would (rightly) refuse a reference-less Ref2VA row.
+        references = (
+            []
+            if no_reference
+            else _h3_resolve_references(
+                row,
+                index,
+                data_root,
+                references_per_sample=references_per_sample,
+                reference_pair_seed=reference_pair_seed,
+                environment_ref_last=environment_ref_last,
+            )
         )
         # ⛔ D-10-DEF-4: ONE resize, shared with PHASE B. `prepare_h3_reference_images` is the only
         # place a reference's encode geometry is decided, and it returns the RESIZED image and its
@@ -3598,12 +3624,19 @@ def h3_preprocess(
         # `build_h3_presentation(caption, [])` is that presentation, and it is built through the SAME
         # function rather than by string surgery, so the label/prompt layout cannot drift between the
         # two states. Empty references => empty spans, which the payload builder then enforces.
-        prompt_only_presentation, prompt_only_spans = build_h3_presentation(
-            row["caption"], (), tokenizer=getattr(processor, "tokenizer", None)
-        )
-        prompt_only_hidden = encode_h3_text_conditions(
-            text_encoder, processor, prompt_only_presentation, (), vision_spans=prompt_only_spans
-        )
+        #
+        # NO-REFERENCE: the reference-bearing presentation IS the prompt-only one (zero slots), so
+        # the second Qwen3-VL pass would re-encode the identical presentation — the one tensor
+        # serves both payload keys and the pass is skipped.
+        if no_reference:
+            prompt_only_hidden = hidden
+        else:
+            prompt_only_presentation, prompt_only_spans = build_h3_presentation(
+                row["caption"], (), tokenizer=getattr(processor, "tokenizer", None)
+            )
+            prompt_only_hidden = encode_h3_text_conditions(
+                text_encoder, processor, prompt_only_presentation, (), vision_spans=prompt_only_spans
+            )
         # ⛔ The SPANS ARE PERSISTED. They used to be computed here and dropped, while `h3_ref` read
         # `batch.get("vision_spans", ())` from a batch nothing ever populated — so every training
         # step tagged >90% of its text stream TEXT instead of VIDEO, silently. The payload is
@@ -3694,37 +3727,41 @@ def h3_preprocess(
         )
         del pixels
 
-        images = [_h3_open_reference_image(r["source"]) for r in meta["references"]]
-        reference_payload = encode_h3_reference_latents(
-            video_vae,
-            images,
-            reference_image_short_edge,
-            latents_mean,
-            latents_std,
-            # D-10-DEF-2: the descriptors travel INTO the payload. Without them the cache carries
-            # sizes but no identity, and H3RefStrategy cannot order or gather the slots — it fails
-            # loud naming the three missing fields, after a full metered pre-encode has been paid
-            # for. They are propagated from the manifest, never inferred from a tensor.
-            descriptors=meta["references"],
-            references_per_sample=references_per_sample,
-        )
-
-        # ⛔ D-10-DEF-4, the cross-phase assertion. `prepare_h3_reference_images` makes these equal
-        # by construction (both phases call it, on the same files, at the same short edge), so this
-        # can only fire if a future edit gives one phase its own geometry again — which is exactly
-        # what happened the first time. It is checked rather than assumed because the failure is
-        # silent: wrong vision spans, wrong modality tags, and a packed budget that no longer
-        # describes the batch, all at a perfectly valid shape.
-        encoded_rows = [int(slot["latent_rows"]) for slot in reference_payload["references"]]
-        if encoded_rows != list(meta["vision_counts"]):
-            raise RuntimeError(
-                f"[h3_preprocess] sample {rel}: PHASE A presented {meta['vision_counts']} vision "
-                f"token(s) per reference slot but PHASE B encoded {encoded_rows} latent row(s). "
-                f"The two phases must describe the SAME reference at the SAME geometry — the "
-                f"conditioning rows, the Qwen vision spans, the AdaLN modality tags and the packed "
-                f"budget are all billed off this one number (D-10-DEF-4). Refusing to write a cache "
-                f"whose text conditioning and reference latents disagree."
+        # NO-REFERENCE: no reference encode and no h3_reference_latents/ file — the train side at
+        # zero slots does not declare the source, so an absent dir is the correct layout, not a gap.
+        reference_payload = None
+        if not no_reference:
+            images = [_h3_open_reference_image(r["source"]) for r in meta["references"]]
+            reference_payload = encode_h3_reference_latents(
+                video_vae,
+                images,
+                reference_image_short_edge,
+                latents_mean,
+                latents_std,
+                # D-10-DEF-2: the descriptors travel INTO the payload. Without them the cache carries
+                # sizes but no identity, and H3RefStrategy cannot order or gather the slots — it fails
+                # loud naming the three missing fields, after a full metered pre-encode has been paid
+                # for. They are propagated from the manifest, never inferred from a tensor.
+                descriptors=meta["references"],
+                references_per_sample=references_per_sample,
             )
+
+            # ⛔ D-10-DEF-4, the cross-phase assertion. `prepare_h3_reference_images` makes these equal
+            # by construction (both phases call it, on the same files, at the same short edge), so this
+            # can only fire if a future edit gives one phase its own geometry again — which is exactly
+            # what happened the first time. It is checked rather than assumed because the failure is
+            # silent: wrong vision spans, wrong modality tags, and a packed budget that no longer
+            # describes the batch, all at a perfectly valid shape.
+            encoded_rows = [int(slot["latent_rows"]) for slot in reference_payload["references"]]
+            if encoded_rows != list(meta["vision_counts"]):
+                raise RuntimeError(
+                    f"[h3_preprocess] sample {rel}: PHASE A presented {meta['vision_counts']} vision "
+                    f"token(s) per reference slot but PHASE B encoded {encoded_rows} latent row(s). "
+                    f"The two phases must describe the SAME reference at the SAME geometry — the "
+                    f"conditioning rows, the Qwen vision spans, the AdaLN modality tags and the packed "
+                    f"budget are all billed off this one number (D-10-DEF-4). Refusing to write a cache "
+                    f"whose text conditioning and reference latents disagree."
+                )
 
         # ⛔ The absent marker is written for EVERY sample, ``with_audio`` or not. ``h3_audio_latents``
         # is one of the FOUR sources ``H3RefStrategy.get_data_sources()`` declares, and
@@ -3763,12 +3800,16 @@ def h3_preprocess(
 
         # REALIZED packed rows, from what was actually encoded. The config-load budget check prices
         # the worst-case pair from declared source sizes; this is the belt-and-braces sibling that
-        # knows the true tokenized text length and the true encoded reference grids.
+        # knows the true tokenized text length and the true encoded reference grids. NO-REFERENCE
+        # contributes zero reference rows — the each-image-bills-TWICE rule removes BOTH sides
+        # (no vision tokens in text_rows, no ref latent rows here).
+        realized_ref_rows = (
+            []
+            if reference_payload is None
+            else [int(slot["latent_rows"]) for slot in reference_payload["references"]]
+        )
         realized = (
-            int(meta["text_rows"])
-            + sum(int(slot["latent_rows"]) for slot in reference_payload["references"])
-            + n_target_video
-            + n_target_audio
+            int(meta["text_rows"]) + sum(realized_ref_rows) + n_target_video + n_target_audio
         )
         if realized > max_packed_rows:
             raise RuntimeError(
@@ -3780,8 +3821,7 @@ def h3_preprocess(
             )
         print(
             f"[h3_preprocess]   {rel}: {realized}/{max_packed_rows} packed rows "
-            f"(text {meta['text_rows']}, refs "
-            f"{[int(s['latent_rows']) for s in reference_payload['references']]}, "
+            f"(text {meta['text_rows']}, refs {realized_ref_rows}, "
             f"target {n_target_video}+{n_target_audio})"
         )
         del video_payload, reference_payload, audio_payload
@@ -3807,13 +3847,16 @@ def h3_preprocess(
             f"and {counts[H3_CONDITIONS_DIR]} text condition(s) under {output_dir} — both are "
             "MANDATORY sources. Refusing to report a successful pre-encode."
         )
-    if reference_image_short_edge and counts[H3_REFERENCE_LATENTS_DIR] == 0:
+    # Keyed on the SLOT COUNT, not the short edge: a NO-REFERENCE encode (references_per_sample 0)
+    # legitimately writes no h3_reference_latents/ — the train side at zero slots does not declare
+    # the source — while the short edge stays at its (inert) default.
+    if references_per_sample and counts[H3_REFERENCE_LATENTS_DIR] == 0:
         raise RuntimeError(
-            f"[h3_preprocess] reference encoding was requested (short edge "
-            f"{reference_image_short_edge}) but ZERO .pt files landed under h3_reference_latents/ "
-            f"in {output_dir}. Refusing to report a successful ref2v encode without references — "
-            "an empty reference dir does not raise downstream, it silently drops every sample from "
-            "the PrecomputedDataset index."
+            f"[h3_preprocess] reference encoding was requested ({references_per_sample} slot(s), "
+            f"short edge {reference_image_short_edge}) but ZERO .pt files landed under "
+            f"h3_reference_latents/ in {output_dir}. Refusing to report a successful ref2v encode "
+            "without references — an empty reference dir does not raise downstream, it silently "
+            "drops every sample from the PrecomputedDataset index."
         )
     if with_audio and audio_present == 0:
         raise RuntimeError(
@@ -4068,6 +4111,14 @@ def h3_train(config_yaml: str) -> None:
             "'No trainable parameters found' — after the metered A100 is already billing."
         )
 
+    if config.h3.references_per_sample == 0:
+        # NO-REFERENCE (ALPHA) — loud, in-container, at the FRONT of the dispatch (the entrypoint
+        # prints the same banner pre-approval; this one survives into the container log).
+        print(
+            "[h3_train] H3 NO-REFERENCE TRAINING IS ALPHA - smoke-tested only, no end-to-end run "
+            "exists; file issues"
+        )
+
     device = "cuda"
     checkpoint_path = str(WEIGHTS_DIR / config.model.model_id)
 
@@ -4122,10 +4173,15 @@ def h3_train(config_yaml: str) -> None:
 
     # The dataset reads the ROOT from config (never a hardcoded ``.precomputed`` — that was a real
     # Phase-6 bug), over exactly the sources the strategy DECLARES, so the dir -> output-key map is
-    # single-sourced with ``_PRECOMPUTED_SOURCE_OUTPUT_KEYS``.
+    # single-sourced with ``_PRECOMPUTED_SOURCE_OUTPUT_KEYS``. The slot count is threaded because
+    # the declaration is now slot-count-dependent: at 0 (NO-REFERENCE, ALPHA) the strategy does not
+    # declare ``h3_reference_latents``, so a no-reference cache loads and a ref-bearing cache's
+    # reference dir is simply never read.
     data_sources = {
         name: _PRECOMPUTED_SOURCE_OUTPUT_KEYS[name]
-        for name in H3RefStrategy().get_data_sources()
+        for name in H3RefStrategy(
+            references_per_sample=config.h3.references_per_sample
+        ).get_data_sources()
     }
     dataset = PrecomputedDataset(config.data.preprocessed_data_root, data_sources=data_sources)
 
@@ -4427,6 +4483,22 @@ def h3_sample(config_yaml: str) -> None:
             f"[h3_sample] model.family is {config.model.family!r}, not 'h3' — this stage drives the "
             "diffusers MiniMax-H3 ref2va workflow, not the LTX pipelines."
         )
+    if config.h3.references_per_sample == 0:
+        # NO-REFERENCE (ALPHA): REFUSED, not faked. This stage is transcribed for the ref2va
+        # workflow only — reference conditions, the `transformer_ref` partition, and the manifest
+        # slot selector are all reference-shaped, and the pinned diffusers t2va workflow (the
+        # `transformer` partition) has not been transcribed or validated in this repo. Rendering
+        # "ref2va with an empty reference list" would be an unvalidated request the adapter was
+        # never trained on, silently mislabeled as a no-reference render. The entrypoint refuses
+        # this pre-approval; this raise is the in-container belt to that brace.
+        raise RuntimeError(
+            "[h3_sample] h3.references_per_sample is 0 (NO-REFERENCE, ALPHA) — no-reference "
+            "rendering is NOT supported. This stage drives the diffusers ref2va workflow, which "
+            "is reference-conditioned end to end (reference inputs, the transformer_ref "
+            "partition); the t2va workflow it would need is not transcribed in this repo. "
+            "Train and preprocess ride --mode train/preprocess; for renders, file an issue "
+            "(H3 no-reference is ALPHA, smoke-tested only)."
+        )
     prompts = list(config.validation.prompts)
     if not prompts:
         raise RuntimeError(
@@ -4445,12 +4517,19 @@ def h3_sample(config_yaml: str) -> None:
     # 17n+5 the training dims satisfy, so a legal training bucket (this campaign's 22) can be
     # unrenderable, and the fix is an eval-design decision rather than a bump.
     from signet_trainer.inference.h3_pipeline_source import (  # noqa: PLC0415
+        H3_FPS,
         assert_h3_frame_count_is_renderable,
+        h3_aligned_num_frames,
     )
 
     print(
         assert_h3_frame_count_is_renderable(
-            int(config.validation.frame_count), where="validation.frame_count"
+            int(config.validation.frame_count),
+            where="validation.frame_count",
+            # The waiver reaches the BAND only. The 22-frame VAE decode floor is enforced inside
+            # regardless, because below it the failure is a `torch.cat([])` in the DECODER — i.e.
+            # after the denoise loop this pre-flight exists to avoid paying for.
+            allow_offband=bool(config.validation.allow_offband_frame_count),
         )
     )
 
@@ -4534,12 +4613,55 @@ def h3_sample(config_yaml: str) -> None:
     print(f"[h3_sample] pipeline index read from {index_path} (the mounted Volume, not the Hub).")
 
     manager = ComponentsManager()
+
+    # ── The OFF-BAND render class (validation.allow_offband_frame_count) ─────────────────────────
+    #
+    # ⛔ THE BAND IS ENFORCED ON THE PIPELINE, NOT IN THE BLOCK. `MiniMaxH3Ref2VASetupStep` does
+    # `if not components.min_duration <= duration <= components.max_duration` — reading two
+    # `@property` off the pipeline object (pinned `minimax_h3/modular_pipeline.py`: 5.0 and 15.0).
+    # A second, identical copy of that check lives in the t2va/fl2va setup step. So the ONE place
+    # that defeats both is the property itself, and overriding a property needs a class.
+    #
+    # A SUBCLASS, NOT A MONKEYPATCH, and specifically not `type(pipe).min_duration = ...`: these
+    # are class-level data descriptors, so instance assignment raises; and patching the imported
+    # class would mutate diffusers' own class for everything else in the container and have to be
+    # unwound on every exit path, including an OOM. signet constructs this class itself (right
+    # below), so choosing a different class is a seam that already exists.
+    #
+    # It WIDENS rather than replaces, so a render already inside 5-15 s behaves identically whether
+    # or not the flag is set — the flag cannot change a legal render's meaning.
+    class _OffbandDurationH3Pipeline(MiniMaxH3ModularPipeline):
+        """``MiniMaxH3ModularPipeline`` with the generation band widened to this render's span."""
+
+        # A plain attribute set after construction: the base `__init__` takes no extra kwargs, and
+        # this must not depend on diffusers' signature staying stable across the pin.
+        _offband_span_s: float = 0.0
+
+        @property
+        def min_duration(self) -> float:
+            return min(self._offband_span_s, MiniMaxH3ModularPipeline.min_duration.fget(self))
+
+        @property
+        def max_duration(self) -> float:
+            return max(self._offband_span_s, MiniMaxH3ModularPipeline.max_duration.fget(self))
+
+    offband = bool(config.validation.allow_offband_frame_count)
+    pipeline_cls = _OffbandDurationH3Pipeline if offband else MiniMaxH3ModularPipeline
     # No `pretrained_model_name_or_path=`: passing the root would re-introduce the Hub-sourced
     # specs. The blocks are the authority for WHICH components `ref2va` needs and WHAT class each
     # one is; the Volume is the authority for where they live.
-    pipe = MiniMaxH3ModularPipeline(
-        blocks=MiniMaxH3Blocks(), workflow="ref2va", components_manager=manager
-    )
+    pipe = pipeline_cls(blocks=MiniMaxH3Blocks(), workflow="ref2va", components_manager=manager)
+    if offband:
+        # The ALIGNED count, because the pipeline checks the duration of what it will actually
+        # generate, not of what was asked for.
+        pipe._offband_span_s = h3_aligned_num_frames(int(config.validation.frame_count)) / H3_FPS
+        print(
+            f"[h3_sample] ⚠ OFF-BAND RENDER: generation band widened to include "
+            f"{pipe._offband_span_s:.3f} s ({config.validation.frame_count} frames) via "
+            f"validation.allow_offband_frame_count. min_duration={pipe.min_duration}, "
+            f"max_duration={pipe.max_duration}. The 17n+5 law and the 22-frame VAE decode floor "
+            "were both enforced at the pre-flight above and are NOT waived by this flag."
+        )
     needed = list(pipe.pretrained_component_names)
     sources = resolve_h3_component_sources(index, pipeline_root, needed)
     print(assert_h3_sources_are_local(sources, pipeline_root))
@@ -4661,6 +4783,9 @@ def h3_sample(config_yaml: str) -> None:
             "base-only grid under an adapter label."
         )
     adapted = inject_lora(base_transformer, lora_config)
+    # load_adapter_into is FAIL-LOUD (empty file / unexpected keys / cold lora tensors all raise):
+    # a checkpoint that does not FULLY apply refuses the render here, for the same reason the
+    # component check above raises — anything less renders a base-only grid under an adapter label.
     load_adapter_into(adapted, latest_ckpt)
     adapted.eval()  # inject_lora leaves the model in train mode + grad-checkpointing (TRAIN-06)
     pipe.update_components(**{H3_REF2VA_TRANSFORMER: adapted})

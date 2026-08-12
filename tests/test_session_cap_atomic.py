@@ -11,6 +11,11 @@ Pure stdlib-json — NO modal/CUDA dependency; runs on Windows/CI with zero spen
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -90,3 +95,116 @@ def test_crash_mid_write_leaves_old_ledger_intact(tmp_path, monkeypatch) -> None
     # The real ledger is untouched: same bytes, still parseable, same cumulative total.
     assert ledger.read_text(encoding="utf-8") == original_bytes
     assert read_ledger(ledger) == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------------------------------------
+# CR-02 — multi-writer safety. The ledger is multi-writer by design (N parallel watchers + the
+# agent's own per-dispatch appends against the ONE project ledger); an unlocked read-modify-write
+# silently LOSES concurrent entries (the cap then under-counts real spend — fail OPEN). These
+# tests pin the lock + unique-staging fix; the concurrent one fails on the pre-fix code.
+# ---------------------------------------------------------------------------------------------
+
+_N_WRITERS = 4
+_APPENDS_PER_WRITER = 60
+
+# One worker process: N sequential $1.00 appends against the shared ledger (argv: ledger, n, tag).
+_WORKER_SRC = """
+import sys
+from signet_trainer.modal.session_cap import append_spend
+ledger, n, tag = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+for i in range(n):
+    append_spend(ledger, est_usd=1.0, run_ref=f"{tag}-{i}")
+"""
+
+
+def test_concurrent_append_spend_loses_no_entries(tmp_path) -> None:
+    """4 writer processes x 60 appends of $1.00 -> ALL 240 entries must survive (CR-02).
+
+    Pre-fix this lost ~3/4 of the entries: every writer staged over the same fixed
+    ``SESSION-STATE.json.tmp`` (PermissionError collisions on Windows) and the unsynchronised
+    read-modify-write let a stale snapshot overwrite concurrent appends silently on POSIX.
+    """
+    ledger = tmp_path / "SESSION-STATE.json"
+    env = dict(os.environ)
+    src_dir = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _WORKER_SRC, str(ledger), str(_APPENDS_PER_WRITER), f"w{w}"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for w in range(_N_WRITERS)
+    ]
+    for proc in procs:
+        _, stderr = proc.communicate(timeout=180)
+        assert proc.returncode == 0, f"writer crashed:\n{stderr.decode('utf-8', 'replace')}"
+
+    expected = float(_N_WRITERS * _APPENDS_PER_WRITER)
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    assert len(data["spend"]) == _N_WRITERS * _APPENDS_PER_WRITER, "lost-update: entries vanished"
+    assert read_ledger(ledger) == pytest.approx(expected)
+    # No writer debris left behind next to the live ledger.
+    assert not list(tmp_path.glob("*.tmp")) and not list(tmp_path.glob("*.lock"))
+
+
+def test_staging_names_are_unique_per_writer(tmp_path, monkeypatch) -> None:
+    """Two appends must stage through DISTINCT temp names (pre-fix both used ``<name>.tmp``)."""
+    ledger = tmp_path / "SESSION-STATE.json"
+    srcs: list[str] = []
+    real_replace = session_cap.os.replace
+
+    def _spy_replace(src, dst):
+        srcs.append(str(src))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(session_cap.os, "replace", _spy_replace)
+    append_spend(ledger, est_usd=1.0, run_ref="a")
+    append_spend(ledger, est_usd=1.0, run_ref="b")
+
+    assert len(srcs) == 2 and srcs[0] != srcs[1], "staging names must be unique per write"
+    assert all(s.endswith(".tmp") for s in srcs)
+
+
+def test_append_spend_fails_loudly_when_lock_is_held(tmp_path, monkeypatch) -> None:
+    """A held (fresh, non-stale) lock must raise TimeoutError — a spend append is never silently
+    skipped (CR-01), and the ledger must be left untouched."""
+    ledger = tmp_path / "SESSION-STATE.json"
+    lock = ledger.with_name(ledger.name + ".lock")
+    lock.write_text("someone-else", encoding="utf-8")
+    monkeypatch.setattr(session_cap, "DEFAULT_LOCK_TIMEOUT_S", 0.2)
+
+    with pytest.raises(TimeoutError):
+        append_spend(ledger, est_usd=1.0, run_ref="blocked")
+    assert not ledger.exists(), "a blocked append must not touch the ledger"
+    assert lock.exists(), "the contender must never steal a fresh lock"
+
+
+def test_consume_blanket_fails_loudly_when_lock_is_held(tmp_path, monkeypatch) -> None:
+    """consume_blanket (the other ledger writer) honors the same lock + TimeoutError posture."""
+    ledger = tmp_path / "SESSION-STATE.json"
+    ledger.write_text(json.dumps(_blanket_ledger(), indent=2), encoding="utf-8")
+    original_bytes = ledger.read_text(encoding="utf-8")
+    lock = ledger.with_name(ledger.name + ".lock")
+    lock.write_text("someone-else", encoding="utf-8")
+    monkeypatch.setattr(session_cap, "DEFAULT_LOCK_TIMEOUT_S", 0.2)
+
+    with pytest.raises(TimeoutError):
+        consume_blanket(ledger, blanket_index=0, est_usd=1.0, run_ref="blocked")
+    assert ledger.read_text(encoding="utf-8") == original_bytes
+
+
+def test_stale_lock_is_broken_not_a_permanent_wedge(tmp_path) -> None:
+    """A crashed writer's leftover lock (older than DEFAULT_LOCK_STALE_S) must be broken so the
+    harness never wedges forever — the append then proceeds and releases cleanly."""
+    ledger = tmp_path / "SESSION-STATE.json"
+    lock = ledger.with_name(ledger.name + ".lock")
+    lock.write_text("corpse", encoding="utf-8")
+    ancient = time.time() - (session_cap.DEFAULT_LOCK_STALE_S + 60.0)
+    os.utime(lock, (ancient, ancient))
+
+    append_spend(ledger, est_usd=2.5, run_ref="after-crash")
+
+    assert read_ledger(ledger) == pytest.approx(2.5)
+    assert not lock.exists(), "the lock must be released after the append"
