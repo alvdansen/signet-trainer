@@ -498,9 +498,16 @@ qwen_gpu_image = (
 #: it as the subprocess CWD explicitly rather than inheriting one.
 MUSUBI_TUNER_ROOT = "/opt/musubi-tuner"
 
-#: ⛔ UNPINNED — a DECLARED GAP, not a value. See the ⛔⛔⛔ banner above. When the SHA is resolved,
-#: set this to the literal 40-hex string and the conditional below becomes an ordinary checkout.
-MUSUBI_TUNER_COMMIT_SHA: str | None = None
+#: PINNED 2026-08-12 — resolved with the command the banner above names
+#: (``gh api repos/kohya-ss/musubi-tuner/commits/main --jq .sha``) and transcribed literally.
+#:
+#: train_kohya.py:31 clones ``main`` with no checkout, so there was no SHA to transcribe from
+#: the oracle and this sat as a declared gap. It is resolved here rather than left floating
+#: because musubi's dataset-config SCHEMA is what ``runners/musubi_toml.py`` transcribes: an
+#: upstream key rename would otherwise be discovered by a rejected TOML inside a metered
+#: container, and every adapter this image produces would be unattributable to a code state.
+#: Bump deliberately, the same rule the three sibling pins carry.
+MUSUBI_TUNER_COMMIT_SHA: str | None = "8934cfbbb4b9bcfa8071ce209129f0c5eb5df2e6"
 
 #: The checkout step, or a loud refusal standing in for it. Never a fallback to ``main``: a floating
 #: clone is the failure the three sibling SHA pins exist to prevent, and it is worse here than

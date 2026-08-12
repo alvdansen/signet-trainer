@@ -1,3 +1,17 @@
+# ⛔ THIS IS A TEST FIXTURE, NOT A RUNNABLE SIGNET CONFIG. Do not copy it.
+#
+# Its paths are the SOURCE METHOD's: train_kohya.py mounts its dataset Volume at /datasets, so the
+# production TOML this repo is asserted against carries /datasets/datasets/Kaboom/... Reproducing
+# that TOML byte-for-byte therefore requires a config carrying those paths — which is why this file
+# exists separately from configs/wan21_kaboom.example.yaml.
+#
+# The shipped config used to BE this file, and that dragged a foreign mount point into the only
+# runnable wan config in the repo: signet mounts its dataset Volume at /dataset (singular), so every
+# path in it addressed a location that does not exist in a signet container. musubi's cache pass
+# would have found no media, or written a cache to the container's ephemeral overlay and discarded
+# it at exit. Splitting the two keeps the byte-exact proof (a property of the RENDERER) from
+# dictating the mount layout of a config an operator is meant to run.
+#
 # Wan 2.1 t2v-14B via the musubi-tuner RUNNER — the three-dataset method, in signet YAML.
 #
 # THE ONLY SHIPPED CONFIG THAT DECLARES `data.sources`, and the only one on `family: wan`. It moved
@@ -31,7 +45,7 @@ data:
   # absent, which is why `sources` is an OPTIONAL SIBLING rather than a re-expression of the flat
   # single-source form — the byte-identical path for every existing config is the ABSENCE of a key,
   # and an absent key cannot regress.
-  preprocessed_data_root: /dataset/Kaboom
+  preprocessed_data_root: /datasets/datasets/Kaboom
   caption_extension: ".txt"      # -> [general] in the rendered TOML
   enable_bucket: true            # -> [general]
   bucket_no_upscale: true        # -> [general]; nothing is ever upscaled, so nothing is invented
@@ -44,8 +58,8 @@ data:
     # ── stills: maximum detail, no temporal axis ──────────────────────────────────────────────
     - id: stills                  # LOAD-BEARING: cache discriminator, provenance tag, census label
       kind: image
-      directory: /dataset/Kaboom/Images
-      cache_root: /dataset/Kaboom/Images/cache
+      directory: /datasets/datasets/Kaboom/Images
+      cache_root: /datasets/datasets/Kaboom/Images/cache
       resolution: [1024, 1024]
       extraction: image           # the only legal mode on kind: image
       num_repeats: 1
@@ -54,8 +68,8 @@ data:
     # ── appearance: expensive-and-narrow. The opening beat, at full resolution ────────────────
     - id: appearance
       kind: video
-      directory: /dataset/Kaboom/Videos
-      cache_root: /dataset/Kaboom/Videos/cache_1
+      directory: /datasets/datasets/Kaboom/Videos
+      cache_root: /datasets/datasets/Kaboom/Videos/cache_1
       resolution: [1280, 720]
       extraction: head            # window from frame 0 — the establishing moment of each clip
       target_frames: [1, 21]      # TWO clips per video, BOTH from frame 0: a still and a 21f window
@@ -68,8 +82,8 @@ data:
       # THE SAME DIRECTORY AS `appearance`, and this is the point of the whole feature. Two views
       # of one corpus are two blocks precisely because they are two CACHES: the cache filename
       # carries the SOURCE video's size, never the training resolution.
-      directory: /dataset/Kaboom/Videos
-      cache_root: /dataset/Kaboom/Videos/cache_2
+      directory: /datasets/datasets/Kaboom/Videos
+      cache_root: /datasets/datasets/Kaboom/Videos/cache_2
       resolution: [640, 360]      # ⚠ TRAINS AT 640x352 — 360 is not a multiple of 16. Warned, not
                                   # refused: this is the method's own working value.
       extraction: uniform
@@ -87,25 +101,27 @@ training:
 
 model:
   family: wan                     # the FOURTH family — a family, not a seventh --mode
-  # The four components musubi needs, staged onto the weights Volume by
-  # `modal/fns.download_wan_weights` and addressed here as paths under WEIGHTS_DIR — the same
-  # `WEIGHTS_DIR / <id>` convention every other family resolves through.
+  # ⚠ DECLARED GAP — HALF OF IT CLOSED 2026-08-10, and the remaining half is weights, not schema.
   #
-  # PROVENANCE: repo ids and filenames are transcribed from the proven launch method
-  # (train_kohya.py:69-92), not chosen. The umT5 and open-CLIP encoders ship in Wan-AI's I2V
-  # release; the DiT and VAE come from Comfy-Org's repackage. The two repos are unrelated, which is
-  # why the CLIP path is DECLARED rather than composed from the T5 one — deriving it hands musubi a
-  # umT5 checkpoint where it expects open-CLIP, in a metered container, after the latent cache pass
-  # has already run.
+  # CLOSED: the config SURFACE. `clip_id` now exists on ModelConfig (Wan 2.1 is the first signet
+  # family with two text-side encoders — open-CLIP XLM-RoBERTa-Large ViT-H/14 alongside umT5,
+  # train_kohya.py:78-82,139), and `vae_id` is no longer fenced away from this family. All four ids
+  # wan_resolve_component_ids wants — dit/vae/t5/clip -> model_id/vae_id/text_encoder_id/clip_id —
+  # are declarable here now. They are left UNSET on purpose; see below.
   #
-  # model_id and text_encoder_id are SHARED with LTX and carry LTX defaults, so leaving either unset
-  # is not a loud failure — it is `--t5 <weights>/gemma-3-12b-it`, a Gemma directory where musubi
-  # wants a .pth. wan_resolve_component_ids refuses an INHERITED default as firmly as a missing one
-  # for exactly that reason.
-  model_id: wan2.1/wan2.1_t2v_14B_bf16.safetensors                        # --dit
-  vae_id: wan2.1/wan_2.1_vae.safetensors                                  # --vae
-  text_encoder_id: wan2.1/models_t5_umt5-xxl-enc-bf16.pth                 # --t5
-  clip_id: wan2.1/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth # --clip
+  # OPEN: the weights, and there is no honest value to write until they exist. `modal volume ls
+  # signe-trainer-weights` (2026-08-10) holds gemma-3-12b-it, minimax-h3, qwen-image-edit-2511 and
+  # the LTX checkpoints — NO Wan components — and there is no `download_wan_weights` stage beside
+  # download_weights / download_qwen_edit_weights. train_kohya.py:69-92 sidesteps this by hardcoding
+  # two Hub repo ids and downloading at run time; signet resolves from the Volume instead, so what
+  # lands a real dispatch is a download stage plus the four ids it writes.
+  #
+  # Filling these in with musubi's canonical filenames before the files exist would be the guessed
+  # path this codebase refuses everywhere else: model_id and text_encoder_id are SHARED with LTX and
+  # carry LTX defaults, so a plausible-looking wrong value does not fail loudly — it hands musubi
+  # `--t5 /weights/gemma-3-12b-it`, a Gemma directory where it wants a umT5 .pth, and does it after
+  # the latent cache pass has already run. wan_resolve_component_ids refuses all four BY NAME, which
+  # is the behaviour to keep until the weights are real.
   #
   # The `wan:` knobs (task / network_dim / discrete_flow_shift / max_train_epochs, hardcoded at
   # train_kohya.py:136-159) are deliberately NOT a config block: they live in

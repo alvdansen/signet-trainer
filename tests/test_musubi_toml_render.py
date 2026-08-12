@@ -63,7 +63,12 @@ _REAL_TOML = _REPO / "docs" / "source-methods" / "musubi-wan21" / "wan21-dataset
 #: The signet-side expression of the same three-dataset method. MOVED in slice A from
 #: ``tests/fixtures/`` to ``configs/`` — with ``DataConfig.sources`` and ``ModelConfig.family: wan``
 #: landed it is a real, loadable run config, which is what its own header said would happen.
-_FIXTURE = _REPO / "configs" / "wan21_kaboom.example.yaml"
+#: The oracle-equivalence fixture. NOT configs/wan21_kaboom.example.yaml — that config now
+#: carries signet's /dataset mount, while the production TOML this file diffs against carries
+#: train_kohya.py's /datasets. Byte-equivalence is a property of the RENDERER; making the
+#: shipped config carry a foreign mount point to keep this test green was the tail wagging the
+#: dog, and it put a config in configs/ that could not dispatch.
+_FIXTURE = _REPO / "tests" / "fixtures" / "wan21_kaboom.oracle.yaml"
 
 
 def _fixture_config():

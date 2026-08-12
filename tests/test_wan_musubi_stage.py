@@ -407,9 +407,57 @@ def test_train_mode_is_not_refused_for_being_train() -> None:
 
     gaps = _wan_config_gaps(load_config(_EXAMPLE), mode="train")
     assert not any("has no wan arm" in gap for gap in gaps)
-    # ...and the real gaps ARE reported, together rather than one at a time.
-    assert any("wan_resolve_component_ids" in gap for gap in gaps)
-    assert any("MUSUBI_TUNER_COMMIT_SHA" in gap for gap in gaps)
+    # The component gap is now CLOSED on the shipped config — download_wan_weights stages the four
+    # and the config declares them — so asserting it FIRES here would pin the branch to its own
+    # unfinished state. What must still hold is that an UNDECLARED config is refused; that is
+    # test_the_component_gap_still_fires_on_an_undeclared_config below.
+    assert not any("wan_resolve_component_ids" in gap for gap in gaps), (
+        f"the shipped wan config no longer resolves its components: {gaps}"
+    )
+
+
+def test_the_component_gap_still_fires_on_an_undeclared_config() -> None:
+    """The refusal that used to fire on the shipped config must still fire on an incomplete one.
+
+    Closing a gap by declaring the ids is progress; closing it by weakening the check is not, and
+    the two look identical from a green suite. This drives the seam with model_id/text_encoder_id
+    left at their LTX defaults — the dangerous case, because an inherited default is not an empty
+    value and a truthiness test would resolve it straight into `--t5 <weights>/gemma-3-12b-it`.
+    """
+    from signet_trainer.modal.entrypoint import _wan_config_gaps
+
+    cfg = load_config(_EXAMPLE)
+    bare = SimpleNamespace(
+        data=cfg.data,
+        model=SimpleNamespace(family="wan", model_id=None, vae_id=None, text_encoder_id=None, clip_id=None),
+        training=cfg.training,
+    )
+    gaps = _wan_config_gaps(bare, mode="train")
+    assert any("wan_resolve_component_ids" in gap for gap in gaps), gaps
+
+
+def test_the_unpinned_musubi_checkout_gap_fires_ONLY_when_it_is_unpinned(monkeypatch) -> None:
+    """Both directions, because the pin landing must not silently retire the guard that demands it.
+
+    MUSUBI_TUNER_COMMIT_SHA was None while the SHA was a declared gap; it is now a literal, so the
+    gap correctly stops firing. That is a behaviour change in a money-safe check, and deleting the
+    assertion would have been the easy way to make this file green — leaving nothing to catch a
+    later edit that sets it back to None or to a floating ref.
+    """
+    from signet_trainer.modal import app, entrypoint
+
+    assert app.MUSUBI_TUNER_COMMIT_SHA and len(app.MUSUBI_TUNER_COMMIT_SHA) == 40, (
+        "the musubi checkout is unpinned again — a floating clone means musubi's dataset-config "
+        "schema can change under the renderer between two builds of the same image"
+    )
+    pinned = entrypoint._wan_config_gaps(load_config(_EXAMPLE), mode="train")
+    assert not any("MUSUBI_TUNER_COMMIT_SHA" in gap for gap in pinned)
+
+    monkeypatch.setattr(app, "MUSUBI_TUNER_COMMIT_SHA", None)
+    unpinned = entrypoint._wan_config_gaps(load_config(_EXAMPLE), mode="train")
+    assert any("MUSUBI_TUNER_COMMIT_SHA" in gap for gap in unpinned), (
+        "un-pinning no longer produces a gap — the guard is decorative"
+    )
 
 
 def test_the_gap_list_is_EMPTY_when_everything_is_declared(monkeypatch) -> None:
@@ -517,7 +565,12 @@ def test_the_refusal_names_every_gap_at_once_and_costs_nothing() -> None:
     with pytest.raises(SystemExit) as excinfo:
         _wan_refuse_on_gaps(load_config(_EXAMPLE), mode="sample")
     message = str(excinfo.value)
-    assert "3 DECLARED gap(s)" in message, message
+    # ONE now. The list has shrunk twice on purpose: the musubi SHA gap closed when the
+    # checkout was pinned, and the component gap closed when download_wan_weights landed and
+    # the config declared the four ids. Only the MODE fence remains, because there is still no
+    # Wan inference path. The count is asserted rather than ">= 1" because reporting EVERY gap
+    # in one abort is the property, and a silently shrinking list is how it rots.
+    assert "1 DECLARED gap(s)" in message, message
     assert "nothing was spent" in message
 
 
@@ -632,20 +685,38 @@ def test_a_wan_dispatch_without_approve_stops_at_the_approval_pause(monkeypatch,
     assert "approval: DECLINED" in out
 
 
-def test_a_wan_dispatch_WITH_approve_still_refuses_on_the_declared_gaps(monkeypatch) -> None:
-    """Approval is not a bypass: the gaps abort AFTER the pause and BEFORE any spawn, at $0."""
+def test_a_wan_dispatch_WITH_approve_still_refuses_on_the_declared_gaps(monkeypatch, tmp_path) -> None:
+    """Approval is not a bypass: a gap aborts AFTER the pause and BEFORE any spawn, at $0.
+
+    ⚠ REWRITTEN 2026-08-12, and the reason is the point. This used to drive the SHIPPED config,
+    which had two open gaps (unpinned musubi SHA, unresolvable components). Both are now closed —
+    the checkout is pinned and download_wan_weights stages the four components the config declares —
+    so the shipped config passes every gate and reaches `.spawn()`. That is the feature landing.
+
+    It also means the shipped config can no longer prove this property, and quietly deleting the
+    test would have removed the only check that `--approve` does not skip the gap refusal. So it now
+    drives a config with a gap deliberately reopened (the components undeclared), which is the
+    condition the property is about. The MVP closing a gap must not retire the guard that the gap
+    was ever refused.
+    """
     from signet_trainer.modal import entrypoint, fns
+
+    raw = _EXAMPLE.read_text(encoding="utf-8")
+    for line in ("  model_id:", "  vae_id:", "  text_encoder_id:", "  clip_id:"):
+        raw = "\n".join(l for l in raw.split("\n") if not l.startswith(line))
+    ungapped = tmp_path / "wan_undeclared.yaml"
+    ungapped.write_text(raw, encoding="utf-8")
 
     calls: list[tuple] = []
     monkeypatch.setattr(
         fns, "wan_train", SimpleNamespace(with_options=lambda **_: SimpleNamespace(spawn=lambda **kw: calls.append(kw)))
     )
     with pytest.raises(SystemExit) as excinfo:
-        entrypoint.main.info.raw_f(config=str(_EXAMPLE), approve=True, mode="train")
+        entrypoint.main.info.raw_f(config=str(ungapped), approve=True, mode="train")
 
     assert "DECLARED gap(s)" in str(excinfo.value)
     assert "nothing was spent" in str(excinfo.value)
-    assert calls == []
+    assert calls == [], "a gap was reported and the dispatch happened anyway"
 
 
 def test_the_wan_arm_lands_after_the_approval_gate_in_source_order() -> None:

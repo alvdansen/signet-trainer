@@ -184,18 +184,19 @@ def wan_resolve_component_ids(
 
       * ``model.model_id`` / ``model.text_encoder_id`` — fields that EXIST and are shared with LTX,
         so on a wan config they are INHERITED rather than unset. Declaring them is a config edit.
-      * ``model.vae_id`` — a field that exists and is REFUSED on this family.
-        ``config/schema._FAMILY_ONLY_MODEL_IDS`` maps it to ``frozenset({"h3", "qwen_edit"})``, so a
-        ``family: wan`` config that sets it fails at config LOAD with *"that ID is only read under
-        family {...} and would be silently ignored here"*. That was correct while the field had no
-        consumer on this family; it now has one. WHAT LANDS IT: add ``"wan"`` to that entry — the
-        same one-line change ``_qwen_edit_config_gaps`` gap (1) asks for, for the same reason.
-      * ``model.clip_id`` — a field that does NOT EXIST AT ALL. Wan 2.1 needs an open-CLIP
-        XLM-RoBERTa-Large ViT-H/14 encoder ALONGSIDE the umT5 text encoder
-        (``train_kohya.py:78-82,139``); no signet family has ever had two text-side encoders, so
-        ``ModelConfig`` has no slot for the second. WHAT LANDS IT: a ``clip_id: str | None`` field on
-        ``ModelConfig``, fenced to ``{"wan"}`` in ``_FAMILY_ONLY_MODEL_IDS`` so no other family can
-        set a knob it does not read.
+      * ``model.vae_id`` / ``model.clip_id`` — both exist and are fenced to this family in
+        ``config/schema._FAMILY_ONLY_MODEL_IDS``. ``clip_id`` was added because Wan 2.1 needs an
+        open-CLIP XLM-RoBERTa-Large ViT-H/14 encoder ALONGSIDE the umT5 one
+        (``train_kohya.py:78-82,139``) and no signet family had ever carried two text-side encoders.
+
+    ⚠ THIS LIST USED TO SAY ``clip_id`` "does NOT EXIST AT ALL" and that ``vae_id`` was fenced away
+    from ``wan`` — and it said so in the same commit that landed both. An operator reading the
+    refusal went to make two edits already made. The remedy text is the whole value of a $0 gate, so
+    it is maintained here rather than allowed to describe the tree it was written against.
+
+    THE REMAINING GAP IS WEIGHTS, NOT SCHEMA. ``modal/fns.download_wan_weights`` stages the four
+    components (transcribed repo ids and filenames, ``train_kohya.py:69-92``) into the weights
+    Volume and prints the four id strings to paste into ``model:``.
 
     ⛔ NOTHING IS GUESSED HERE. Composing the CLIP path from ``text_encoder_id`` is the one tempting
     shortcut and it is wrong in the way that costs money: musubi would load a umT5 checkpoint where
@@ -226,15 +227,20 @@ def wan_resolve_component_ids(
         "model.text_encoder_id defaults to LTX's Gemma encoder, so accepting it would hand musubi "
         "--t5 <weights>/gemma-3-12b-it where it expects a umT5 checkpoint, after the latent cache "
         "pass has already run. train_kohya.py:69-92 obtains all four components by hf_hub_download "
-        "from two HARDCODED Hub repo ids at run time; signet resolves them from the weights Volume "
-        "instead, so each needs a DECLARED config field. WHAT LANDS THEM: declare model.model_id "
-        "(the Wan DiT safetensors) and model.text_encoder_id (the umT5 .pth) explicitly. "
-        "model.vae_id EXISTS but config/schema._FAMILY_ONLY_MODEL_IDS fences it to "
-        "{'h3', 'qwen_edit'}, so add 'wan' to that entry. model.clip_id does not exist at all — Wan "
-        "needs an open-CLIP encoder BESIDE the umT5 one and no signet family has ever carried two, "
-        "so it is a new field on ModelConfig, fenced to {'wan'}. Do NOT compose the CLIP path from "
-        "text_encoder_id: musubi would load umT5 where it expects open-CLIP, in a metered "
-        "container, after the cache pass has already run."
+        "from two HARDCODED Hub repo ids at run time; signet stages them into the weights Volume "
+        "instead, so each needs a DECLARED config field. "
+        "ALL FOUR IDS ARE DECLARABLE — model_id / vae_id / text_encoder_id / clip_id all exist on "
+        "ModelConfig, and vae_id and clip_id are fenced to this family. (An earlier version of this "
+        "message told the operator to add the clip_id field and widen the vae_id fence; the commit "
+        "that wrote the message had already done both. Time spent proving a refusal wrong is what a "
+        "message costs when it outlives its tree.) "
+        "WHAT LANDS IT: run modal/fns.download_wan_weights to stage the four components, then "
+        "declare the paths it prints — model_id: wan2.1/wan2.1_t2v_14B_bf16.safetensors, "
+        "vae_id: wan2.1/wan_2.1_vae.safetensors, "
+        "text_encoder_id: wan2.1/models_t5_umt5-xxl-enc-bf16.pth, "
+        "clip_id: wan2.1/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth. "
+        "⛔ Do NOT compose the CLIP path from text_encoder_id: musubi would load umT5 where it "
+        "expects open-CLIP, in a metered container, after the cache pass has already run."
     )
 
 

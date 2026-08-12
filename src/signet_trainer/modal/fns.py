@@ -2211,6 +2211,111 @@ def download_qwen_edit_weights(repo_id: str = "Qwen/Qwen-Image-Edit-2511") -> st
     )
 
 
+#: The FOUR Wan 2.1 components musubi needs, transcribed verbatim from the proven launch method
+#: (``docs/source-methods/musubi-wan21/train_kohya.py:69-92``) — repo id and filename both. NOT
+#: derived, NOT guessed: the two repos are unrelated (the encoders ship in Wan-AI's I2V release, the
+#: DiT and VAE in Comfy-Org's repackage), and the one tempting shortcut — composing the CLIP path
+#: from the T5 path because they live side by side — hands musubi a umT5 checkpoint where it expects
+#: open-CLIP, inside a metered container, after the latent cache pass has already run.
+#:
+#: Keyed by the musubi flag each one feeds, so a reader can check this table against the argv in
+#: ``runners/wan_musubi.wan_stage_argv`` without translating.
+WAN21_COMPONENTS: dict[str, tuple[str, str]] = {
+    # flag  : (repo_id, filename-within-repo)
+    "t5":   ("Wan-AI/Wan2.1-I2V-14B-720P", "models_t5_umt5-xxl-enc-bf16.pth"),
+    "clip": ("Wan-AI/Wan2.1-I2V-14B-720P",
+             "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
+    "vae":  ("Comfy-Org/Wan_2.1_ComfyUI_repackaged", "split_files/vae/wan_2.1_vae.safetensors"),
+    "dit":  ("Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+             "split_files/diffusion_models/wan2.1_t2v_14B_bf16.safetensors"),
+}
+
+#: Where the four land under ``WEIGHTS_DIR``. Flat, and named for what they ARE rather than for the
+#: repo they came from, because two repos contribute to one family and a repo-shaped layout would
+#: make ``model.text_encoder_id`` read as if the encoder belonged to the I2V release.
+WAN21_LOCAL_ROOT = "wan2.1"
+
+
+@app.function(
+    image=download_image,  # code-only image + huggingface_hub, same as the two siblings.
+    volumes={**WEIGHTS_MOUNT},  # CPU only — a pure HF download, never a GPU.
+    secrets=[huggingface_secret],
+    timeout=TWENTY_FOUR_HOURS,  # the DiT alone is ~32 GB in bf16.
+)
+def download_wan_weights() -> str:
+    """One-time download of the four Wan 2.1 components into the weights Volume.
+
+    The ``wan`` family sibling of :func:`download_weights` / :func:`download_qwen_edit_weights`,
+    and the thing that turns ``wan_resolve_component_ids``' refusal from a wall into a config edit.
+
+    ⚠ THIS DEPARTS FROM THE ORACLE ON PURPOSE, in exactly one respect. ``train_kohya.py`` calls
+    ``hf_hub_download`` INSIDE the training function on every run, resolving against an
+    ``hf-hub-cache`` Volume and passing whatever absolute paths come back straight to musubi. That
+    works, and it is why the proven method needs no weights staging at all. signet stages instead,
+    for the reason every other family does: the run that trains an adapter should not also be the
+    run that decides which bytes it trained on. A separate CPU download stage makes the weight set
+    a declared, inspectable input — ``model.model_id`` and friends name it, the config that ships
+    beside the adapter records it, and a re-dispatch cannot silently pick up a different file
+    because upstream moved a tag.
+
+    The COMPONENT TABLE is transcribed rather than reinvented: same repos, same filenames, same
+    four. Departing there would be departing from the recipe.
+
+    Layout written::
+
+        <WEIGHTS_DIR>/wan2.1/models_t5_umt5-xxl-enc-bf16.pth                       -> text_encoder_id
+        <WEIGHTS_DIR>/wan2.1/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth -> clip_id
+        <WEIGHTS_DIR>/wan2.1/wan_2.1_vae.safetensors                               -> vae_id
+        <WEIGHTS_DIR>/wan2.1/wan2.1_t2v_14B_bf16.safetensors                       -> model_id
+
+    The two Comfy-Org files are flattened out of their ``split_files/...`` prefixes so all four sit
+    in one directory; the config ids below are what the operator actually writes, so they are
+    printed literally rather than described.
+    """
+    import os
+    import shutil
+
+    from huggingface_hub import hf_hub_download
+
+    root = WEIGHTS_DIR / WAN21_LOCAL_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+
+    written: dict[str, tuple[str, float]] = {}
+    for flag, (repo_id, filename) in WAN21_COMPONENTS.items():
+        leaf = filename.rsplit("/", 1)[-1]
+        destination = root / leaf
+        if destination.exists() and destination.stat().st_size > 0:
+            written[flag] = (leaf, destination.stat().st_size / (1024**3))
+            print(f"[download_wan_weights] {flag}: {leaf} already present, skipping.")
+            continue
+        cached = hf_hub_download(repo_id=repo_id, filename=filename)
+        # COPY, not symlink: hf_hub_download returns a path inside its own cache, and a symlink
+        # committed to the Volume would dangle in any container that mounts the Volume without
+        # that cache. The Volume must hold the bytes.
+        shutil.copyfile(cached, destination)
+        size_gb = os.path.getsize(destination) / (1024**3)
+        written[flag] = (leaf, size_gb)
+        print(f"[download_wan_weights] {flag}: {repo_id}/{filename} -> {destination} ({size_gb:.1f} GB)")
+
+    weights_vol.commit()  # Pitfall 3 commit-or-vanish, same as both siblings.
+
+    summary = ", ".join(f"{flag} {leaf} {gb:.1f} GB" for flag, (leaf, gb) in written.items())
+    ids = chr(10).join(
+        f"          {field}: {WAN21_LOCAL_ROOT}/{written[flag][0]}"
+        for flag, field in (
+            ("dit", "model_id"),
+            ("vae", "vae_id"),
+            ("t5", "text_encoder_id"),
+            ("clip", "clip_id"),
+        )
+        if flag in written
+    )
+    return (
+        f"[download_wan_weights] {len(written)}/4 component(s) in {root}: {summary}; committed. "
+        f"Declare them in your `model:` block:" + chr(10) + ids
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # Phase-2 GPU loader smoke (SC#1 / D-04). Loads the LTX-2.3 components via the ported
 # load_ltxv_components, prints the transformer/VAE/Gemma/scheduler shapes, ASSERTS them against the
