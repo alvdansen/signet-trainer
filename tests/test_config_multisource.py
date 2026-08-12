@@ -449,3 +449,67 @@ def test_the_largest_view_law_and_the_percent16_law_are_mutually_satisfiable() -
     raw["training_dims"] = [640, 360, 45]  # the declared view — still non-%16, still refused
     with pytest.raises((ValidationError, ValueError)):
         load_config_from_text(yaml.safe_dump(raw))
+
+
+def test_wan_refuses_the_knobs_the_locked_recipe_overrides() -> None:
+    """The lean field-split, applied to the family that had been exempted from it.
+
+    This PR already refuses `data.resolution_buckets` on wan because musubi never reads it — while
+    leaving `lora.*` and the whole `training` block free, all hard-overridden by WAN_MUSUBI_RECIPE.
+
+    The failure is the quiet kind: `lora: {rank: 128}` loads, dry-runs green, prints a cost line,
+    dispatches — and musubi trains rank 32. Nothing errors. The config committed beside the adapter
+    describes a run nobody performed, which corrupts the provenance record rather than failing.
+    """
+    import yaml
+
+    from signet_trainer.config.load import load_config_from_text
+
+    raw = yaml.safe_load(_EXAMPLE.read_text(encoding="utf-8"))
+    assert load_config_from_text(yaml.safe_dump(raw)), "the shipped wan config must still load"
+
+    for patch, expected in (
+        ({"lora": {"rank": 128, "alpha": 128}}, "lora.rank"),
+        ({"training": {"max_steps": 4000, "learning_rate": 1.0e-4}}, "training.learning_rate"),
+        ({"training": {"max_steps": 4000, "optimizer": "adamw"}}, "training.optimizer"),
+    ):
+        candidate = dict(raw)
+        candidate.update(patch)
+        with pytest.raises((ValidationError, ValueError)) as exc:
+            load_config_from_text(yaml.safe_dump(candidate))
+        assert expected in str(exc.value)
+        assert "WAN_MUSUBI_RECIPE" in str(exc.value), (
+            "the refusal must name where the value actually lives, or the operator has nowhere to go"
+        )
+
+
+def test_wan_still_reads_max_steps_because_the_cost_line_prices_from_it() -> None:
+    """The one documented exception. A blanket refusal would break the cost line's own basis."""
+    import yaml
+
+    from signet_trainer.config.load import load_config_from_text
+
+    raw = yaml.safe_load(_EXAMPLE.read_text(encoding="utf-8"))
+    raw["training"] = {"max_steps": 9999}
+    cfg = load_config_from_text(yaml.safe_dump(raw))
+    assert cfg.training.max_steps == 9999
+
+
+def test_a_wan_config_is_never_stamped_with_the_LTX_target_list() -> None:
+    """musubi builds its own network (`--network_module networks.lora_wan`) and never reads this.
+
+    `_cross_field_checks` wrote `resolved_lora_targets()` back onto every config that left
+    `lora.target_modules` unset — which on wan is the LTX ATTENTION SUFFIX LIST. That put
+    `['attn1.to_k', …]` into the artifact shipped beside a lora_wan adapter, asserting a target set
+    no part of the run ever used.
+    """
+    import yaml
+
+    from signet_trainer.config.load import load_config_from_text
+
+    raw = yaml.safe_load(_EXAMPLE.read_text(encoding="utf-8"))
+    cfg = load_config_from_text(yaml.safe_dump(raw))
+    assert cfg.lora.target_modules is None, (
+        f"a wan config was stamped with {cfg.lora.target_modules!r} — musubi never reads it, so "
+        f"this is a false claim in the provenance record"
+    )

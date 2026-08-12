@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -2387,6 +2387,58 @@ class SignetConfig(_Base):
             return QWEN_EDIT_LORA_TARGET_REGEX
         return list(LTX_DEFAULT_LORA_TARGETS)
 
+    #: ``training.*`` fields a wan config may legitimately set. ``max_steps`` is signet's own
+    #: accounting basis and is READ (the cost line prices from it); it is explicitly NOT passed to
+    #: musubi, which is epoch-driven. Everything else in the block is overridden by the locked
+    #: recipe, so declaring it is declaring a run that will not happen.
+    _WAN_READABLE_TRAINING_FIELDS: ClassVar[frozenset[str]] = frozenset({"max_steps"})
+
+    def _check_wan_recipe_overrides(self) -> None:
+        """Refuse ``lora.*`` / ``training.*`` values that ``WAN_MUSUBI_RECIPE`` silently overrides.
+
+        The lean field-split, applied to the one family that had been exempted from it. This PR
+        already refuses ``data.resolution_buckets`` on wan because musubi never reads it — but
+        ``lora.rank`` / ``lora.alpha`` / ``lora.target_modules`` and the whole ``training`` block
+        were left free while being hard-overridden by the locked recipe.
+
+        The failure is the quietest kind there is. An operator writes ``lora: {rank: 128, alpha:
+        128}`` and ``training: {learning_rate: 1.0e-4}``; the config LOADS, the dry-run banner is
+        green, the cost line prints, the run dispatches — and musubi trains rank 32 at lr 2e-4 for
+        16 epochs. Nothing errors. The artifact that ships beside the adapter describes a run nobody
+        performed, which is the exact defect class every other refusal in this file exists to
+        prevent, and it corrupts the provenance record rather than failing.
+
+        Defaults come off the FIELD DEFINITIONS rather than a pristine instance — instantiating one
+        inside a model_validator would recurse — so a default change is covered automatically and
+        this guard cannot drift out of sync (the T-10-05-T doctrine, same as the H3 family guard).
+        """
+        offenders: list[str] = []
+        for block, model, allowed in (
+            ("lora", LoraConfig, frozenset()),
+            ("training", TrainingConfig, self._WAN_READABLE_TRAINING_FIELDS),
+        ):
+            declared = getattr(self, block)
+            for name, field in model.model_fields.items():
+                if name in allowed:
+                    continue
+                if getattr(declared, name) != field.get_default(call_default_factory=True):
+                    offenders.append(f"{block}.{name}")
+        if offenders:
+            raise ValueError(
+                f"family 'wan' does not read {offenders}. musubi owns the optimizer, the schedule "
+                f"and the network — every one of these is hard-overridden by "
+                f"runners/wan_musubi.WAN_MUSUBI_RECIPE (task, network_dim, discrete_flow_shift, "
+                f"max_train_epochs and the transcribed argv), so a value here does not change the "
+                f"run: it changes the CONFIG THAT SHIPS BESIDE THE ADAPTER, which then describes a "
+                f"run nobody performed. That is why this is refused rather than warned about "
+                f"(lean field-split — no silently-ignored config block).\n"
+                f"        training.max_steps is the one exception and is deliberately readable: it "
+                f"is signet's accounting basis for the cost line and is NOT passed to musubi, which "
+                f"is epoch-driven.\n"
+                f"        To change the recipe, change WAN_MUSUBI_RECIPE — and that is a ruling, "
+                f"because the recipe is a transcription of a proven run, not a set of knobs."
+            )
+
     @model_validator(mode="after")
     def _cross_field_checks(self) -> "SignetConfig":
         # Single-bucket is enforced on data.batch_size; re-assert here for a clear top-level error
@@ -2397,7 +2449,14 @@ class SignetConfig(_Base):
         # (rather than only exposing resolved_lora_targets()) is deliberate: modal/fns.py and
         # train/validate_gate.py read cfg.lora.target_modules directly, and an H3 run that silently
         # injected the LTX-shaped list would NOT fail loud — see the LoraConfig.target_modules note.
-        if self.lora.target_modules is None:
+        if self.model.family == "wan":
+            # ⛔ NO WRITE-BACK ON wan. signet does not own this loop: musubi builds the network
+            # itself (--network_module networks.lora_wan) and never reads lora.target_modules.
+            # Stamping resolved_lora_targets() here would write the LTX ATTENTION SUFFIX LIST
+            # (attn1.to_k, …) into the config that ships beside a lora_wan adapter — a provenance
+            # record asserting a target set that no part of the run ever used.
+            self._check_wan_recipe_overrides()
+        elif self.lora.target_modules is None:
             self.lora.target_modules = self.resolved_lora_targets()
         elif not self.lora.target_modules:
             # An EXPLICITLY empty override is never a valid run — it injects zero adapters. It also
