@@ -6,7 +6,7 @@ versioning during beta — the config schema and CLI surface may change in any r
 
 ## [0.1.0b1] — 2026-08-07
 
-First private beta cut. Published with fresh history; the full development record is retained
+First beta cut (published private, now public). Published with fresh history; the full development record is retained
 privately.
 
 ### Model families

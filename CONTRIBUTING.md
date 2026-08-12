@@ -1,6 +1,6 @@
 # Contributing
 
-signet-trainer is in **private beta**. The most valuable contribution right now is a precise bug
+signet-trainer is in **public beta**. The most valuable contribution right now is a precise bug
 report; code contributions are welcome but the schema is still moving, so open an issue before
 writing anything large.
 
