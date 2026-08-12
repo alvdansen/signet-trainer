@@ -37,7 +37,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
+import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -217,18 +219,42 @@ def _encode_gray_png(mask_u8) -> bytes:
     return buf.tobytes()
 
 
-def write_binary_mask(prep_dir: Path | str, stem: str, rgba, *, kind: str = "frame0", frame: int | None = None):
+def _atomic_write_bytes(target: Path, data: bytes) -> None:
+    """Write ``data`` via a same-dir temp file + ``os.replace`` so a partial write can never land."""
+    tmp = target.with_name(f"{target.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():  # only on a failed replace/write — never leave staging litter
+            tmp.unlink(missing_ok=True)
+
+
+def write_binary_mask(
+    prep_dir: Path | str, stem: str, rgba, *, kind: str = "frame0", frame: int | None = None, allow_empty: bool = False
+):
     """Threshold an RGBA overlay SERVER-SIDE and write the binary WHITE mask in the D-05 layout.
 
     Returns ``(target_path, mask_u8)``. The write target is resolved and asserted under ``prep_dir``
     (traversal guard) before any bytes hit disk. The written PNG is binary ``{0, 255}`` by
     construction — the browser's anti-aliasing never reaches disk.
+
+    An all-empty mask (zero set pixels after thresholding) is REFUSED unless ``allow_empty=True`` —
+    a blank overlay landing here would silently overwrite a propagated SAM mask or the frame-0 seed
+    with all-black, which downstream negates to KEEP-everywhere. The write itself is temp+``os.replace``
+    atomic so a crashed request can never leave a truncated PNG at the target.
     """
+    np = _need_numpy()
     mask = threshold_alpha_to_binary(rgba)
     rel = export_target_rel(stem, kind, frame)
     target = resolve_under_dir(prep_dir, rel)
+    if not allow_empty and not np.any(mask):
+        raise ValueError(
+            f"[prep.app] refusing to write an EMPTY mask to {rel} -- the overlay has zero set pixels "
+            "after thresholding; pass allow_empty=True only for a deliberate blank-out."
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(_encode_gray_png(mask))
+    _atomic_write_bytes(target, _encode_gray_png(mask))
     return target, mask
 
 
@@ -245,7 +271,7 @@ def import_paintover(prep_dir: Path | str, stem: str, png_bytes: bytes, spec: di
     rel = export_target_rel(stem, "frame0", None)
     target = resolve_under_dir(prep_dir, rel)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(_encode_gray_png(mask))
+    _atomic_write_bytes(target, _encode_gray_png(mask))
     return target, mask, record
 
 
@@ -430,8 +456,9 @@ def make_handler(config: AppConfig):
                 stem = payload["stem"]
                 kind = payload.get("kind", "frame0")
                 frame = payload.get("frame")
+                allow_empty = bool(payload.get("allow_empty", False))
                 rgba = _decode_png_rgba(self._decode_dataurl(payload["png"]))
-                target, _ = write_binary_mask(prep_dir, stem, rgba, kind=kind, frame=frame)
+                target, _ = write_binary_mask(prep_dir, stem, rgba, kind=kind, frame=frame, allow_empty=allow_empty)
             except (KeyError, ValueError, base64.binascii.Error) as exc:
                 self._send(400, f"export rejected: {exc}".encode("utf-8"), "text/plain; charset=utf-8")
                 return

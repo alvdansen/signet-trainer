@@ -140,6 +140,79 @@ def test_export_per_frame_video_layout(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# Empty-mask refusal + atomic write — a merely-visited frame must never blank a propagated mask
+# (the PR-10 export-destroys-masks blocker). Server refuses zero-set-pixel writes; the write itself
+# is temp+os.replace so a partial write can never land at the target.
+# --------------------------------------------------------------------------------------------------
+
+
+def _empty_overlay(h: int, w: int) -> np.ndarray:
+    return np.zeros((h, w, 4), dtype=np.uint8)  # all-transparent -> zero set pixels after threshold
+
+
+def test_export_refuses_empty_mask_and_preserves_existing(tmp_path: Path) -> None:
+    """An all-transparent overlay is REFUSED, leaving an existing propagated mask byte-identical."""
+    cv2 = pytest.importorskip("cv2")
+    prep = tmp_path / "prep"
+    stem = "07_scene003__face_hair"
+    seeded = prep / "masks_video" / stem / "00007.png"
+    seeded.parent.mkdir(parents=True)
+    cv2.imwrite(str(seeded), np.full((64, 64), 255, dtype=np.uint8))  # a full-white SAM mask
+    before = seeded.read_bytes()
+
+    with pytest.raises(ValueError, match="EMPTY mask"):
+        mask_app.write_binary_mask(prep, stem, _empty_overlay(64, 64), kind="video", frame=7)
+    assert seeded.read_bytes() == before  # the propagated mask survives untouched
+
+    # the frame-0 seed layout is protected by the same refusal
+    with pytest.raises(ValueError, match="EMPTY mask"):
+        mask_app.write_binary_mask(prep, stem, _empty_overlay(64, 64), kind="frame0")
+    assert not (prep / "masks_frame0" / f"{stem}.png").exists()
+
+
+def test_export_allow_empty_is_a_deliberate_flag(tmp_path: Path) -> None:
+    """``allow_empty=True`` is the explicit blank-out escape hatch — it writes an all-black mask."""
+    cv2 = pytest.importorskip("cv2")
+    prep = tmp_path / "prep"
+    prep.mkdir()
+    target, mask = mask_app.write_binary_mask(
+        prep, "10_clip__face", _empty_overlay(16, 16), kind="video", frame=3, allow_empty=True
+    )
+    assert target.is_file()
+    disk = cv2.imread(str(target), cv2.IMREAD_GRAYSCALE)
+    assert disk.max() == 0
+    assert mask.max() == 0
+
+
+def test_export_write_is_atomic_no_staging_litter(tmp_path: Path) -> None:
+    """The write lands via temp+os.replace: the finished PNG appears, and no ``.tmp-*`` survives."""
+    pytest.importorskip("cv2")
+    prep = tmp_path / "prep"
+    prep.mkdir()
+    target, _ = mask_app.write_binary_mask(prep, "10_clip__face", _white_overlay(16, 16), kind="video", frame=9)
+    assert target.is_file()
+    litter = [p for p in target.parent.iterdir() if ".tmp-" in p.name]
+    assert litter == []
+
+
+def test_export_handler_forwards_allow_empty_and_client_posts_only_dirty_frames() -> None:
+    """Client contract: Export POSTs only PAINTED frames (S.dirtyFrames), never every visited frame,
+    and saveOverlay never snapshots a merely-visited frame; the handler forwards ``allow_empty``."""
+    from signet_trainer.prep._app_client import CLIENT_SCRIPT
+    import inspect
+
+    # the export loop iterates the dirty set, not every overlay key ever recorded
+    assert "Object.keys(S.overlays)" not in CLIENT_SCRIPT
+    assert "[...S.dirtyFrames]" in CLIENT_SCRIPT
+    assert "S.dirtyFrames.has(0)" in CLIENT_SCRIPT
+    # saveOverlay is gated on the dirty set (a scrolled-past frame acquires no overlay entry)
+    assert "if(!S.clip || !S.dirtyFrames.has(S.frame)) return;" in CLIENT_SCRIPT
+
+    handler_src = inspect.getsource(mask_app.make_handler)
+    assert 'payload.get("allow_empty", False)' in handler_src
+
+
+# --------------------------------------------------------------------------------------------------
 # D-10 — the paintover import routes through the rebuilt chroma extractor (Plan 03).
 # --------------------------------------------------------------------------------------------------
 
