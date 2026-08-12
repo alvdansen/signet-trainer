@@ -211,7 +211,18 @@ function buildStrip(){
   }
 }
 
-function saveOverlay(){ if(S.clip) S.overlays[S.frame]=overlay.toDataURL('image/png'); }
+function overlayHasPaint(){
+  const d=octx.getImageData(0,0,overlay.width,overlay.height).data;
+  for(let i=3;i<d.length;i+=4){ if(d[i]>127) return true; }
+  return false;
+}
+function saveOverlay(){
+  // Snapshot ONLY frames the operator actually painted on — a merely-visited frame must never
+  // acquire an overlay entry, or Export would blank its propagated mask on disk.
+  if(!S.clip || !S.dirtyFrames.has(S.frame)) return;
+  if(!overlayHasPaint()){ delete S.overlays[S.frame]; S.dirtyFrames.delete(S.frame); return; }
+  S.overlays[S.frame]=overlay.toDataURL('image/png');
+}
 
 function showFrame(i){
   S.frame=i;
@@ -303,8 +314,8 @@ $('toolEraser').onclick=()=>setTool('eraser');
 $('brushSize').oninput=e=>{ S.size=+e.target.value; };
 
 // ---- undo / redo (stroke-level, depth 20; Ctrl/Cmd+Z / Ctrl/Cmd+Shift+Z) ----
-function undo(){ const k=S.frame,st=S.undo[k]; if(st&&st.length){ (S.redo[k]=S.redo[k]||[]).push(octx.getImageData(0,0,overlay.width,overlay.height)); octx.putImageData(st.pop(),0,0); saveOverlay(); updateCoverage(); } }
-function redo(){ const k=S.frame,st=S.redo[k]; if(st&&st.length){ (S.undo[k]=S.undo[k]||[]).push(octx.getImageData(0,0,overlay.width,overlay.height)); octx.putImageData(st.pop(),0,0); saveOverlay(); updateCoverage(); } }
+function undo(){ const k=S.frame,st=S.undo[k]; if(st&&st.length){ (S.redo[k]=S.redo[k]||[]).push(octx.getImageData(0,0,overlay.width,overlay.height)); octx.putImageData(st.pop(),0,0); S.dirtyFrames.add(k); saveOverlay(); updateCoverage(); } }
+function redo(){ const k=S.frame,st=S.redo[k]; if(st&&st.length){ (S.undo[k]=S.undo[k]||[]).push(octx.getImageData(0,0,overlay.width,overlay.height)); octx.putImageData(st.pop(),0,0); S.dirtyFrames.add(k); saveOverlay(); updateCoverage(); } }
 $('undoBtn').onclick=undo; $('redoBtn').onclick=redo;
 
 // ---- clear frame (undoable, no confirm) / clear all (confirm inline; not undoable) ----
@@ -333,9 +344,10 @@ $('exportBtn').onclick=async()=>{
   saveOverlay();
   const stem=S.clip.replace(/\\.mp4$/,'');
   try{
-    // frame-0 seed + every painted frame in the per-frame layout
-    if(S.overlays[0]) await postExport(stem,'frame0',0,S.overlays[0]);
-    for(const f of Object.keys(S.overlays)){ await postExport(stem,'video',+f,S.overlays[f]); }
+    // frame-0 seed + every PAINTED frame (S.dirtyFrames) in the per-frame layout — never a frame
+    // the operator merely scrolled past, so existing propagated masks on disk stay untouched
+    if(S.dirtyFrames.has(0) && S.overlays[0]) await postExport(stem,'frame0',0,S.overlays[0]);
+    for(const f of [...S.dirtyFrames].sort((a,b)=>a-b)){ if(S.overlays[f]) await postExport(stem,'video',+f,S.overlays[f]); }
     $('exportBtn').textContent='Exported ✓'; setTimeout(()=>$('exportBtn').textContent='Export masks',1200);
   }catch(e){
     alert('Could not write masks to `'+stem+'`. Check the path exists and is writable, then retry Export.');
