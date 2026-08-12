@@ -373,7 +373,19 @@ def parse_musubi_toml(text: str) -> ParsedMusubiConfig:
         source_id = _provenance_id(cache_directory, index, taken)
         taken.add(source_id)
         kind = "image" if "image_directory" in block else "video"
-        extraction = ExtractionMode(block.get("frame_extraction", ExtractionMode.IMAGE.value))
+        # ⛔ THE DEFAULT IS MUSUBI'S, NOT SIGNET'S. This direction exists so an operator's
+        # existing, known-good runner config can be read INTO the manifest vocabulary, which
+        # means every absent key must resolve the way MUSUBI resolves it. Its
+        # `frame_extraction` default is `head` for a video block (kohya-ss/musubi-tuner
+        # docs/dataset_config.md); defaulting to `image` rejected a perfectly ordinary video
+        # block with "kind 'video' cannot use extraction: image" — a complaint about a mode
+        # the operator's file never mentions.
+        extraction = ExtractionMode(
+            block.get(
+                "frame_extraction",
+                ExtractionMode.IMAGE.value if kind == "image" else ExtractionMode.HEAD.value,
+            )
+        )
         fields: dict[str, object] = {
             "id": source_id,
             "kind": kind,
@@ -393,7 +405,10 @@ def parse_musubi_toml(text: str) -> ParsedMusubiConfig:
 
     return ParsedMusubiConfig(
         caption_extension=general.get("caption_extension", ".txt"),
-        enable_bucket=general.get("enable_bucket", True),
+        # musubi's own default is FALSE. Defaulting to True recorded bucketing ON for a config
+        # that ran with it OFF, and a re-render then EMITTED `enable_bucket = true` — a
+        # training-affecting flag flipped by an ingest that advertises losslessness.
+        enable_bucket=general.get("enable_bucket", False),
         bucket_no_upscale=general.get("bucket_no_upscale", False),
         sources=tuple(sources),
     )

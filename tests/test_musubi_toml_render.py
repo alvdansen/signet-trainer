@@ -564,3 +564,61 @@ def test_the_purity_probe_would_catch_a_violation() -> None:
         f"the purity probe failed to flag a deliberately-imported torch: {result.stdout.strip()}\n"
         f"{result.stderr}"
     )
+
+
+def test_parse_defaults_are_MUSUBIS_defaults_not_signets() -> None:
+    """An absent key must resolve the way musubi resolves it, or the ingest is not lossless.
+
+    This direction exists so an operator's existing, known-good runner config can be read INTO the
+    manifest vocabulary. Two defaults contradicted upstream:
+
+      * `frame_extraction` defaulted to `image`, so a video block relying on musubi's `head` default
+        was REJECTED with "kind 'video' cannot use extraction: image" — a complaint about a mode the
+        operator's file never mentions;
+      * `enable_bucket` defaulted to True, so a `[general]` that omitted it was recorded as
+        bucketing ON for a config musubi ran with it OFF — and a re-render then EMITTED
+        `enable_bucket = true`, a training-affecting flag flipped by an ingest advertising
+        losslessness.
+    """
+    from signet_trainer.config.sources import ExtractionMode
+    from signet_trainer.runners.musubi_toml import parse_musubi_toml
+
+    minimal = "\n".join([
+        "[general]",
+        'caption_extension = ".txt"',
+        "",
+        "[[datasets]]",
+        'video_directory = "/dataset/K/Videos"',
+        'cache_directory = "/dataset/K/Videos/cache"',
+        "resolution = [640, 352]",
+        "target_frames = [45]",
+        "batch_size = 1",
+        "",
+    ])
+    parsed = parse_musubi_toml(minimal)
+    assert parsed.enable_bucket is False, (
+        "an omitted enable_bucket was recorded as True — re-rendering would turn bucketing ON for a "
+        "run that had it OFF"
+    )
+    assert parsed.sources[0].extraction is ExtractionMode.HEAD, (
+        "an omitted frame_extraction on a VIDEO block must resolve to musubi's `head`, not `image`"
+    )
+
+
+def test_an_omitted_frame_extraction_on_an_IMAGE_block_still_resolves_to_image() -> None:
+    """The other half of the same default — kind-dependent, not a blanket swap."""
+    from signet_trainer.config.sources import ExtractionMode
+    from signet_trainer.runners.musubi_toml import parse_musubi_toml
+
+    minimal = "\n".join([
+        "[general]",
+        'caption_extension = ".txt"',
+        "",
+        "[[datasets]]",
+        'image_directory = "/dataset/K/Images"',
+        'cache_directory = "/dataset/K/Images/cache"',
+        "resolution = [1024, 1024]",
+        "batch_size = 1",
+        "",
+    ])
+    assert parse_musubi_toml(minimal).sources[0].extraction is ExtractionMode.IMAGE
