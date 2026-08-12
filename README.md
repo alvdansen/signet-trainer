@@ -1,6 +1,6 @@
 # signet-trainer
 
-> **Private beta.** Interfaces, config schema, and CLI surface may change without notice.
+> **Public beta.** Interfaces, config schema, and CLI surface may change without notice.
 > See [Beta status](#beta-status) before you build anything on this.
 
 A video LoRA trainer built around **reference control as a first-class feature** rather than an
@@ -247,7 +247,7 @@ appreciated, not just tolerated.
 
 ## Beta status
 
-This is a **private beta** cut with fresh history.
+This is a **public beta** cut with fresh history.
 
 - The config schema, YAML field names, and CLI flags **will** change. Pin a commit if you need
   stability.
