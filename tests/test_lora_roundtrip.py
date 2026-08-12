@@ -135,3 +135,60 @@ def test_non_default_adapter_roundtrips_via_subdir(tmp_path) -> None:
     assert set(loaded) == set(saved)
     for k in saved:
         assert torch.allclose(saved[k], loaded[k])
+
+
+# --------------------------------------------------------------------------------------------------
+# fail-loud contract — a mismatched / partial / empty adapter load must RAISE, never no-op
+# --------------------------------------------------------------------------------------------------
+# ``set_peft_model_state_dict`` returns ``_IncompatibleKeys`` and never raises on a key mismatch:
+# a key-mismatched warm start applies ZERO tensors, leaves every lora_B at its zero init (an exact
+# identity adapter), and the run proceeds on the untouched base under an adapter label. The seam
+# enforces its own docstring contract instead of trusting callers to inspect the return value.
+
+
+def _wrapped_with_targets(targets: list[str]) -> tuple[nn.Module, LoraConfig]:
+    cfg = LoraConfig(
+        r=4, lora_alpha=4, target_modules=targets, lora_dropout=0.0, bias="none"
+    )
+    return get_peft_model(_TwoLinear(), cfg), cfg
+
+
+def test_load_adapter_into_raises_on_fully_mismatched_targets(tmp_path) -> None:
+    """Saved targets {a} into a model targeting {b}: nothing applies -> RAISE, not a silent no-op."""
+    src, _ = _wrapped_with_targets(["a"])
+    _randomize_lora_b(src)
+    save_adapter(src, tmp_path)
+
+    dst, _ = _wrapped_with_targets(["b"])
+    with pytest.raises(RuntimeError, match="matched NO parameter"):
+        load_adapter_into(dst, tmp_path)
+    # And the model really was untouched: lora_B is still its all-zero init (identity adapter).
+    for name, p in dst.named_parameters():
+        if "lora_B" in name:
+            assert torch.count_nonzero(p) == 0
+
+
+def test_load_adapter_into_raises_on_partial_cold_adapter(tmp_path) -> None:
+    """Saved targets {a} into a model targeting {a, b}: half the adapter stays cold -> RAISE.
+
+    The plausible case: unexpected_keys is EMPTY here (every file tensor applied), so only the
+    coverage check catches that b's lora tensors never left their zero init.
+    """
+    src, _ = _wrapped_with_targets(["a"])
+    _randomize_lora_b(src)
+    save_adapter(src, tmp_path)
+
+    dst, _ = _wrapped_with_targets(["a", "b"])
+    with pytest.raises(RuntimeError, match="NOT in .* and stayed at their init"):
+        load_adapter_into(dst, tmp_path)
+
+
+def test_load_adapter_into_raises_on_empty_adapter_file(tmp_path) -> None:
+    """A zero-tensor adapter file warm-starts nothing -> RAISE (sibling of the T-03-41 resume guard)."""
+    from safetensors.torch import save_file
+
+    save_file({}, str(tmp_path / "adapter_model.safetensors"))
+
+    dst, _ = _wrapped_with_targets(["a", "b"])
+    with pytest.raises(RuntimeError, match="empty adapter state_dict"):
+        load_adapter_into(dst, tmp_path)

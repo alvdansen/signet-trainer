@@ -4691,6 +4691,9 @@ def h3_sample(config_yaml: str) -> None:
             "base-only grid under an adapter label."
         )
     adapted = inject_lora(base_transformer, lora_config)
+    # load_adapter_into is FAIL-LOUD (empty file / unexpected keys / cold lora tensors all raise):
+    # a checkpoint that does not FULLY apply refuses the render here, for the same reason the
+    # component check above raises — anything less renders a base-only grid under an adapter label.
     load_adapter_into(adapted, latest_ckpt)
     adapted.eval()  # inject_lora leaves the model in train mode + grad-checkpointing (TRAIN-06)
     pipe.update_components(**{H3_REF2VA_TRANSFORMER: adapted})

@@ -13,9 +13,11 @@ The 6 checks (video-only — NO audio/cross-modal/AV expansion, NO Wan probes):
                           ground-truth header read.
   #2 check_text_encoder — Gemma ``hidden_size == 3840`` (the real ground truth, NOT Flimmer's
                           stale 3072) via ``text_encoder.config.hidden_size``.
-  #3 check_lora_targets — every ``P1_FF_LORA_TARGETS`` entry (attn1+attn2+ff.net) resolves via
-                          ``name.endswith(target)`` over ``named_modules()`` — the structural
-                          proof the ``ff.net`` fix is real on the arch.
+  #3 check_lora_targets — every target THE RUN WILL INJECT (``config.lora.target_modules``, the
+                          family-resolved set — e.g. the 14-entry a2v set with the cross-modal
+                          ``audio_to_video_attn.*`` entries) resolves on the arch via the
+                          PEFT-faithful matchers in ``lora/peft.py`` — the structural proof the
+                          injected set is real on the arch, not a probe of a hardcoded default.
   #4 check_forward_pass — drive ONE synthetic ``training_step`` forward and assert a tensor
                           returns. THIS resolves Open-Q1: whether ``components.transformer``
                           accepts ``model(video=Modality, audio=None, perturbations=None)→(pred,_)``;
@@ -48,11 +50,17 @@ from typing import Any
 import torch
 
 from signet_trainer.lora.peft import (
+    H3_LORA_TARGET_REGEX,
     P1_FF_LORA_TARGETS,
     build_lora_config,
+    check_lora_targets_regex,
     inject_lora,
     roundtrip_check,
 )
+
+# The per-target counting probe shares its name with this module's gate check #3 (which wraps it
+# into a CheckResult), so it is imported under an alias rather than shadowed.
+from signet_trainer.lora.peft import check_lora_targets as count_lora_targets
 from signet_trainer.models.loader import (
     EXPECTED_HIDDEN_DIM,
     EXPECTED_NUM_BLOCKS,
@@ -108,29 +116,23 @@ class CheckResult:
 # --------------------------------------------------------------------------------------------------
 
 
-def resolve_lora_targets(
-    module: Any, targets: list[str] | None = None
-) -> dict[str, list[str]]:
-    """Resolve each LoRA target via ``name.endswith(target)`` over ``module.named_modules()``.
+def resolve_lora_targets(module: Any, targets: list[str]) -> dict[str, Any]:
+    """Resolve each LoRA target over ``module.named_modules()`` via the PEFT-faithful matcher.
 
-    The faithful port of validate_ltx23.py's ``_check_targets`` matcher (471-476): a target is
-    "matched" iff at least one ``named_modules()`` key ends with it. Returns ``{"matched": [...],
-    "unmatched": [...], "counts": {target: n}}``. This is the structural proof that the locked
-    ``P1_FF_LORA_TARGETS`` (including the ``ff.net.0.proj`` / ``ff.net.2`` entries — the fix)
-    resolve on the real arch; the test drives it against a FAKE module with no 22B model.
+    Delegates to ``lora/peft.py::check_lora_targets`` (dot-bounded suffix — what PEFT actually does
+    for a ``list[str]`` ``target_modules``) rather than re-implementing a matcher. The original port
+    of validate_ltx23.py's ``_check_targets`` used a bare ``name.endswith(target)``, which is LOOSER
+    than PEFT (it would "match" a coincidental ``…xattn1.to_q``) — the gate must predict PEFT's
+    injection, so it uses PEFT's semantics. Returns ``{"matched": [...], "unmatched": [...],
+    "counts": {target: n}}``; the test drives it against a FAKE module with no 22B model.
     """
-    if targets is None:
-        targets = P1_FF_LORA_TARGETS
-
-    names = [name for name, _ in module.named_modules()]
-    matched: list[str] = []
-    unmatched: list[str] = []
-    counts: dict[str, int] = {}
-    for target in targets:
-        n = sum(1 for name in names if name.endswith(target))
-        counts[target] = n
-        (matched if n > 0 else unmatched).append(target)
-    return {"matched": matched, "unmatched": unmatched, "counts": counts}
+    report = count_lora_targets(module, targets)
+    counts = {target: report[target]["total"] for target in targets}
+    return {
+        "matched": [t for t in targets if counts[t] > 0],
+        "unmatched": [t for t in targets if counts[t] == 0],
+        "counts": counts,
+    }
 
 
 def _benchmark_vram(label: str) -> dict[str, Any]:
@@ -449,10 +451,22 @@ def check_text_encoder(components: Any) -> CheckResult:
         )
 
 
-def check_lora_targets(components: Any) -> CheckResult:
-    """#3 — every ``P1_FF_LORA_TARGETS`` entry resolves via ``name.endswith`` over named_modules.
+def check_lora_targets(components: Any, config: Any) -> CheckResult:
+    """#3 — every target THE RUN WILL INJECT resolves on the arch, with per-target counts.
 
-    The structural proof that the ``ff.net`` fix is real on the arch (attn1+attn2+ff.net all match).
+    Probes ``config.lora.target_modules`` — the set check #5 actually injects (family-resolved and
+    written back by ``SignetConfig._cross_field_checks``; same ``or P1_FF_LORA_TARGETS`` fallback
+    spelling as check #5) — NOT a hardcoded default. Probing ``P1_FF_LORA_TARGETS`` here passed an
+    a2v run "10/10 targets matched" while all four cross-modal ``audio_to_video_attn.*`` entries
+    were absent from the arch — the exact "#1 silent a2v failure" the GATE-SPEC names.
+
+    Both target forms are handled with the PEFT-faithful matchers from ``lora/peft.py``:
+      * ``list[str]`` — ``check_lora_targets`` (dot-bounded suffix, PEFT's list semantics); FAIL on
+        ANY per-target zero count, and the message carries the per-target counts.
+      * bare ``str`` — a PEFT path REGEX (the H3 form); ``check_lora_targets_regex`` (never iterate
+        a bare str as a list — that char-explodes the probe). FAIL on zero total matches; for the
+        H3 family regex additionally FAIL on any per-leaf zero (the H3 bar is main=50 PER LEAF).
+
     Runs on the BASE transformer's ``named_modules()`` — no PEFT injection needed for the match.
     """
     t0 = time.time()
@@ -465,13 +479,37 @@ def check_lora_targets(components: Any) -> CheckResult:
                 "components.transformer is None",
                 duration_s=round(time.time() - t0, 2),
             )
-        resolution = resolve_lora_targets(transformer, P1_FF_LORA_TARGETS)
+        targets = (
+            getattr(getattr(config, "lora", None), "target_modules", None) or P1_FF_LORA_TARGETS
+        )
+        if isinstance(targets, str):
+            survey = check_lora_targets_regex(transformer, targets)
+            zero_leaves = (
+                [leaf for leaf, n in survey["per_leaf"].items() if n == 0]
+                if targets == H3_LORA_TARGET_REGEX
+                else []
+            )
+            status = "PASS" if survey["total"] > 0 and not zero_leaves else "FAIL"
+            message = (
+                f"regex target form: {survey['total']} modules matched "
+                f"(main={survey['main']}, collateral={survey['collateral']}); "
+                f"per-leaf: {survey['per_leaf']}"
+                + (f"; ZERO-MATCH leaves: {zero_leaves}" if zero_leaves else "")
+            )
+            return CheckResult(
+                "check_lora_targets",
+                status,
+                message,
+                details=survey,
+                duration_s=round(time.time() - t0, 2),
+            )
+        resolution = resolve_lora_targets(transformer, list(targets))
         unmatched = resolution["unmatched"]
         status = "PASS" if not unmatched else "FAIL"
-        ff_counts = {t: resolution["counts"][t] for t in ("ff.net.0.proj", "ff.net.2")}
         message = (
-            f"{len(resolution['matched'])}/{len(P1_FF_LORA_TARGETS)} targets matched; "
-            f"ff.net instances: {ff_counts}"
+            f"{len(resolution['matched'])}/{len(targets)} injected targets matched; "
+            f"per-target counts: {resolution['counts']}"
+            + (f"; UNMATCHED: {unmatched}" if unmatched else "")
         )
         return CheckResult(
             "check_lora_targets",
@@ -744,7 +782,7 @@ def run_validation_gate(
     results.append(check_frame_constraints(config))
     results.append(check_dimensions(components, checkpoint_path=checkpoint_path))
     results.append(check_text_encoder(components))
-    results.append(check_lora_targets(components))
+    results.append(check_lora_targets(components, config))
     results.append(check_forward_pass(components, config, device=device, dtype=dtype))
 
     train_result, peft_model = check_training_step(components, config, device=device, dtype=dtype)
