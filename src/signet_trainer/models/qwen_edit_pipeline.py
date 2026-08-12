@@ -12,11 +12,18 @@ set out of LTX paths (its own docstring, :6-8), whose directory-wide ``glob("*.p
 also covers a family where that same setting is MANDATORY at a different value. The guard's scope
 is non-recursive and covers ``inference/`` only; ``models/`` is not scanned.
 
-Narrowing ``_WAN_TOKENS`` to the LTX modules remains the right long-term ruling, and it is
-Timothy's to make. Until then this module names the setting plainly, in one place, and
+This module names the setting plainly, in one place, and
 ``inference/qwen_edit_layout.render_qwen_edit_sample`` consumes a pipeline that is ALREADY pinned
-and never spells the token. That is additive and reversible: the day the guard is narrowed,
-nothing here has to move, and no shipped money-safe test was weakened to land a sampler.
+and never spells the token — so wherever the guard's scope lands, nothing here has to move.
+
+⚠ CORRECTION (2026-08-12, PR review). This paragraph used to end "no shipped money-safe test was
+weakened to land a sampler", and by then that was FALSE: ``test_no_wan_params.py`` had already been
+rewritten in this same branch to scope the bare-token ban by family prefix, which IS a narrowing of
+a shipped guard. The claim outlived the code it described, and it was load-bearing — a reader
+checking whether the sampler had been landed cheaply would have been reassured by a sentence that
+was no longer true. The narrowing stands, and the rewrite has since been tightened (the ``wan_``
+carve-out removed for want of a module, the value scanner taught to read ``set_shift(...)``), but
+it is a narrowing and this file says so.
 
 ⚠ THE TRAP THIS MODULE EXISTS FOR — measured on this box, not asserted
 ----------------------------------------------------------------------
