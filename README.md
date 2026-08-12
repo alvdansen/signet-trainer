@@ -96,6 +96,30 @@ another provider without touching the training machinery.
 
 ---
 
+## The agentic harness
+
+This repo doesn't just ship a trainer — it ships **the way we operate it**. `.claude/skills/`
+contains the six lifecycle playbooks we drive every real campaign with, built for (and with)
+Claude Code:
+
+| Skill | Stage |
+| --- | --- |
+| `training-session-setup` | The one upfront gate: triage mode, spend cap, sampling plan, recipe surface — collected before any metered work |
+| `training-prep` / `training-prep-inpaint` | Dataset staging + the gated pre-encode (inpaint adds the mask pipeline + QA gate) |
+| `training-run` | Dry-run → cost print → approval → launch → monitor, through the single entrypoint only |
+| `training-review` | Sample renders, side-by-side grids, the ~200-step convergence probe — judged on clips, not loss curves |
+| `segmentation-prep` | SAM3 text-prompt seeding → propagation → paired control datasets |
+
+Open this repo in Claude Code and start with `training-session-setup`; the skills carry the full
+playbooks (commands, artifact paths, VRAM and cost landmines) and enforce the house rules the rest
+of this README describes — the approval gate, the spend ledger, save-everything checkpoints, and
+verdicts rendered on visual output. They are our in-house methodology, shipped as-is; a few
+reference private companion tooling and say so where they do. You can run everything in this repo
+without them — but they are how it's *meant* to be run, and they're half the reason a two-person
+domain team can operate a trainer like this at all.
+
+---
+
 ## Requirements
 
 | | |
