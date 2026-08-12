@@ -80,6 +80,22 @@ runs on a laptop (including Windows) with zero cost.
 
 ---
 
+## Compute venues
+
+Two venues are implemented today: **Modal** (serverless GPU — the primary, validated path) and
+**local workstation GPUs** (the BETA runner above). We plan to support others, but we prioritize
+the venues we actually have access to and can validate on real hardware — that's the "ship what
+works" rule applied to infrastructure. (If, say, RunPod wanted to send a compute grant our way, we
+would be *delighted* to implement RunPod support properly.)
+
+That said, the venue layer is deliberately thin and porting it is largely mechanical: every run
+flows through one config-driven entrypoint, the training core never imports the venue, weights and
+datasets are plain paths, and the dispatch arms are isolated in `src/signet_trainer/modal/`. An
+agent — or an engineer with one — pointed at this repo should be able to convert the scripts to
+another provider without touching the training machinery.
+
+---
+
 ## Requirements
 
 | | |
