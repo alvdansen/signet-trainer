@@ -115,6 +115,10 @@ H3_REFERENCE_KINDS: tuple[str, ...] = ("character", "environment", "prop")
 #: off the same seed. Without them, an environment segment's character pick would be correlated with
 #: the pair a non-environment segment at the same index would have received.
 _PAIR_DOMAIN = "h3-reference-pair"
+#: k>=3 selection. A SEPARATE domain from the pair case on purpose: sharing `_PAIR_DOMAIN` would
+#: make the 3-slot assignment for a given segment correlate with its 2-slot assignment, which is
+#: a silent coupling between two regimes that should be independent.
+_COMBO_DOMAIN = "h3-reference-combination"
 _CHARACTER_DOMAIN = "h3-character-ref"
 _DROPOUT_DOMAIN = "h3-reference-dropout"
 
@@ -337,9 +341,14 @@ def resolve_reference_slots(
         )
     elif n_characters_needed == 2:
         picked = assign_reference_pair(segment_index, n_refs=len(characters), seed=seed)
-    else:  # pragma: no cover — Phase 10 fixes references_per_sample at 2
+    else:
+        # k >= 3. Reached by explicit-manifest sequence tasks (references_per_sample=3), where
+        # the pool is exactly the manifest's own three references. In that case
+        # combinations(range(3), 3) enumerates a SINGLE tuple, so this is the identity
+        # permutation for every segment — deterministic, and with nothing to rotate toward.
+        # It is a real selection only when the pool is larger than the slot count.
         picked = _assign_combination(
-            segment_index, len(characters), n_characters_needed, seed=seed, domain=_PAIR_DOMAIN
+            segment_index, len(characters), n_characters_needed, seed=seed, domain=_COMBO_DOMAIN
         )
 
     slots = [characters[i] for i in picked]
@@ -836,7 +845,13 @@ class H3RefStrategy(TrainingStrategy):
         characters = [reference for reference, _ in pool if reference.kind != "environment"]
         environments = [reference for reference, _ in pool if reference.kind == "environment"]
 
-        allowed_environments = self.references_per_sample - 1
+        # ⛔ At most ONE environment reference, ALWAYS — it SUBSTITUTES for the last character
+        # slot and is never appended, so "one" is a property of the substitution rule, not of the
+        # slot count. The old `references_per_sample - 1` happened to equal 1 only because the
+        # count was pinned at 2; at 3 it silently permitted a 2-environment pool while the call
+        # below still passes `environments[0]`, dropping the second without a word. Widening the
+        # slot count is what made that reachable, so it is pinned here in the same change.
+        allowed_environments = 1 if self.references_per_sample >= 2 else 0
         if len(environments) > allowed_environments:
             raise ValueError(
                 f"got {len(environments)} environment reference(s) but at most "

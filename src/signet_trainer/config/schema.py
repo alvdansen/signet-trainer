@@ -533,18 +533,33 @@ class H3Config(_Base):
         #      single reference is strictly CHEAPER (5,040 vs 7,848 packed rows at 16:9).
         # 0 -- NO-REFERENCE training (ALPHA -- smoke-tested only: one 50-step metered smoke, no
         #      end-to-end run; --mode sample refused at 0 pending the t2va render leg).
-        # 3 remains refused, and that bound carries the real weight: three slots were never priced,
-        # and an environment reference SUBSTITUTES for the last character slot rather than being
-        # appended -- feeding all three character refs every time would make conditioning CONSTANT
-        # across the corpus and invite copy-collapse.
-        if v not in (0, 1, H3_PHASE10_REFERENCES_PER_SAMPLE):
+        # 3 -- EXPLICIT-MANIFEST sequence tasks (operator ruling 2026-08-16: the keyframe
+        #      sequence model, first / middle / last keyframe OF THE CLIP). Added here because
+        #      BOTH of the original refusal's reasons were checked and neither survives for a
+        #      corpus that names its references per sample:
+        #        * "three slots were never priced" -- they are now. h3_packed_seq_len prices a
+        #          22-frame 16:9 target with three 1344x768 references at short_edge 768 at
+        #          13,402 packed rows against a computed A100-80GB ceiling of 13,777. It only
+        #          fits at 768; at 896 it is 15,586 and is correctly refused by the budget.
+        #        * "rotating character refs would make conditioning CONSTANT and invite
+        #          copy-collapse" -- that argument is about the POOL branch. A row carrying
+        #          `reference_paths` never enters it: `_h3_resolve_references` takes the
+        #          `if explicit:` branch and uses the manifest list verbatim, so the references
+        #          vary per sample by construction and carry no fixed identity to copy.
+        #      At train time the 3-of-3 selection arm enumerates exactly one combination, so it
+        #      is the identity permutation -- there is no rotation to collapse toward.
+        # >3 stays refused: 4 slots are unpriced and would exceed the ceiling at any usable
+        # reference size.
+        if v not in (0, 1, H3_PHASE10_REFERENCES_PER_SAMPLE, 3):
             raise ValueError(
                 f"invalid references_per_sample {v}: the slot count is 0 (NO-REFERENCE training, "
-                f"ALPHA), 1 (single-control), or {H3_PHASE10_REFERENCES_PER_SAMPLE} (Ref2VA -- a "
+                f"ALPHA), 1 (single-control), {H3_PHASE10_REFERENCES_PER_SAMPLE} (Ref2VA -- a "
                 f"non-environment segment gets two rotating character refs; an environment segment "
                 f"gets one rotating character ref plus the environment ref, which SUBSTITUTES for "
-                f"the second character slot). There is no 3-reference case: three slots were never "
-                f"priced by the packed-sequence budget and would OOM a metered container."
+                f"the second character slot), or 3 (explicit-manifest sequence tasks, where every "
+                f"row supplies its own `reference_paths` and the pool/rotation branch is never "
+                f"taken). Counts above 3 were never priced by the packed-sequence budget and "
+                f"would OOM a metered container."
             )
         return v
 
