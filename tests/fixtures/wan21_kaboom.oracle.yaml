@@ -1,0 +1,140 @@
+# ⛔ THIS IS A TEST FIXTURE, NOT A RUNNABLE SIGNET CONFIG. Do not copy it.
+#
+# Its paths are the SOURCE METHOD's: train_kohya.py mounts its dataset Volume at /datasets, so the
+# production TOML this repo is asserted against carries /datasets/datasets/Kaboom/... Reproducing
+# that TOML byte-for-byte therefore requires a config carrying those paths — which is why this file
+# exists separately from configs/wan21_kaboom.example.yaml.
+#
+# The shipped config used to BE this file, and that dragged a foreign mount point into the only
+# runnable wan config in the repo: signet mounts its dataset Volume at /dataset (singular), so every
+# path in it addressed a location that does not exist in a signet container. musubi's cache pass
+# would have found no media, or written a cache to the container's ephemeral overlay and discarded
+# it at exit. Splitting the two keeps the byte-exact proof (a property of the RENDERER) from
+# dictating the mount layout of a config an operator is meant to run.
+#
+# Wan 2.1 t2v-14B via the musubi-tuner RUNNER — the three-dataset method, in signet YAML.
+#
+# THE ONLY SHIPPED CONFIG THAT DECLARES `data.sources`, and the only one on `family: wan`. It moved
+# here from tests/fixtures/ when slice A landed the schema; every other config in this directory
+# omits the key entirely, which is what keeps their dry-run byte-identical (an absent key cannot
+# regress — a re-expressed one-element list could).
+#
+# WHAT IS PROVED AGAINST THIS FILE, on CPU, at $0:
+#   * it LOADS — `load_config_from_text` accepts it, which exercises every validator below;
+#   * tests/test_musubi_toml_render.py renders `data.sources` and asserts the result is EQUIVALENT
+#     — semantically AND byte-for-byte — to Timothy's real runner config at
+#     docs/source-methods/musubi-wan21/wan21-dataset-config.toml.
+#
+# ⚠ WHAT IS NOT PROVED: this config CANNOT BE DISPATCHED yet. The dry-run gate refuses family 'wan'
+# by name (dryrun/shapes.assert_wan_dryrun_geometry), so `modal run ... --mode train` aborts at $0
+# before the cost print. That refusal is deliberate — the generic dry-run arm is LTX's and would
+# print a plausible OK banner about the wrong architecture. Render the dataset TOML with
+# runners/musubi_toml.render_from_config and drive musubi directly until the Wan stage lands.
+
+# The LARGEST DECLARED VIEW (1280x720x21, the `appearance` source), not a fourth geometry: the
+# dry-run gate prices the most expensive thing this run will actually assemble. `motion` is
+# 640x352x45 and `stills` is 1024x1024x1; both are cheaper per sample than this one. This is a LAW
+# on family 'wan', not a habit: SignetConfig refuses a training_dims that is not the largest
+# declared view, because on this family the geometry lives per-source and training_dims' only
+# remaining job is to name the view signet PRICES.
+training_dims: [1280, 720, 21]
+
+data:
+  # When `sources:` is set this is the cache PARENT under which a source that names no `cache_root`
+  # mints `<preprocessed_data_root>/cache/<id>`. It keeps its ordinary meaning when `sources:` is
+  # absent, which is why `sources` is an OPTIONAL SIBLING rather than a re-expression of the flat
+  # single-source form — the byte-identical path for every existing config is the ABSENCE of a key,
+  # and an absent key cannot regress.
+  preprocessed_data_root: /datasets/datasets/Kaboom
+  caption_extension: ".txt"      # -> [general] in the rendered TOML
+  enable_bucket: true            # -> [general]
+  bucket_no_upscale: true        # -> [general]; nothing is ever upscaled, so nothing is invented
+
+  # resolution_buckets DELIBERATELY OMITTED. musubi does its own bucketing from each source's
+  # `resolution` AREA BUDGET, so a bucket list here would be read by nobody — the exact
+  # silently-ignored-config defect the lean field-split guards kill elsewhere in this schema.
+
+  sources:
+    # ── stills: maximum detail, no temporal axis ──────────────────────────────────────────────
+    - id: stills                  # LOAD-BEARING: cache discriminator, provenance tag, census label
+      kind: image
+      directory: /datasets/datasets/Kaboom/Images
+      cache_root: /datasets/datasets/Kaboom/Images/cache
+      resolution: [1024, 1024]
+      extraction: image           # the only legal mode on kind: image
+      num_repeats: 1
+      batch_size: 1
+
+    # ── appearance: expensive-and-narrow. The opening beat, at full resolution ────────────────
+    - id: appearance
+      kind: video
+      directory: /datasets/datasets/Kaboom/Videos
+      cache_root: /datasets/datasets/Kaboom/Videos/cache_1
+      resolution: [1280, 720]
+      extraction: head            # window from frame 0 — the establishing moment of each clip
+      target_frames: [1, 21]      # TWO clips per video, BOTH from frame 0: a still and a 21f window
+      num_repeats: 1
+      batch_size: 1
+
+    # ── motion: cheap-and-wide. Long extent, bought with resolution ───────────────────────────
+    - id: motion
+      kind: video
+      # THE SAME DIRECTORY AS `appearance`, and this is the point of the whole feature. Two views
+      # of one corpus are two blocks precisely because they are two CACHES: the cache filename
+      # carries the SOURCE video's size, never the training resolution.
+      directory: /datasets/datasets/Kaboom/Videos
+      cache_root: /datasets/datasets/Kaboom/Videos/cache_2
+      resolution: [640, 360]      # ⚠ TRAINS AT 640x352 — 360 is not a multiple of 16. Warned, not
+                                  # refused: this is the method's own working value.
+      extraction: uniform
+      target_frames: [45]         # 45 frames is unaffordable at 720p; that trade IS the method
+      frame_sample: 2             # first and last possible 45f window: linspace(0, n-45, 2)
+      num_repeats: 1
+      batch_size: 1
+
+training:
+  # The one required run-specific knob (D-RUN-1). ⚠ SEMANTICS DIFFER ACROSS THE RUNNER BOUNDARY:
+  # musubi is EPOCH-driven (--max_train_epochs), so this step budget is signet's accounting basis
+  # for the cost line and NOT a value the runner reads. The epoch count that actually bounds the
+  # run — and `num_repeats`, which multiplies it — land with the `wan:` block in the Modal stage.
+  max_steps: 4000
+
+model:
+  family: wan                     # the FOURTH family — a family, not a seventh --mode
+  # ⚠ DECLARED GAP — HALF OF IT CLOSED 2026-08-10, and the remaining half is weights, not schema.
+  #
+  # CLOSED: the config SURFACE. `clip_id` now exists on ModelConfig (Wan 2.1 is the first signet
+  # family with two text-side encoders — open-CLIP XLM-RoBERTa-Large ViT-H/14 alongside umT5,
+  # train_kohya.py:78-82,139), and `vae_id` is no longer fenced away from this family. All four ids
+  # wan_resolve_component_ids wants — dit/vae/t5/clip -> model_id/vae_id/text_encoder_id/clip_id —
+  # are declarable here now. They are left UNSET on purpose; see below.
+  #
+  # OPEN: the weights, and there is no honest value to write until they exist. `modal volume ls
+  # signe-trainer-weights` (2026-08-10) holds gemma-3-12b-it, minimax-h3, qwen-image-edit-2511 and
+  # the LTX checkpoints — NO Wan components — and there is no `download_wan_weights` stage beside
+  # download_weights / download_qwen_edit_weights. train_kohya.py:69-92 sidesteps this by hardcoding
+  # two Hub repo ids and downloading at run time; signet resolves from the Volume instead, so what
+  # lands a real dispatch is a download stage plus the four ids it writes.
+  #
+  # Filling these in with musubi's canonical filenames before the files exist would be the guessed
+  # path this codebase refuses everywhere else: model_id and text_encoder_id are SHARED with LTX and
+  # carry LTX defaults, so a plausible-looking wrong value does not fail loudly — it hands musubi
+  # `--t5 /weights/gemma-3-12b-it`, a Gemma directory where it wants a umT5 .pth, and does it after
+  # the latent cache pass has already run. wan_resolve_component_ids refuses all four BY NAME, which
+  # is the behaviour to keep until the weights are real.
+  #
+  # The `wan:` knobs (task / network_dim / discrete_flow_shift / max_train_epochs, hardcoded at
+  # train_kohya.py:136-159) are deliberately NOT a config block: they live in
+  # runners/wan_musubi.WAN_MUSUBI_RECIPE as locked recipe terms, the same doctrine as
+  # QWEN_EDIT_RENDER_RECIPE. Promoting them to config is a ruling, not a gap.
+
+modal:
+  hourly_rate_usd: 1.64
+  cost_guardrail_usd: 50.0
+  # ⚠ DECLARED, NOT MEASURED — no Wan steps/hour figure has been measured on any card in this
+  # program. The batch line beside the cost line prints the clip-instance arithmetic so the two can
+  # be checked against each other; it never replaces this number with an invented one.
+  est_hours: 6.0
+
+seed: 42
+output_dir: outputs/wan21_kaboom

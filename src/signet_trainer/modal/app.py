@@ -442,6 +442,125 @@ qwen_gpu_image = (
 )
 
 # --------------------------------------------------------------------------------------------------
+# Wan 2.1 / musubi-tuner RUNNER image (family #4) — a FOURTH image, and the least signet-shaped of
+# the four, because it does not host signet's training loop at all. musubi-tuner owns the optimizer
+# step here; this image exists to hold that checkout and its dependency closure. It is TRANSCRIBED
+# from ``docs/source-methods/musubi-wan21/train_kohya.py:23-48`` — the one Wan 2.1 build this
+# project has a working record of — and every deviation from that transcription is noted below.
+#
+# ⛔ PYTHON 3.10, NOT 3.11. Every other image in this file is 3.11; train_kohya.py:24 builds this one
+# on 3.10 and the recipe was measured there. This is also the reason ``runners/wan_musubi.py`` and
+# ``config/sources.py`` avoid 3.11-only syntax (``StrEnum``) — the family's own runtime is 3.10.
+#
+# ⛔⛔ THE PYDANTIC COLLISION, and why ``wan_train`` is a THREADED-PARAMETER stage. train_kohya.py:37
+# pins ``pydantic==1.10.13`` into this image, AFTER musubi's own ``requirements.txt``; signet's
+# ``config/load.load_config_from_text`` needs ``pydantic>=2.10.4``. One interpreter cannot carry
+# both, so this image DELIBERATELY does NOT declare the config-loader closure that
+# ``download_image`` / ``h3_gpu_image`` / ``qwen_gpu_image`` all carry, and ``modal/fns.wan_train``
+# never calls ``load_config_from_text``. It takes its parameters threaded in from the entrypoint
+# (the ``h3_preprocess`` shape) and imports only ``signet_trainer.runners.wan_musubi``, which is
+# stdlib-only for exactly this reason. Adding pydantic v2 here to "fix" a config load would break
+# musubi instead — silently, in a metered container.
+#
+# ⛔⛔⛔ SUPPLY CHAIN — THE ONE THING THAT IS NOT DONE, AND IT IS DELIBERATE, NOT AN OVERSIGHT.
+# ``MUSUBI_TUNER_COMMIT_SHA`` is ``None``. Every other foreign checkout in this file
+# (``LTX2_COMMIT_SHA``, ``DIFFUSERS_SHA``, ``QWEN_DIFFUSERS_SHA``) is a LITERAL 40-hex SHA and each
+# banner says to bump it deliberately, because an unpinned ``main`` makes an image build silently
+# non-reproducible — the image that trains an adapter must be the image that renders it.
+# train_kohya.py:31 clones ``main`` with no checkout at all, so there is no SHA to transcribe, and
+# this pass performs ZERO downloads (CPU-only, no network), so there is no SHA to resolve either.
+# Writing a plausible-looking hex string would be fabrication of exactly the kind the pins exist to
+# prevent. So the gap is DECLARED and defended twice over:
+#
+#   1. ``modal/entrypoint._wan_config_gaps`` refuses the dispatch at $0, naming the one command that
+#      lands it: ``gh api repos/kohya-ss/musubi-tuner/commits/main --jq .sha``.
+#   2. The build step below FAILS LOUDLY if it is ever reached unpinned, rather than falling back to
+#      a floating ``main``. A build that dies saying why costs one container start; a build that
+#      quietly takes today's ``main`` costs the reproducibility of every adapter it produces.
+#
+# NO WEIGHTS BAKED IN (MODL-01) — and this is the sharpest divergence from the transcription.
+# train_kohya.py:69-92 ``hf_hub_download``s all four components (DiT, VAE, umT5, open-CLIP) from two
+# HARDCODED Hub repo ids INSIDE the training function, on every container start. signet resolves
+# them from the weights Volume instead (``WEIGHTS_DIR / <id>``, the caller composing every path),
+# which is what makes a round reproducible, air-gappable, and not re-pulling 30+ GiB per retry.
+# ``runners/wan_musubi.wan_resolve_component_ids`` is the named symbol that lands the config fields.
+#
+# NO ``.add_local_file("wan21-dataset-config.toml", ...)``. train_kohya.py:40-43 bakes the dataset
+# TOML into the IMAGE, which makes changing the dataset an image REBUILD and makes "what did round 2
+# train on?" unanswerable from the artifacts. signet renders it from the manifest at DISPATCH time
+# (``runners/musubi_toml.render_from_config``), ships it BY VALUE, and writes it beside the adapter
+# on the checkpoints Volume — so "only the dataset changed between rounds" becomes a diff of two
+# committed files instead of a memory.
+# --------------------------------------------------------------------------------------------------
+
+#: Where the musubi-tuner checkout lands in the image. train_kohya.py clones into the build CWD and
+#: then ``.workdir("musubi-tuner")``; an absolute path is named here instead so ``wan_train`` can set
+#: it as the subprocess CWD explicitly rather than inheriting one.
+MUSUBI_TUNER_ROOT = "/opt/musubi-tuner"
+
+#: PINNED 2026-08-12 — resolved with the command the banner above names
+#: (``gh api repos/kohya-ss/musubi-tuner/commits/main --jq .sha``) and transcribed literally.
+#:
+#: train_kohya.py:31 clones ``main`` with no checkout, so there was no SHA to transcribe from
+#: the oracle and this sat as a declared gap. It is resolved here rather than left floating
+#: because musubi's dataset-config SCHEMA is what ``runners/musubi_toml.py`` transcribes: an
+#: upstream key rename would otherwise be discovered by a rejected TOML inside a metered
+#: container, and every adapter this image produces would be unattributable to a code state.
+#: Bump deliberately, the same rule the three sibling pins carry.
+MUSUBI_TUNER_COMMIT_SHA: str | None = "8934cfbbb4b9bcfa8071ce209129f0c5eb5df2e6"
+
+#: The checkout step, or a loud refusal standing in for it. Never a fallback to ``main``: a floating
+#: clone is the failure the three sibling SHA pins exist to prevent, and it is worse here than
+#: elsewhere because musubi's dataset-config SCHEMA is what ``runners/musubi_toml.py`` transcribes —
+#: upstream adding or renaming a key would be discovered by a rejected TOML inside a metered
+#: container.
+_MUSUBI_CHECKOUT_COMMAND = (
+    f"cd {MUSUBI_TUNER_ROOT} && git checkout {MUSUBI_TUNER_COMMIT_SHA}"
+    if MUSUBI_TUNER_COMMIT_SHA
+    else (
+        "echo 'signet: MUSUBI_TUNER_COMMIT_SHA is UNPINNED in modal/app.py. Refusing to build "
+        "against a floating main — pin the literal 40-hex SHA "
+        "(gh api repos/kohya-ss/musubi-tuner/commits/main --jq .sha) and rebuild.' >&2 && exit 1"
+    )
+)
+
+wan_musubi_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .env({"HF_HUB_CACHE": "/cache/cache/"})
+    .apt_install("git", "ffmpeg", "python3-opencv")
+    # ⚠ DELIBERATE DEVIATION from the transcription, and the gate caught it rather than a reviewer.
+    # train_kohya.py:29 pre-installs ``transformers>=4.46.0`` BEFORE musubi's own requirements.txt.
+    # That floating range is exactly what ``tests/test_modal_gpu_image.py::
+    # test_h3_transformers_pin_is_a_literal_version`` bans repo-wide, and its reason applies here
+    # verbatim: a range decides a conditioning-critical version at BUILD time, by whatever the
+    # resolver picked that day, so the image that trains an adapter need not be the image that
+    # renders it. The other families answer that with a literal ``==`` pin; this one CANNOT, because
+    # no transformers version has been measured for musubi in this program and inventing a number
+    # to satisfy a gate is worse than the gate firing. So the pre-install is DROPPED and musubi's
+    # own ``requirements.txt`` — installed below, from the checkout — is left as the single
+    # authority on its own dependency. That makes the build's reproducibility rest entirely on
+    # MUSUBI_TUNER_COMMIT_SHA, which is precisely the property the ⛔⛔⛔ banner above demands and
+    # ``_wan_config_gaps`` gap (6) refuses to dispatch without.
+    .pip_install("huggingface_hub")
+    .run_commands(
+        f"git clone https://github.com/kohya-ss/musubi-tuner.git {MUSUBI_TUNER_ROOT}",
+        _MUSUBI_CHECKOUT_COMMAND,
+        f"cd {MUSUBI_TUNER_ROOT} && pip3 install torch torchvision "
+        "--index-url https://download.pytorch.org/whl/cu124",
+        f"cd {MUSUBI_TUNER_ROOT} && pip3 install -r requirements.txt",
+    )
+    # ⛔ pydantic 1.10.13 — musubi's pin, and the reason this image cannot load a SignetConfig. See
+    # the ⛔⛔ banner. ``albumentations==1.4.3`` and ``hf_transfer`` are likewise transcribed.
+    .pip_install("pydantic==1.10.13", "hf_transfer", "albumentations==1.4.3")
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    # CODE ONLY: the signet package, for ``signet_trainer.modal.app`` (imported by fns.py at module
+    # load) and ``signet_trainer.runners.wan_musubi`` (the recipe + argv builders). NO WEIGHTS, and
+    # no dataset TOML — both are run-time inputs here, not build-time ones. Last, because Modal
+    # forbids any build step after ``add_local_*``.
+    .add_local_python_source("signet_trainer")
+)
+
+# --------------------------------------------------------------------------------------------------
 # CPU download image (Phase 2) — the light, non-GPU image. Kept SEPARATE from the heavy ``gpu_image``:
 # none of its users need ltx-core / ltx-trainer / CUDA, so it stays a fast CPU image. NO weights baked
 # in (MODL-01) — files land on the mounted Volumes at runtime. (The bare code-only ``image`` has no

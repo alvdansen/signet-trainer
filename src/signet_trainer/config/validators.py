@@ -65,6 +65,14 @@ from signet_trainer.conditioning.h3_geometry import (
     max_packed_rows_for_budget,
 )
 
+# Single home for musubi's LAWS (family #4). Re-export, do not duplicate — ``config/sources.py`` is
+# pydantic + stdlib only, so this adds no third-party root to the closure.
+from signet_trainer.config.sources import (
+    MUSUBI_FRAME_MULTIPLE,
+    MUSUBI_RESOLUTION_STEP,
+    musubi_floor_frames,
+)
+
 # Single home for the Qwen-Image-Edit-2511 arch math (family #3). Re-export, do not duplicate.
 # ``qwen_edit_geometry`` is the same CONFINED tier as ``h3_geometry`` — stdlib + dataclasses only —
 # so this import adds ZERO new third-party roots to the ``config.validators`` closure (and therefore
@@ -131,6 +139,14 @@ __all__ = [
     "h3_packed_seq_len",
     "h3_worst_case_packed_seq_len",
     "max_packed_rows_for_budget",
+    # --- Wan 2.1 via the musubi-tuner RUNNER (family #4, slice A) ----------------------------
+    "validate_wan_frames",
+    "validate_wan_height",
+    "validate_wan_width",
+    "validate_wan_training_dims",
+    # Re-exported musubi laws (defined in config/sources.py, NOT here).
+    "MUSUBI_FRAME_MULTIPLE",
+    "MUSUBI_RESOLUTION_STEP",
     # --- Qwen-Image-Edit-2511 (family #3) ----------------------------------------------------
     "QWEN_EDIT_LORA_LEAVES",
     "QWEN_EDIT_LORA_TARGET_REGEX",
@@ -1099,3 +1115,114 @@ def validate_qwen_edit_row_budget(
             f"this refusal."
         )
     return packed_rows
+
+
+# --------------------------------------------------------------------------------------------------
+# Wan 2.1 via the musubi-tuner RUNNER (family #4, slice A) — the THIRD dims branch.
+#
+# WHY A THIRD BRANCH RATHER THAN A WIDENED LITERAL. The design's own worked geometry, 1280x720x21,
+# is rejected by BOTH existing laws on BOTH axes: 720 % 32 == 16 (LTX/H3 spatial step is 32) and 21
+# satisfies neither ``(F-1) % 8 == 0`` nor ``(F-5) % 17 == 0``. Adding ``"wan"`` to
+# ``ModelConfig.family`` without these functions produces a family that cannot be configured at all
+# — the point ``tests/test_multisource_verifier_gaps.py::
+# test_the_fixtures_geometry_is_rejected_by_every_family_that_exists`` was written to make.
+#
+# ⚠ THE WAN LAW IS LOOSER THAN LTX'S ON BOTH AXES, so widening the SignetConfig pre-screen with it
+# lets dims through that the LTX arm then rejects — by design, and provably hole-free: the
+# family-exact ``else:`` arm re-asserts ``validate_training_dims`` verbatim, so an LTX config sees
+# the identical verdict and the identical message it saw before. What changes for a rejected LTX
+# config is only WHERE the error is raised (model validator rather than field validator); the four
+# existing rejection cases in the suite ([768,512,32], [768,512,22], [770,...], [...,510,...], every
+# zero/negative triple) all fail the WAN law too and therefore still die at the field level, exactly
+# as they did. Measured, not assumed — see the regression comm on this slice.
+# --------------------------------------------------------------------------------------------------
+
+
+def validate_wan_frames(frames: int) -> int:
+    """Reject frame counts that are not ``N*4+1`` (musubi's Wan latent temporal stride).
+
+    A NEW function rather than a parameterization of ``validate_frames``: LTX's modulus is 8 and
+    musubi's is 4, and the failure MODE differs too. LTX raises; musubi SILENTLY FLOORS
+    ``(f-1)//4*4+1``, so an accepted 30 trains at 29 and the config then describes a run nobody
+    performed. signet refuses and names the floored value, the same posture
+    ``SourceSpec.target_frames`` takes on the per-source clip lengths.
+
+    Positivity is checked FIRST (the CR-01 discipline): ``-3 % 4 == 1`` in Python, so a negative
+    frame count satisfies the modulo outright and would otherwise pass the law.
+    """
+    if frames < 1:
+        raise ValueError(
+            f"invalid frame count {frames}: frames must be a positive integer >= 1 "
+            f"(musubi/Wan additionally requires the N*{MUSUBI_FRAME_MULTIPLE}+1 law, i.e. frames "
+            f"in 1, 5, 9, ..., 21, ..., 45, ...)."
+        )
+    if frames % MUSUBI_FRAME_MULTIPLE != 1:
+        raise ValueError(
+            f"invalid frame count {frames} for model.family 'wan': musubi requires "
+            f"frames % {MUSUBI_FRAME_MULTIPLE} == 1 (the Wan latent temporal stride) and would "
+            f"SILENTLY floor this to {musubi_floor_frames(frames)} rather than raise. Declare "
+            f"{musubi_floor_frames(frames)}, or "
+            f"{musubi_floor_frames(frames) + MUSUBI_FRAME_MULTIPLE}."
+        )
+    return frames
+
+
+def validate_wan_height(height: int) -> int:
+    """Reject heights that are not a multiple of musubi's 16-pixel bucketing step.
+
+    ⚠ ASYMMETRY WITH ``musubi_resolution_warnings``, and it is deliberate. A SOURCE's
+    ``resolution`` is only WARNED about when it is not a multiple of 16, because refusing it would
+    refuse Timothy's own working ``[640, 360]``. ``training_dims`` is a different object: it is
+    signet's own statement of the view it prices in the cost line and the dry-run banner, and a
+    priced number that is off by a silent crop is a number the operator cannot check against the
+    run. Declare the floored value there; the source may keep the un-floored one.
+    """
+    if height <= 0:
+        raise ValueError(
+            f"invalid height {height}: height must be a positive multiple of "
+            f"{MUSUBI_RESOLUTION_STEP}."
+        )
+    if height % MUSUBI_RESOLUTION_STEP != 0:
+        raise ValueError(
+            f"invalid height {height} for model.family 'wan': musubi buckets to a multiple of "
+            f"{MUSUBI_RESOLUTION_STEP} and would train this at "
+            f"{height - height % MUSUBI_RESOLUTION_STEP}. training_dims is the number signet "
+            f"PRICES, so declare {height - height % MUSUBI_RESOLUTION_STEP}."
+        )
+    return height
+
+
+def validate_wan_width(width: int) -> int:
+    """Reject widths that are not a multiple of musubi's 16-pixel bucketing step.
+
+    Same asymmetry as :func:`validate_wan_height`; see its note.
+    """
+    if width <= 0:
+        raise ValueError(
+            f"invalid width {width}: width must be a positive multiple of "
+            f"{MUSUBI_RESOLUTION_STEP}."
+        )
+    if width % MUSUBI_RESOLUTION_STEP != 0:
+        raise ValueError(
+            f"invalid width {width} for model.family 'wan': musubi buckets to a multiple of "
+            f"{MUSUBI_RESOLUTION_STEP} and would train this at "
+            f"{width - width % MUSUBI_RESOLUTION_STEP}. training_dims is the number signet "
+            f"PRICES, so declare {width - width % MUSUBI_RESOLUTION_STEP}."
+        )
+    return width
+
+
+def validate_wan_training_dims(dims: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Validate a ``[W, H, F]`` triple against musubi's Wan geometry. Returns it unchanged.
+
+    Deliberately NOT a coherence check against ``data.sources`` — that check needs the source list
+    and therefore lives cross-field on ``SignetConfig``, where the family is also known. This is the
+    LAW only, so it can run in the field-level pre-screen beside the LTX and H3 laws.
+    """
+    if len(dims) != 3:
+        raise ValueError(f"training_dims must be exactly [width, height, frames]; got {dims!r}")
+    width, height, frames = dims
+    validate_wan_width(width)
+    validate_wan_height(height)
+    validate_wan_frames(frames)
+    return (width, height, frames)

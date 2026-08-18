@@ -57,12 +57,13 @@ _WAN_TOKENS = ("UniPC", "shift", "frames=33", "guidance_scale=5", "num_inference
 
 #: Filename prefixes that mark a module as owned by a non-LTX family.
 #:
-#: ⚠ ``wan_`` IS DELIBERATELY ABSENT and must stay absent until the Wan family lands. Releasing
-#: the bare-token ban for a filename prefix that matches NO module in this branch buys nothing
-#: and pre-authorises musubi's --discrete_flow_shift 7.0 — the exact Wan value this gate was
-#: written to keep out of an inference path — for a file nobody has reviewed yet. The carve-out
-#: travels WITH runners/wan_musubi.py on the multi-source branch, where it has a consumer.
-_FAMILY_PREFIXES = ("h3_", "qwen_edit_")
+#: ``wan_`` is present HERE and absent on the qwen branch, deliberately. A carve-out that
+#: releases the bare-token ban and pre-authorises musubi's --discrete_flow_shift 7.0 — the exact
+#: Wan value this gate exists to keep out — must not ship one commit ahead of the module that
+#: justifies it. It lands with runners/wan_musubi.py, and
+#: :func:`test_a_family_carve_out_requires_a_module_that_consumes_it` makes that a RULE rather
+#: than an intention: any prefix in this tuple must match a real scanned module.
+_FAMILY_PREFIXES = ("h3_", "qwen_edit_", "wan_")
 
 #: Wan tokens that stay banned EVERYWHERE, including in family-scoped modules. The bare ``shift``
 #: is deliberately absent: it is the token this scoping exists to release.
@@ -72,13 +73,26 @@ _WAN_TOKENS_ALWAYS = ("UniPC", "frames=33", "guidance_scale=5", "num_inference_s
 #: family's set is refused — including Wan's 4.0, which is what the original token guarded against.
 _ALLOWED_SHIFT_VALUES = {
     "qwen_edit_": {"3.0", "7.0"},   # METHOD §8: edit 3.0, base Qwen-Image 7.0
+    "wan_": {"7.0"},                # musubi --discrete_flow_shift 7.0 (runners/wan_musubi.py)
     "h3_": set(),                   # H3 pins no static shift; any literal here is a surprise
-}   # NOTE: no "wan_" entry — it lands with the wan family. See _FAMILY_PREFIXES above.
+}
 
 #: Modules OUTSIDE inference/ that carry sampling parameters and must be scanned anyway. Added
 #: because the Qwen scheduler pin lives in models/, and a gate that misses the file holding the
 #: parameter is decorative.
-_EXTRA_SCANNED = ("src/signet_trainer/models/qwen_edit_pipeline.py",)
+#:
+#: ⚠ EXTENDED 2026-08-09 for family #4. ``runners/wan_musubi.py`` holds the LOCKED musubi recipe,
+#: including ``discrete_flow_shift = 7.0`` — a REAL, REQUIRED Wan parameter. It carries the ``wan_``
+#: filename prefix specifically so ``_family_of`` recognises it, and it is listed here so the
+#: family-scoped VALUE rule actually reaches it. Without this line the module would sit outside
+#: every scan, which is the exact defect ``test_the_qwen_pipeline_module_is_actually_scanned``
+#: records: a gate that cannot see the file holding the parameter is decorative. This ADDS coverage;
+#: it relaxes nothing.
+_EXTRA_SCANNED = (
+    "src/signet_trainer/models/qwen_edit_pipeline.py",
+    "src/signet_trainer/runners/wan_musubi.py",
+    "src/signet_trainer/runners/musubi_toml.py",
+)
 
 
 def _family_of(name: str) -> str | None:
@@ -177,16 +191,25 @@ def _inference_sources() -> list[Path]:
 
 
 def test_no_wan_params_in_inference_code() -> None:
-    """LTX-path modules keep the total ban; family modules keep a stricter, value-level one."""
+    """LTX-path modules keep the total ban; family modules keep a stricter, value-level one.
+
+    ⚠ WIDENED 2026-08-09 to cover ``_EXTRA_SCANNED`` as well as ``inference/``. Test (b) below
+    already scanned those files for shift VALUES; this one did not scan them at all, so a
+    ``UniPC`` / ``frames=33`` / ``guidance_scale=5`` leak into ``models/qwen_edit_pipeline.py`` or
+    ``runners/wan_musubi.py`` was invisible to the whole gate. Both files are clean today (checked
+    before widening), so this is coverage added at zero cost — and it means the two scans now agree
+    on WHICH FILES exist rather than each knowing about a different set.
+    """
     offenders: list[str] = []
-    for path in _inference_sources():
+    extra = [Path(__file__).resolve().parents[1] / rel for rel in _EXTRA_SCANNED]
+    for path in [*_inference_sources(), *(p for p in extra if p.exists())]:
         code = _strip_comments_and_docstrings(path.read_text(encoding="utf-8"))
         family = _family_of(path.name)
         tokens = _WAN_TOKENS if family is None else _WAN_TOKENS_ALWAYS
         for token in tokens:
             if token in code:
                 offenders.append(f"{path.name}: {token!r}")
-    assert not offenders, f"Wan sampling token(s) leaked into inference/ code: {offenders}"
+    assert not offenders, f"Wan sampling token(s) leaked into scanned code: {offenders}"
 
 
 def test_family_modules_pin_only_their_own_shift_values() -> None:
@@ -241,6 +264,30 @@ def test_the_qwen_pipeline_module_is_actually_scanned() -> None:
     )
 
 
+def test_the_wan_recipe_module_is_actually_scanned() -> None:
+    """The file holding the musubi ``--discrete_flow_shift`` pin must be IN scope.
+
+    The sibling of ``test_the_qwen_pipeline_module_is_actually_scanned``, and it exists for the same
+    reason applied to a second family: ``runners/wan_musubi.py`` lives outside ``inference/``, so the
+    directory-scoped scan would miss it entirely and the gate would pass over the one line that
+    matters. It carries the ``wan_`` prefix so ``_family_of`` classifies it, and it is named in
+    ``_EXTRA_SCANNED`` so the value-level rule reaches it — and 7.0 is Wan's OWN value, so this is
+    the family scoping doing its job rather than an exemption.
+    """
+    target = Path(__file__).resolve().parents[1] / "src/signet_trainer/runners/wan_musubi.py"
+    assert target.exists(), "runners/wan_musubi.py is gone — update _EXTRA_SCANNED"
+    assert "src/signet_trainer/runners/wan_musubi.py" in _EXTRA_SCANNED
+    assert _family_of(target.name) == "wan_", (
+        "runners/wan_musubi.py must keep its wan_ filename prefix — that prefix is what puts it "
+        "under the family-scoped VALUE rule instead of outside every rule."
+    )
+    code = _strip_comments_and_docstrings(target.read_text(encoding="utf-8"))
+    assert _shift_literals(code) == {"7.0"}, (
+        "the musubi recipe must pin exactly one shift literal, 7.0 (train_kohya.py:154). Anything "
+        f"else is either a lost pin or a foreign value; found {sorted(_shift_literals(code))}."
+    )
+
+
 def test_a_wan_shift_value_in_a_family_module_is_still_refused() -> None:
     """RED self-check: family scoping must not have opened a hole for Wan's 4.0."""
     code = _strip_comments_and_docstrings('shift = 4.0\n')
@@ -249,10 +296,9 @@ def test_a_wan_shift_value_in_a_family_module_is_still_refused() -> None:
     assert "4.0" not in _ALLOWED_SHIFT_VALUES["qwen_edit_"], (
         "4.0 became allowed for qwen_edit — that is Wan's value and the whole point of this gate"
     )
-    assert "wan_" not in _FAMILY_PREFIXES and "wan_" not in _ALLOWED_SHIFT_VALUES, (
-        "a wan_ carve-out is present without a wan_ module to justify it. Releasing the bare-token "
-        "ban for a family that does not exist in this branch pre-authorises musubi's 7.0 in an "
-        "inference path nobody has reviewed — the carve-out must travel with runners/wan_musubi.py."
+    assert "4.0" not in _ALLOWED_SHIFT_VALUES["wan_"], (
+        "4.0 became allowed for wan_ — 7.0 is musubi's discrete_flow_shift; 4.0 is the sampling "
+        "value the original token ban was written against"
     )
 
 
@@ -361,3 +407,71 @@ def test_reference_video_has_no_module_level_heavy_import() -> None:
     code = _strip_comments_and_docstrings(_REFERENCE_VIDEO_SRC.read_text(encoding="utf-8"))
     hits = _MODULE_LEVEL_HEAVY_IMPORT.findall(code)
     assert not hits, f"Anti-Pattern-6 violation: module-level heavy import in reference_video.py: {hits}"
+
+
+def test_every_runner_module_is_reached_by_some_scan() -> None:
+    """No module under runners/ may sit outside BOTH the family scoping and the extra scan.
+
+    ``runners/musubi_toml.py`` did exactly that: it is not under ``inference/``, carries no
+    ``wan_`` prefix so ``_family_of`` returns None for it, and was absent from ``_EXTRA_SCANNED``.
+    It is clean today, but nothing kept it so — and it is the module that WRITES the sampling
+    config, which makes it the single most valuable place for a Wan token to land unnoticed.
+
+    A gate that happens to be satisfied is not a gate. This asserts coverage rather than
+    cleanliness, so a new runner module cannot be added into the blind spot.
+    """
+    runners = sorted(
+        (Path(__file__).resolve().parents[1] / "src/signet_trainer/runners").glob("*.py")
+    )
+    assert runners, "no runner modules found — did the package move?"
+    uncovered = []
+    for path in runners:
+        if path.name == "__init__.py":
+            continue
+        rel = f"src/signet_trainer/runners/{path.name}"
+        covered = rel in _EXTRA_SCANNED or _family_of(path.name) is not None
+        if not covered:
+            uncovered.append(rel)
+    assert not uncovered, (
+        f"runner module(s) reached by no Wan-token scan: {uncovered}. Either give the module a "
+        f"family prefix from {_FAMILY_PREFIXES} so the family scoping applies, or add it to "
+        f"_EXTRA_SCANNED."
+    )
+
+
+def test_a_family_carve_out_requires_a_module_that_consumes_it() -> None:
+    """Every prefix in ``_FAMILY_PREFIXES`` must match a real scanned module. No prefix may ship
+    ahead of the code that justifies it.
+
+    THE FAILURE THIS PREVENTS, which actually happened. The ``wan_`` carve-out shipped on the
+    qwen_edit branch, where no ``wan_``-prefixed module existed anywhere. It did two things at once
+    for a family that was not there: released the bare-token ban for that filename prefix, and
+    pre-authorised ``7.0`` — musubi's ``--discrete_flow_shift``, i.e. the exact Wan value this whole
+    file exists to keep out of an inference path. A later branch adding ``inference/wan_sampler.py``
+    would have inherited a pre-opened door nobody reviewed.
+
+    A carve-out is a RELAXATION. Relaxations must arrive with the thing that needs them, and the
+    only reliable way to enforce that is to make an orphan prefix fail here — where it costs a test
+    run — rather than in review, where it costs an audit pass and a reviewer's attention.
+
+    Note this is not the same as requiring every family to have a module: it requires every
+    DECLARED PREFIX to have one. Delete the module, and the prefix must go with it.
+    """
+    extra = [Path(__file__).resolve().parents[1] / rel for rel in _EXTRA_SCANNED]
+    scanned = [
+        path.name
+        for path in [*_inference_sources(), *(q for q in extra if q.exists())]
+    ]
+    for prefix in _FAMILY_PREFIXES:
+        assert any(name.startswith(prefix) for name in scanned), (
+            f"_FAMILY_PREFIXES declares {prefix!r} but no scanned module has that prefix. The "
+            f"carve-out releases the bare-token ban and pre-authorises "
+            f"{sorted(_ALLOWED_SHIFT_VALUES.get(prefix, set()))} for a file that does not exist. "
+            f"Scanned: {sorted(scanned)}"
+        )
+    for prefix in _ALLOWED_SHIFT_VALUES:
+        assert prefix in _FAMILY_PREFIXES, (
+            f"_ALLOWED_SHIFT_VALUES declares {prefix!r}, which is not a family prefix — the value "
+            f"allowance would never be consulted, so it reads as a reviewed decision while doing "
+            f"nothing."
+        )

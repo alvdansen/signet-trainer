@@ -35,6 +35,7 @@ from signet_trainer.modal.app import (
     h3_gpu_image,
     huggingface_secret,
     qwen_gpu_image,
+    wan_musubi_image,
     wandb_secret,
     weights_vol,
 )
@@ -2207,6 +2208,157 @@ def download_qwen_edit_weights(repo_id: str = "Qwen/Qwen-Image-Edit-2511") -> st
         f"[download_qwen_edit_weights] {repo_id} -> {root} ({summary}); "
         f"committed. Set model_id/vae_id/text_encoder_id to "
         f"'{local_name}/transformer', '{local_name}/vae', '{local_name}/text_encoder'."
+    )
+
+
+#: The FOUR Wan 2.1 components musubi needs, transcribed verbatim from the proven launch method
+#: (``docs/source-methods/musubi-wan21/train_kohya.py:69-92``) — repo id and filename both. NOT
+#: derived, NOT guessed: the two repos are unrelated (the encoders ship in Wan-AI's I2V release, the
+#: DiT and VAE in Comfy-Org's repackage), and the one tempting shortcut — composing the CLIP path
+#: from the T5 path because they live side by side — hands musubi a umT5 checkpoint where it expects
+#: open-CLIP, inside a metered container, after the latent cache pass has already run.
+#:
+#: Keyed by the musubi flag each one feeds, so a reader can check this table against the argv in
+#: ``runners/wan_musubi.wan_stage_argv`` without translating.
+WAN21_COMPONENTS: dict[str, tuple[str, str]] = {
+    # flag  : (repo_id, filename-within-repo)
+    "t5":   ("Wan-AI/Wan2.1-I2V-14B-720P", "models_t5_umt5-xxl-enc-bf16.pth"),
+    "clip": ("Wan-AI/Wan2.1-I2V-14B-720P",
+             "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
+    "vae":  ("Comfy-Org/Wan_2.1_ComfyUI_repackaged", "split_files/vae/wan_2.1_vae.safetensors"),
+    "dit":  ("Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+             "split_files/diffusion_models/wan2.1_t2v_14B_bf16.safetensors"),
+}
+
+#: Where the four land under ``WEIGHTS_DIR``. Flat, and named for what they ARE rather than for the
+#: repo they came from, because two repos contribute to one family and a repo-shaped layout would
+#: make ``model.text_encoder_id`` read as if the encoder belonged to the I2V release.
+WAN21_LOCAL_ROOT = "wan2.1"
+
+#: How often ``wan_train`` looks for a newly-settled epoch adapter to commit, in seconds. Sized
+#: against what it is racing: musubi saves once per EPOCH on a multi-hour run, so a minute of
+#: latency costs nothing, while a poll tight enough to matter would spend the container's CPU
+#: stat-ing a directory. The number that actually matters is that it is FINITE — the old code
+#: committed once, after the last subprocess returned, so a timeout at epoch 15 of 16 landed
+#: nothing at all.
+WAN_ADAPTER_COMMIT_POLL_SECONDS = 60
+
+
+def wan_settled_adapters(
+    run_root: Any, sizes: dict[str, int], committed: set[str]
+) -> list[str]:
+    """Names of adapters in ``run_root`` that have STOPPED GROWING since the previous poll.
+
+    Pure and filesystem-only — no Modal, no Volume — so the rule that decides when an epoch's
+    adapter is safe to commit can be tested on a laptop with ``tmp_path``. It was a closure inside
+    ``wan_train`` first; that made the one piece of logic standing between a timeout and fifteen
+    lost adapters reachable only by reading it.
+
+    ``sizes`` is the previous poll's observation and is MUTATED here; ``committed`` is what has
+    already been landed and is only read. A file is settled when it shows the same NON-ZERO size on
+    two consecutive polls:
+
+      * first sighting is never enough — it cannot distinguish "written" from "still being written",
+        and a half-flushed safetensors committed under a finished-looking name is worse than a
+        missing one, because the next round of the chain would warm-start from it;
+      * a file already in ``committed`` is skipped, so no adapter is committed twice;
+      * an ``OSError`` mid-rename is swallowed and retried on the next poll rather than aborting a
+        multi-hour run over a transient stat.
+    """
+    from pathlib import Path  # noqa: PLC0415 — this module keeps every import function-local
+
+    landed: list[str] = []
+    for path in sorted(Path(run_root).glob("*.safetensors")):
+        if path.name in committed:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        previous = sizes.get(path.name)
+        sizes[path.name] = size
+        if size > 0 and previous == size:
+            landed.append(path.name)
+    return landed
+
+
+@app.function(
+    image=download_image,  # code-only image + huggingface_hub, same as the two siblings.
+    volumes={**WEIGHTS_MOUNT},  # CPU only — a pure HF download, never a GPU.
+    secrets=[huggingface_secret],
+    timeout=TWENTY_FOUR_HOURS,  # the DiT alone is ~32 GB in bf16.
+)
+def download_wan_weights() -> str:
+    """One-time download of the four Wan 2.1 components into the weights Volume.
+
+    The ``wan`` family sibling of :func:`download_weights` / :func:`download_qwen_edit_weights`,
+    and the thing that turns ``wan_resolve_component_ids``' refusal from a wall into a config edit.
+
+    ⚠ THIS DEPARTS FROM THE ORACLE ON PURPOSE, in exactly one respect. ``train_kohya.py`` calls
+    ``hf_hub_download`` INSIDE the training function on every run, resolving against an
+    ``hf-hub-cache`` Volume and passing whatever absolute paths come back straight to musubi. That
+    works, and it is why the proven method needs no weights staging at all. signet stages instead,
+    for the reason every other family does: the run that trains an adapter should not also be the
+    run that decides which bytes it trained on. A separate CPU download stage makes the weight set
+    a declared, inspectable input — ``model.model_id`` and friends name it, the config that ships
+    beside the adapter records it, and a re-dispatch cannot silently pick up a different file
+    because upstream moved a tag.
+
+    The COMPONENT TABLE is transcribed rather than reinvented: same repos, same filenames, same
+    four. Departing there would be departing from the recipe.
+
+    Layout written::
+
+        <WEIGHTS_DIR>/wan2.1/models_t5_umt5-xxl-enc-bf16.pth                       -> text_encoder_id
+        <WEIGHTS_DIR>/wan2.1/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth -> clip_id
+        <WEIGHTS_DIR>/wan2.1/wan_2.1_vae.safetensors                               -> vae_id
+        <WEIGHTS_DIR>/wan2.1/wan2.1_t2v_14B_bf16.safetensors                       -> model_id
+
+    The two Comfy-Org files are flattened out of their ``split_files/...`` prefixes so all four sit
+    in one directory; the config ids below are what the operator actually writes, so they are
+    printed literally rather than described.
+    """
+    import os
+    import shutil
+
+    from huggingface_hub import hf_hub_download
+
+    root = WEIGHTS_DIR / WAN21_LOCAL_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+
+    written: dict[str, tuple[str, float]] = {}
+    for flag, (repo_id, filename) in WAN21_COMPONENTS.items():
+        leaf = filename.rsplit("/", 1)[-1]
+        destination = root / leaf
+        if destination.exists() and destination.stat().st_size > 0:
+            written[flag] = (leaf, destination.stat().st_size / (1024**3))
+            print(f"[download_wan_weights] {flag}: {leaf} already present, skipping.")
+            continue
+        cached = hf_hub_download(repo_id=repo_id, filename=filename)
+        # COPY, not symlink: hf_hub_download returns a path inside its own cache, and a symlink
+        # committed to the Volume would dangle in any container that mounts the Volume without
+        # that cache. The Volume must hold the bytes.
+        shutil.copyfile(cached, destination)
+        size_gb = os.path.getsize(destination) / (1024**3)
+        written[flag] = (leaf, size_gb)
+        print(f"[download_wan_weights] {flag}: {repo_id}/{filename} -> {destination} ({size_gb:.1f} GB)")
+
+    weights_vol.commit()  # Pitfall 3 commit-or-vanish, same as both siblings.
+
+    summary = ", ".join(f"{flag} {leaf} {gb:.1f} GB" for flag, (leaf, gb) in written.items())
+    ids = chr(10).join(
+        f"          {field}: {WAN21_LOCAL_ROOT}/{written[flag][0]}"
+        for flag, field in (
+            ("dit", "model_id"),
+            ("vae", "vae_id"),
+            ("t5", "text_encoder_id"),
+            ("clip", "clip_id"),
+        )
+        if flag in written
+    )
+    return (
+        f"[download_wan_weights] {len(written)}/4 component(s) in {root}: {summary}; committed. "
+        f"Declare them in your `model:` block:" + chr(10) + ids
     )
 
 
@@ -6630,3 +6782,343 @@ def qwen_edit_sample(config_yaml: str) -> None:
         f"base cell{': ' + ', '.join(identical) if identical else ''}. Zero is the expected result; "
         "anything else means those cells are the base render under a checkpoint's label."
     )
+
+
+# ==================================================================================================
+# Family #4 (wan) — the musubi-tuner RUNNER leg: one gated stage, three subprocesses, no new mode.
+# ==================================================================================================
+#
+# ⛔ ONE STAGE, NOT THREE, and the asymmetry with the other families is the point. h3 and qwen_edit
+# each get preprocess / train / sample because signet owns their encode, their loop and their render.
+# Here musubi owns caching END TO END: ``wan_cache_latents.py`` and
+# ``wan_cache_text_encoder_outputs.py`` read the dataset TOML directly and run INSIDE this stage, so
+# a separate ``--mode preprocess`` arm would be a second cost line for work this one already
+# performs — and a signet-side Wan encoder would be the "never write a custom encoder" landmine,
+# since a canonical one exists. There is no ``--mode sample`` arm either: no Wan inference path
+# exists anywhere in this repo, and a stage that cannot render must not pretend it can.
+# ``entrypoint._wan_config_gaps`` refuses both modes BY NAME at $0 rather than leaving them to fall
+# through to an LTX arm.
+#
+# ⛔ AND NO NEW ``--mode``. The train arm routes on ``cfg.model.family`` exactly as h3 and qwen_edit
+# do — six dispatches, one gate, one ledger. Two structural tests pin the mode set at six.
+# --------------------------------------------------------------------------------------------------
+
+#: The dataset TOML's filename, written beside the adapter on the checkpoints Volume. Named here
+#: because two places must agree: this stage writes it, and an operator diffing round N against
+#: round N-1 looks for it. The whole "only the dataset changed between rounds" claim rests on the
+#: file being an ARTIFACT of the run rather than an input baked into an image (train_kohya.py:40-43
+#: bakes it in, which makes a dataset change an image rebuild).
+WAN_DATASET_TOML_NAME = "dataset-config.toml"
+
+
+def _wan_require_backend(*modules: str) -> None:
+    """Import each signet-side wan module by NAME, raising an actionable error on the first gap.
+
+    The ``_qwen_edit_require_backend`` shape, and it matters MORE here than there. This image is the
+    only one in the fleet that cannot load a ``SignetConfig`` (it carries musubi's
+    ``pydantic==1.10.13``), so ``signet_trainer.runners.wan_musubi`` being importable — i.e. having
+    stayed stdlib-only — is a live property of this container, not a style rule. A pydantic import
+    added anywhere in that module's closure fails HERE, at the stage's first statement, with a
+    message saying so, instead of surfacing as a confusing ``ImportError`` from inside pydantic v1.
+    """
+    import importlib  # noqa: PLC0415
+
+    for name in modules:
+        try:
+            importlib.import_module(name)
+        except ImportError as exc:
+            raise RuntimeError(
+                f"[wan] required module {name!r} is not importable in this container ({exc}). "
+                f"``wan_musubi_image`` carries musubi's pydantic==1.10.13, so this module MUST be "
+                f"stdlib-only — that is a documented hard requirement of runners/wan_musubi.py, not "
+                f"a convention. If the module exists locally but not here the image is stale "
+                f"(``add_local_python_source``; rebuild). If a pydantic/torch import crept into its "
+                f"closure, remove it: the whole reason this stage takes THREADED parameters instead "
+                f"of config YAML is that a SignetConfig cannot be loaded on this interpreter."
+            ) from exc
+
+
+def _wan_cold_path_probe(where: str, musubi_root: str) -> str:
+    """Verify the musubi checkout + launcher BEFORE any weight is touched. Returns a banner line.
+
+    The subprocess-runner equivalent of ``_qwen_edit_cold_path_probe``: there is no ``import
+    diffusers`` to check here because signet does not call into musubi as a library — it EXECUTES
+    it — so the honest cold-path check is that the three scripts exist at the CWD this stage will
+    use and that ``accelerate`` is on PATH.
+
+    Cheap and worth it: an unpinned/renamed upstream layout otherwise surfaces as
+    ``python: can't open file 'wan_cache_latents.py'`` in a metered container, after the A100 is
+    already billing, and reads as a signet bug rather than a checkout one.
+    """
+    import shutil  # noqa: PLC0415
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    from signet_trainer.runners.wan_musubi import (  # noqa: PLC0415
+        WAN_CACHE_LATENTS_SCRIPT,
+        WAN_CACHE_TEXT_ENCODER_SCRIPT,
+        WAN_TRAIN_NETWORK_SCRIPT,
+    )
+
+    root = _Path(musubi_root)
+    scripts = (WAN_CACHE_LATENTS_SCRIPT, WAN_CACHE_TEXT_ENCODER_SCRIPT, WAN_TRAIN_NETWORK_SCRIPT)
+    missing = [name for name in scripts if not (root / name).is_file()]
+    if missing or not root.is_dir():
+        raise RuntimeError(
+            f"[{where}] the musubi-tuner checkout at {musubi_root} is missing "
+            f"{missing or 'entirely'}. ``wan_musubi_image`` clones kohya-ss/musubi-tuner there; if "
+            f"upstream renamed or moved these entry points the transcription in "
+            f"runners/wan_musubi.py is stale and the dataset-TOML schema in runners/musubi_toml.py "
+            f"may be too. Aborting before any weight is touched — do NOT 'fix' this by searching "
+            f"for the scripts, re-pin MUSUBI_TUNER_COMMIT_SHA in modal/app.py."
+        )
+    launcher = shutil.which("accelerate")
+    if launcher is None:
+        raise RuntimeError(
+            f"[{where}] 'accelerate' is not on PATH in this container. musubi's training entry "
+            f"point is launched as ``accelerate launch`` (train_kohya.py:131); it arrives via "
+            f"musubi's own requirements.txt, so its absence means that install step did not take. "
+            f"Fix the image (modal/app.wan_musubi_image) and rebuild — T-03-SC."
+        )
+    line = (
+        f"[{where}] cold-path OK — musubi checkout at {musubi_root} carries all "
+        f"{len(scripts)} entry point(s); accelerate at {launcher}"
+    )
+    print(line)
+    return line
+
+
+@app.function(
+    # The musubi runner image (family #4): python 3.10, musubi's checkout + its pydantic 1.x pin.
+    # A gpu= with the code-only default image boots an A100 and dies at ``import torch``
+    # (tests/test_modal_gpu_image.py). ``A100-80GB`` mirrors train_kohya.py:56 exactly — the 14B DiT
+    # at fp8 plus the umT5 cache pass is what that card was chosen for.
+    gpu="A100-80GB",
+    image=wan_musubi_image,
+    volumes={**WEIGHTS_MOUNT, **DATASET_MOUNT, **CHECKPOINTS_MOUNT},
+    # HF secret only. No wandb: musubi does its own logging and signet's ``train/loop.py`` — the
+    # thing that would call wandb — does not run on this leg at all. Injecting an unused secret is
+    # the mistake ``h3_train`` records for probing wandb it never uses.
+    secrets=[huggingface_secret],
+    timeout=TWENTY_FOUR_HOURS,
+    # NO ``retries=``, DELIBERATELY, and this is the one place family #4 diverges from h3/qwen_edit
+    # for a reason about correctness rather than taste. Their retry contract is safe because
+    # signet's own ``train_loop`` resumes in-dir from the latest COMMITTED checkpoint and commits
+    # per save, so a retry can never observe a half-written one. signet does not own this loop:
+    # musubi's resume semantics are UNVERIFIED here (this pass performs zero downloads and the flag
+    # set at train_kohya.py:129-160 carries no resume argument), and a retry that silently restarts
+    # a 16-epoch run from epoch 0 costs the whole round twice. A retry policy over an unverified
+    # resume is not a safety feature. WHAT LANDS IT: read musubi's checkpoint/resume flags at the
+    # pinned SHA, thread the resume argument, then adopt the same Retries(max_retries=10, ...) the
+    # sibling stages use. No warm-GPU tokens (D-10).
+)
+def wan_train(
+    dataset_toml: str,
+    dit_id: str,
+    vae_id: str,
+    t5_id: str,
+    clip_id: str,
+    output_dir: str,
+    output_name: str,
+    seed: int,
+) -> str:
+    """Stage 1-of-1 (wan) — the gated musubi-tuner Wan 2.1 round: cache, cache, train.
+
+    ⛔ NO ``config_yaml`` PARAMETER, and its absence is load-bearing rather than an omission. Every
+    other train stage in this file takes the recipe BY VALUE as YAML text and re-validates it
+    in-container (the T-03-63 convention). This one CANNOT: ``wan_musubi_image`` carries musubi's
+    ``pydantic==1.10.13`` (train_kohya.py:37) and ``config/load.load_config_from_text`` needs
+    ``pydantic>=2.10.4``. One interpreter, two mutually exclusive pins. So this stage takes THREADED
+    parameters — the ``h3_preprocess`` shape — and EVERY ONE IS REQUIRED WITH NO DEFAULT, which is
+    what turns a threading gap into a ``TypeError`` at dispatch rather than a silent wrong default
+    inside a paid container.
+
+    What is lost by not re-validating in-container is real and is stated rather than glossed: the
+    config's validators fire only on the local side of the gate. What is gained is that the stage
+    runs at all. The mitigation is that the two things a bad config would corrupt here — the dataset
+    composition and the recipe — are BOTH artifacts: the TOML is rendered from the validated
+    manifest and written beside the adapter, and the recipe is one frozen module-level constant read
+    by both sides of the dispatch.
+
+    Body order:
+
+      0. ``_wan_require_backend`` — the one signet-side module, named before anything else. On this
+         image "is it importable" is also "did it stay pydantic-free";
+      1. ``_wan_cold_path_probe`` — the three musubi entry points exist at the CWD this stage will
+         use, and ``accelerate`` is on PATH. Before any weight is touched;
+      2. WRITE the rendered dataset TOML beside the adapter and ``commit()`` the checkpoints Volume
+         IMMEDIATELY — so the artifact that says what this round trained on survives even if the
+         round itself dies at epoch 1 (commit-or-vanish, Pitfall 3);
+      3. resolve + EXIST-CHECK the four component paths under the weights mount. A missing file is
+         a named abort before the first subprocess, not a musubi traceback 40 minutes in;
+      4. run the three passes IN ORDER with ``check=True``. train_kohya.py:105,117,129 calls
+         ``subprocess.run`` with NO return-code check, so a failed cache pass there proceeds
+         silently to training against an empty cache and produces an adapter trained on nothing.
+         That is the single most expensive defect in the transcription and it is NOT carried over;
+      5. ``checkpoints_vol.commit()`` — commit-or-vanish, in a ``finally`` and NOT only at the end.
+         The cache passes commit as they finish, and the TRAINING pass runs under ``Popen`` so each
+         epoch's adapter is committed once its size stops changing. musubi saves every epoch
+         (``--save_every_n_epochs 1``) directly into the mounted Volume, but a Volume commit is
+         explicit: committing once after the last subprocess returned meant a timeout at epoch 15 of
+         16 landed NOTHING, with no ``retries=`` and no resume to recover from. The size-settled
+         check exists because a file that appeared is not a file that is written, and a half-flushed
+         adapter on the Volume is worse than a missing one — the next round would warm-start from it.
+
+    Reported with COUNTS (stage k of 3, elapsed seconds each), so a pass that was skipped prints a
+    zero rather than printing nothing: Modal shows stdout at WARNING and an absent line reads
+    identically to a line that never had anything to say.
+    """
+    # -- (0) the one signet-side module, named before anything is loaded --------------------------
+    _wan_require_backend("signet_trainer.runners.wan_musubi")
+
+    import subprocess  # noqa: PLC0415
+    import time  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    from signet_trainer.modal.app import MUSUBI_TUNER_ROOT  # noqa: PLC0415
+    from signet_trainer.runners.wan_musubi import (  # noqa: PLC0415
+        WAN_MUSUBI_RECIPE,
+        WanComponents,
+        wan_stage_argv,
+    )
+
+    # -- (1) the checkout + launcher, before any weight is touched ---------------------------------
+    _wan_cold_path_probe("wan_train", MUSUBI_TUNER_ROOT)
+
+    # -- (2) the dataset TOML lands BESIDE the adapter, and commits before the round starts --------
+    run_root = CHECKPOINTS_DIR / output_dir
+    run_root.mkdir(parents=True, exist_ok=True)
+    toml_path = run_root / WAN_DATASET_TOML_NAME
+    toml_path.write_text(dataset_toml, encoding="utf-8")
+    # Read back rather than trust the write: this file is the ONLY record of what the round trained
+    # on, and it is also the input all three subprocesses read. A short write here would train a
+    # different dataset than the one committed, which is the exact failure the artifact exists to
+    # make impossible. NOT parsed — python 3.10 has no tomllib and this image has no tomli; the
+    # LOCAL dry-run gate (dryrun/shapes.assert_wan_dryrun_manifest) parses it at $0 before dispatch.
+    written = toml_path.read_text(encoding="utf-8")
+    if written != dataset_toml:
+        raise RuntimeError(
+            f"[wan_train] the dataset TOML at {toml_path} does not read back as it was written "
+            f"({len(written)} vs {len(dataset_toml)} chars). This file is both the run's only "
+            f"provenance record and the input every musubi pass reads; a short write would train a "
+            f"dataset other than the one committed. Aborting before the first subprocess."
+        )
+    checkpoints_vol.commit()
+    print(
+        f"[wan_train] dataset TOML written + COMMITTED to {toml_path} "
+        f"({len(dataset_toml)} chars, {dataset_toml.count('[[datasets]]')} [[datasets]] block(s)). "
+        f"It is an ARTIFACT of this round, not an image input — diff it against the previous "
+        f"round's copy to see exactly what changed."
+    )
+
+    # -- (3) the four components, composed from the weights mount and EXIST-CHECKED ----------------
+    components = WanComponents(
+        dit=str(WEIGHTS_DIR / dit_id),
+        vae=str(WEIGHTS_DIR / vae_id),
+        t5=str(WEIGHTS_DIR / t5_id),
+        clip=str(WEIGHTS_DIR / clip_id),
+    )
+    absent = [
+        f"{name}={path}"
+        for name, path in (
+            ("dit", components.dit),
+            ("vae", components.vae),
+            ("t5", components.t5),
+            ("clip", components.clip),
+        )
+        if not Path(path).exists()
+    ]
+    if absent:
+        raise RuntimeError(
+            f"[wan_train] {len(absent)} of 4 Wan components are not on the weights Volume: "
+            f"{absent}. signet resolves weights from {WEIGHTS_DIR} rather than hf_hub_download-ing "
+            f"them per container (train_kohya.py:69-92 does the latter, which re-pulls 30+ GiB on "
+            f"every retry and makes the round non-reproducible). Upload them to the weights Volume "
+            f"under these ids and re-dispatch; nothing has been spent on compute yet."
+        )
+    print(
+        f"[wan_train] 4 of 4 components resolved under {WEIGHTS_DIR}: dit={dit_id} vae={vae_id} "
+        f"t5={t5_id} clip={clip_id}"
+    )
+
+    # -- (4) the three passes, IN ORDER, each checked -----------------------------------------------
+    stages = wan_stage_argv(
+        dataset_config=str(toml_path),
+        components=components,
+        output_dir=str(run_root),
+        output_name=output_name,
+        seed=seed,
+        recipe=WAN_MUSUBI_RECIPE,
+    )
+    completed = 0
+    elapsed: list[str] = []
+
+    def _commit_settled_adapters(seen: dict[str, int]) -> list[str]:
+        """Commit adapters whose SIZE HAS STOPPED CHANGING since the previous poll.
+
+        musubi saves an adapter every epoch (``--save_every_n_epochs 1``) straight into the mounted
+        Volume, but a Volume commit is explicit — so without this the whole 16-epoch run lands
+        nothing until the last subprocess returns. A timeout at epoch 15 loses fifteen finished
+        adapters, and the stage carries no ``retries=`` (deliberately, see the decorator) and no
+        resume, so the entire metered round is gone with nothing to resume from.
+
+        The size check is the reason this is not just ``glob + commit``: a file that APPEARED is not
+        a file that is WRITTEN. Committing a half-flushed safetensors would put a corrupt adapter on
+        the Volume under a name that looks finished — which is worse than losing it, because the
+        next round would warm-start from it. Two consecutive polls at the same non-zero size is the
+        cheap proxy for "musubi has moved on"; a file still growing is simply left for the next pass.
+        """
+        landed = wan_settled_adapters(run_root, seen, committed_names)
+        if landed:
+            checkpoints_vol.commit()
+            print(
+                f"[wan_train] committed {len(landed)} settled adapter(s) mid-run: "
+                f"{', '.join(landed)} — epoch saves are landed as they stop growing, so a timeout "
+                f"or preemption keeps every completed epoch."
+            )
+        return landed
+
+    committed_names: set[str] = set()
+    try:
+        for index, (label, argv) in enumerate(stages, start=1):
+            print(f"[wan_train] stage {index}/{len(stages)} {label}: {' '.join(argv)}")
+            started = time.monotonic()
+            # check=True is the deviation from the transcription that matters most: train_kohya.py
+            # never inspects a return code, so a failed cache pass there proceeds to training on an
+            # empty cache at a perfectly ordinary loss curve.
+            is_final = index == len(stages)
+            if not is_final:
+                subprocess.run(argv, cwd=MUSUBI_TUNER_ROOT, check=True)
+                # Land the cache pass before the long one starts. The caches are the expensive,
+                # re-usable half; losing them to a training-stage timeout means paying for them again.
+                checkpoints_vol.commit()
+            else:
+                # The TRAINING pass, under Popen so the Volume can be committed WHILE it runs.
+                sizes: dict[str, int] = {}
+                proc = subprocess.Popen(argv, cwd=MUSUBI_TUNER_ROOT)
+                while proc.poll() is None:
+                    time.sleep(WAN_ADAPTER_COMMIT_POLL_SECONDS)
+                    committed_names.update(_commit_settled_adapters(sizes))
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(proc.returncode, argv)
+                committed_names.update(_commit_settled_adapters(sizes))
+            took = time.monotonic() - started
+            completed += 1
+            elapsed.append(f"{label}={took:.0f}s")
+            print(f"[wan_train] stage {index}/{len(stages)} {label} OK in {took:.0f}s")
+    finally:
+        # -- (5) commit-or-vanish, on EVERY exit path ----------------------------------------------
+        # In a finally block rather than after the loop: a timeout, a preemption or a CalledProcess
+        # Error from any stage must still land whatever reached the Volume. The old placement meant
+        # the one case where committing matters most — the run that did not finish — was the one
+        # case that never committed.
+        checkpoints_vol.commit()
+    adapters = sorted(p.name for p in run_root.glob("*.safetensors"))
+    summary = (
+        f"[wan_train] done — {completed}/{len(stages)} stage(s) completed ({', '.join(elapsed)}), "
+        f"{len(adapters)} adapter file(s) committed to signe-trainer-checkpoints under "
+        f"{output_dir}/: {adapters or 'NONE'}. Dataset: {toml_path}. Recipe: task="
+        f"{WAN_MUSUBI_RECIPE.task} network_dim={WAN_MUSUBI_RECIPE.network_dim} "
+        f"epochs={WAN_MUSUBI_RECIPE.max_train_epochs} seed={seed}."
+    )
+    print(summary)
+    return summary

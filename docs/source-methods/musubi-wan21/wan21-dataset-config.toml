@@ -1,0 +1,30 @@
+[general]
+caption_extension = ".txt"
+enable_bucket = true
+bucket_no_upscale = true
+
+[[datasets]]
+image_directory = "/datasets/datasets/Kaboom/Images"
+cache_directory = "/datasets/datasets/Kaboom/Images/cache"
+resolution = [1024, 1024]
+batch_size = 1
+num_repeats = 1
+
+[[datasets]]
+video_directory = "/datasets/datasets/Kaboom/Videos"
+cache_directory = "/datasets/datasets/Kaboom/Videos/cache_1"
+resolution = [1280, 720]
+batch_size = 1
+num_repeats = 1
+frame_extraction = "head"
+target_frames = [1, 21]
+
+[[datasets]]
+video_directory = "/datasets/datasets/Kaboom/Videos"
+cache_directory = "/datasets/datasets/Kaboom/Videos/cache_2"
+resolution = [640, 360]
+batch_size = 1
+num_repeats = 1
+frame_extraction = "uniform"
+target_frames = [45]
+frame_sample = 2

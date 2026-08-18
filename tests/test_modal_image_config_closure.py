@@ -138,6 +138,40 @@ def declared_distributions(block: str) -> set[str]:
     return declared
 
 
+def _calls_config_loader(node: ast.FunctionDef) -> bool:
+    """Does this function actually CALL the loader — as opposed to merely NAMING it?
+
+    ⚠ SHARPENED 2026-08-09, and the imprecision it replaces was live rather than theoretical. The
+    predecessor was ``CONFIG_LOADER in ast.unparse(node)`` — a substring test over the whole
+    unparsed body, DOCSTRINGS INCLUDED. ``modal/fns.wan_train`` is the first stage in this repo that
+    deliberately does NOT load a config (``wan_musubi_image`` carries musubi's ``pydantic==1.10.13``
+    while ``config/load`` needs pydantic>=2.10.4, so the stage takes threaded parameters instead),
+    and its docstring says exactly that — naming ``load_config_from_text`` in order to explain its
+    absence. The substring test read that sentence as a call and demanded the config closure be
+    installed on an image whose whole design is that it cannot carry it.
+
+    An AST CALL-node scan answers the question the incidents were actually about. Verified
+    equivalent before the change: over the nine pre-existing config-loading stages
+    (``backup_sync``/``restore`` on ``download_image``, ``fuse``/``sample``/``train`` on
+    ``gpu_image``, ``h3_sample``/``h3_train``, ``qwen_edit_sample``/``qwen_edit_train``) the two
+    scans return an IDENTICAL mapping, so both historical incidents remain detected. The only
+    difference is ``wan_train``, which does not call it.
+
+    Deliberately does NOT chase indirect calls (a helper that loads a config on the function's
+    behalf). The substring form did not catch those either — a helper's body is not inside this
+    function's AST — so nothing is lost, and inventing a call-graph walk here would be a bigger,
+    less checkable thing than the guard it protects.
+    """
+    return any(
+        isinstance(child, ast.Call)
+        and (
+            (isinstance(child.func, ast.Name) and child.func.id == CONFIG_LOADER)
+            or (isinstance(child.func, ast.Attribute) and child.func.attr == CONFIG_LOADER)
+        )
+        for child in ast.walk(node)
+    )
+
+
 def functions_by_image() -> dict[str, list[str]]:
     """``{image_name: [fn, ...]}`` for every ``@app.function(image=...)`` that loads a config."""
     source = _src(FNS)
@@ -154,7 +188,7 @@ def functions_by_image() -> dict[str, list[str]]:
                         image = keyword.value.id
         if image is None:
             continue
-        if CONFIG_LOADER in ast.unparse(node):
+        if _calls_config_loader(node):
             mapping.setdefault(image, []).append(node.name)
     return mapping
 
@@ -214,6 +248,47 @@ def test_the_derivation_itself_is_not_broken() -> None:
         "missed BOTH real incidents."
     )
     assert functions_by_image(), "no config-loading Modal function found — the AST scan is broken"
+
+
+def test_the_call_detector_reads_calls_and_not_prose() -> None:
+    """RED self-check on the sharpened detector: a mention is not a call, and a call is not missed.
+
+    Both directions, because getting either wrong is expensive in a different way. A detector that
+    flags prose demands dependencies an image cannot carry (the ``wan_train`` case that prompted
+    this). A detector that misses a real call is the ModuleNotFoundError in a paid container this
+    whole file exists to prevent, and it would fail SILENTLY — an image simply drops out of the
+    mapping and the gate reports clean.
+    """
+    mentions_only = ast.parse(
+        f'def f():\n    """This stage does NOT call {CONFIG_LOADER} — see the image note."""\n'
+        f"    x = 1\n"
+    ).body[0]
+    really_calls = ast.parse(f"def g():\n    cfg = {CONFIG_LOADER}(text)\n").body[0]
+    attribute_call = ast.parse(f"def h():\n    cfg = mod.{CONFIG_LOADER}(text)\n").body[0]
+    assert not _calls_config_loader(mentions_only), "a docstring mention was read as a call"
+    assert _calls_config_loader(really_calls), "a plain call was missed — the gate would go silent"
+    assert _calls_config_loader(attribute_call), "a module-qualified call was missed"
+
+
+def test_the_real_config_loading_stages_are_all_still_detected() -> None:
+    """Non-vacuity for the sharpening: every stage that genuinely loads a config is still in scope.
+
+    Named explicitly — not derived — precisely BECAUSE the detector changed. The point of this
+    assertion is to be an independent statement of the expected result that a change to the
+    detection logic must survive; deriving it from the detector would make it circular. Both
+    documented incidents are represented: ``backup_sync``/``restore`` (download_image, 2026-08-05)
+    and ``h3_train``/``h3_sample`` (h3_gpu_image, 2026-08-06).
+
+    ``wan_train`` is deliberately ABSENT: it is the one stage that cannot load a config, because
+    ``wan_musubi_image`` carries musubi's pydantic 1.x.
+    """
+    detected = {image: sorted(fns) for image, fns in functions_by_image().items()}
+    assert detected == {
+        "download_image": ["backup_sync", "restore"],
+        "gpu_image": ["fuse", "sample", "train"],
+        "h3_gpu_image": ["h3_sample", "h3_train"],
+        "qwen_gpu_image": ["qwen_edit_sample", "qwen_edit_train"],
+    }, detected
 
 
 def test_every_image_carries_the_closure_of_the_functions_pointed_at_it() -> None:

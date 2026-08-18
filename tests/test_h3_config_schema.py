@@ -103,9 +103,28 @@ def test_model_config_accepts_h3_family() -> None:
 
 
 def test_model_config_rejects_unknown_family() -> None:
-    """The discriminator is an allowlist — a typo'd or aspirational family dies at load."""
+    """The discriminator is an allowlist — a typo'd or aspirational family dies at load.
+
+    ⚠ AMENDED, DELIBERATELY (multi-source slice A). The example used to be ``family="wan"``, and
+    ``tests/test_multisource_verifier_gaps.py`` armed a tripwire so that changing it could not be
+    accidental. ``"wan"`` is now a REAL family — the musubi-tuner runner, the only one that consumes
+    ``data.sources`` — with its own dims law (``validators.validate_wan_training_dims``) and its own
+    arm in ``SignetConfig._cross_field_checks``, so it is no longer an example of anything rejected.
+
+    The CLAIM this test makes is unchanged and still covered: the field is an ALLOWLIST, not a free
+    string. ``"svd"`` replaces ``"wan"`` as the aspirational-family example, and
+    ``test_model_config_accepts_wan_family`` below pins the positive half so the allowlist's real
+    membership is asserted rather than implied.
+    """
     with pytest.raises(ValidationError):
-        ModelConfig(family="wan")
+        ModelConfig(family="svd")
+    with pytest.raises(ValidationError):
+        ModelConfig(family="LTX")  # case matters — the literal is exact
+
+
+def test_model_config_accepts_wan_family() -> None:
+    """Family #4: the musubi-tuner RUNNER family (multi-source slice A)."""
+    assert ModelConfig(family="wan").family == "wan"
 
 
 def test_model_config_h3_only_ids_default_to_none() -> None:

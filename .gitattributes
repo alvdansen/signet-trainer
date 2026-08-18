@@ -1,0 +1,7 @@
+# Reference artifacts are ORACLES: their bytes are the test fixture, so git must not
+# normalise them. wan21-dataset-config.toml is the production musubi config the TOML renderer
+# is asserted against, and autocrlf silently rewrote it from 750 bytes (LF, as authored) to
+# 780 (CRLF) on checkout — so the repo's "byte-exact" proof was really text-exact, and a
+# byte-mode assertion would have failed on any Windows clone while passing on Linux.
+# An oracle that changes shape depending on who checked it out is not an oracle.
+docs/source-methods/** -text
