@@ -412,6 +412,47 @@ def test_reference_free_h3_config_is_still_budget_checked() -> None:
     assert str(h3_packed_seq_len(124, (16, 9), [], 96, 896).total) in str(excinfo.value)
 
 
+def test_multi_bucket_budget_prices_the_largest_bucket_not_training_dims_f(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression for the budget-incoherence defect: ``training_dims`` F is the DEFAULT bucket, not
+    necessarily the LARGEST one, and the whole point of ``H3DryrunBudget.priced_frames`` is that both
+    the coherence check and the OK banner must price whichever bucket is largest.
+
+    ``training_dims=[1344, 768, 5]`` with ``resolution_buckets=["1344x768x5", "1344x768x22"]`` is
+    exactly the documented default-bucket shape: F=5 loads fine (it is A declared bucket, just not
+    the biggest), but the real worst-case geometry a training run can actually serve is F=22. If
+    ``assert_h3_seq_len_budget`` ever re-derives ``target_frames`` from ``cfg.training_dims[2]``
+    (the reverted defect) instead of reading ``budget.priced_frames``, it re-prices the SAME config
+    at 5 frames while ``_h3_worst_case_budget`` already priced ``budget.layout`` at 22 — the two
+    disagree, and the function's own internal "H3 budget incoherence" assertion fires, so this test
+    fails loudly under that mutation instead of silently passing a run that would OOM on its actual
+    22-frame rows.
+    """
+    cfg = _h3_cfg(
+        training_dims=[1344, 768, 5],
+        data={
+            "preprocessed_data_root": "/data/h3_preprocessed",
+            "batch_size": 1,
+            "resolution_buckets": ["1344x768x5", "1344x768x22"],
+        },
+    )
+
+    budget = assert_h3_seq_len_budget(cfg)
+    assert budget.priced_frames == 22, (
+        "must price the LARGEST declared bucket (22), not training_dims F (5)"
+    )
+    assert budget.layout.total == WORST_896.total
+    assert budget.worst_pair_label == WORST_LABEL_896 == "C+008"
+
+    # The OK banner must name the SAME 22-frame geometry — never the training_dims default of 5.
+    assert run_dryrun(cfg) == 0
+    out = capsys.readouterr().out
+    assert "22 target frames" in out
+    assert f"{h3_latent_frames(22)} latent frames" in out
+    assert f"packed seq_len={WORST_896.total}" in out
+
+
 def test_budget_gate_delegates_to_the_shared_worst_pair_validator() -> None:
     """key_link: the refusal message lives in ONE place — ``validate_h3_reference_budget``."""
     source = SHAPES_PY.read_text(encoding="utf-8")
