@@ -531,6 +531,76 @@ def test_config_text_stages_compute_their_own_ceiling(fn: str) -> None:
 # --------------------------------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------------------------------
+# (5) #39 finding 2 — pipeline_root_id required, pre-approval, for family: h3 --mode sample
+# --------------------------------------------------------------------------------------------------
+
+
+def test_h3_sample_refuses_a_missing_pipeline_root_id_pre_approval() -> None:
+    """The ONLY prior enforcement was ``fns.py:h3_sample``'s in-container RuntimeError, AFTER the
+    ~61.7 GiB arch gate — a dispatch paid for a refusal that costs nothing locally. This asserts the
+    free, load-time twin exists and fires strictly before ``_require_approval``."""
+    source = _ENTRYPOINT.read_text(encoding="utf-8")
+    assert "cfg.model.pipeline_root_id" in source and "not cfg.model.pipeline_root_id" in source, (
+        "entrypoint.py must check model.pipeline_root_id before dispatch — the field is documented "
+        "(config/schema.py) as 'Required by --mode sample on a family: h3 config' but nothing at "
+        "load asked for it"
+    )
+    refusal = source.index("config.model.pipeline_root_id is unset")
+    approval = source.index("_require_approval(approve)")
+    assert refusal < approval, (
+        "the pipeline_root_id refusal must fire BEFORE the approval gate (zero-spend), exactly "
+        "like the sibling no-reference --mode sample refusal it sits beside"
+    )
+
+
+def _compact(source: str) -> str:
+    """Collapse adjacent string-literal concatenation + whitespace, so a message split across
+    several ``"..."`` lines can be matched as the single sentence it becomes at runtime — the same
+    technique ``test_the_alpha_banner_is_printed_at_the_front_of_a_no_ref_dispatch`` uses."""
+    return re.sub(r"\s+", " ", source.replace('"', ""))
+
+
+def test_h3_pipeline_root_id_gate_message_matches_h3_sample_verbatim() -> None:
+    """#39's proposed direction: 'reuse fns.py:4513's message text verbatim so the operator sees the
+    same instruction either way' — pinned as a shared sentence across both refusals."""
+    entry_compact = _compact(_ENTRYPOINT.read_text(encoding="utf-8"))
+    fns_compact = _compact(_FNS.read_text(encoding="utf-8"))
+    shared = (
+        "config.model.pipeline_root_id is unset. The render needs the pipeline "
+        "ROOT (the dir holding model_index.json and every component partition); "
+        "`model.model_id` names the transformer PARTITION inside it and means something "
+        "different to h3_train / h3_loader, so it is NOT reused here (D-10-DEF-14)."
+    )
+    assert shared in entry_compact, "the entrypoint's pre-approval refusal text has drifted from fns.py"
+    assert shared in fns_compact, "fns.py's in-container RuntimeError text has drifted from the entrypoint"
+
+
+def test_h3_pipeline_root_id_gate_is_scoped_to_sample_and_h3_only() -> None:
+    """The gate must not fire for train/preprocess (pipeline_root_id is unused there, per
+    schema.py's own field doc) nor for any other family — only mode == 'sample' and family == 'h3'."""
+    main_fn = _find_function(_ENTRYPOINT.read_text(encoding="utf-8"), "main")
+    guarded = [
+        node
+        for node in ast.walk(main_fn)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(n, ast.Constant)
+            and isinstance(n.value, str)
+            and "config.model.pipeline_root_id is unset" in n.value
+            for n in ast.walk(node)
+        )
+    ]
+    assert guarded, "no `if` guarding the pipeline_root_id refusal was found"
+    condition_src = ast.unparse(guarded[0].test)
+    assert "mode ==" in condition_src and "'sample'" in condition_src.replace('"', "'"), (
+        f"the guard condition ({condition_src!r}) must be scoped to mode == 'sample'"
+    )
+    assert "family" in condition_src and "h3" in condition_src, (
+        f"the guard condition ({condition_src!r}) must be scoped to model.family == 'h3'"
+    )
+
+
 def test_this_gate_imports_no_modal() -> None:
     """The whole file must stay CPU-pure — importing modal would break the invariant it asserts."""
     src = Path(__file__).read_text(encoding="utf-8")

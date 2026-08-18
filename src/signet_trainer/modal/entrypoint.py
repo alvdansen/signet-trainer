@@ -1335,6 +1335,24 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "end-to-end run exists; file issues"
         )
 
+    # (1d) H3 render config-load requirement — pre-approval, zero-spend (#39 finding 2). The ONLY
+    #      enforcement of this used to be modal/fns.py:h3_sample's own RuntimeError, INSIDE the
+    #      metered container, AFTER the ~61.7 GiB arch gate has loaded — a dispatch paid for a
+    #      refusal that costs nothing locally. `model.pipeline_root_id` is documented (schema.py)
+    #      as "Required by --mode sample on a family: h3 config", but nothing at load asked for
+    #      it and no shipped h3 config declares it. Message text matches fns.py's RuntimeError
+    #      verbatim (module tag aside) so the operator sees the identical instruction whichever
+    #      gate fires.
+    if mode == "sample" and cfg.model.family == "h3" and not cfg.model.pipeline_root_id:
+        raise SystemExit(
+            "[signet-entrypoint] config.model.pipeline_root_id is unset. The render needs the "
+            "pipeline ROOT (the dir holding model_index.json and every component partition); "
+            "`model.model_id` names the transformer PARTITION inside it and means something "
+            "different to h3_train / h3_loader, so it is NOT reused here (D-10-DEF-14). Add to "
+            "the config's `model:` block:\n    pipeline_root_id: minimax-h3\n"
+            "[signet-entrypoint] Aborting pre-approval, no dispatch."
+        )
+
     # (2) Dry-run hard gate (CONF-03) on the already-loaded cfg — must pass before ANY remote
     #     dispatch. Non-zero -> abort. The mode is threaded through (gap-dryrun-ltx-0) so the
     #     mode-conditional refusals shared with the container bodies (config/mode_gate.py) fire

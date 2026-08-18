@@ -454,10 +454,22 @@ def h3_reference_pairing_domain(
         domain.append(("+".join(r.label for r in combo), combo))
     # The environment ref SUBSTITUTES for the last character slot -- hence combinations of
     # (references_per_sample - 1) characters, never `references_per_sample` characters + 1 env.
-    for combo in itertools.combinations(characters, references_per_sample - 1):
-        for env in environments:
-            pair = (*combo, env)
-            domain.append(("+".join(r.label for r in pair), pair))
+    #
+    # #39 finding 1 / step 2: skip this leg ENTIRELY below 2 slots rather than let it run. At
+    # references_per_sample == 1, `itertools.combinations(characters, 0)` yields exactly the empty
+    # combo, so `pair = (env,)` has length 1 -- which EQUALS references_per_sample and sails past
+    # the length invariant below even though no such sample is resolvable: an environment ref needs
+    # a character slot to substitute for (h3_ref.py's own rule), and at 1 total slot there is none
+    # left. `resolve_reference_slots` / `H3RefStrategy._resolve_slots` refuse every environment-
+    # bearing sample below 2 slots by construction, so a length-1 "pair" here would price a layout
+    # the runtime can never produce -- the schema-level mirror guard (config/schema.py,
+    # H3Config._check_no_reference_fields) refuses this at config load, but this function must stay
+    # correct for any OTHER caller that reaches it directly (tests, future code) too.
+    if references_per_sample >= 2:
+        for combo in itertools.combinations(characters, references_per_sample - 1):
+            for env in environments:
+                pair = (*combo, env)
+                domain.append(("+".join(r.label for r in pair), pair))
 
     for label, pair in domain:
         if len(pair) != references_per_sample:

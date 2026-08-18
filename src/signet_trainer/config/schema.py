@@ -802,31 +802,64 @@ class H3Config(_Base):
         # left free even though --mode sample is REFUSED at 0 slots today: they are inert until the
         # t2va render leg lands (the tracked no-ref follow-up), and rejecting them would force a
         # config edit the moment it does. Inert-but-free is a documented choice here, not drift.
-        if self.references_per_sample != 0:
+        if self.references_per_sample == 0:
+            # Defaults are read off the FIELD DEFINITIONS (not a pristine instance — instantiating
+            # one inside its own model_validator would recurse), so a default change is covered
+            # automatically and the guard cannot drift out of sync (T-10-05-T, same as the family
+            # guard).
+            ref_only = (
+                "reference_image_short_edge",
+                "reference_dropout",
+                "reference_pair_seed",
+                "environment_ref_last",
+                "t_visual_cond",
+                "character_reference_sizes",
+                "environment_reference_sizes",
+            )
+            nondefault = [
+                name
+                for name in ref_only
+                if getattr(self, name)
+                != H3Config.model_fields[name].get_default(call_default_factory=True)
+            ]
+            if nondefault:
+                raise ValueError(
+                    f"H3 reference field(s) {nondefault} set while references_per_sample is 0 "
+                    f"(NO-REFERENCE, ALPHA): with zero reference slots these knobs act on nothing "
+                    f"and would be silently ignored (lean field-split — no silently-ignored config "
+                    f"block). Remove them, or set references_per_sample: 2 for Ref2VA."
+                )
             return self
-        # Defaults are read off the FIELD DEFINITIONS (not a pristine instance — instantiating one
-        # inside its own model_validator would recurse), so a default change is covered automatically
-        # and the guard cannot drift out of sync (the T-10-05-T doctrine, same as the family guard).
-        ref_only = (
-            "reference_image_short_edge",
-            "reference_dropout",
-            "reference_pair_seed",
-            "environment_ref_last",
-            "t_visual_cond",
-            "character_reference_sizes",
-            "environment_reference_sizes",
-        )
-        nondefault = [
-            name
-            for name in ref_only
-            if getattr(self, name) != H3Config.model_fields[name].get_default(call_default_factory=True)
-        ]
-        if nondefault:
+        # NOTE: the MIRROR direction of the guard above (#31 finding 1 — a 1- or 2-slot config
+        # with BOTH size lists left empty) is deliberately NOT here. This validator runs on every
+        # ``H3Config`` instance, including the all-default nested block an LTX/qwen_edit config
+        # carries for free (``references_per_sample`` defaults to
+        # ``H3_PHASE10_REFERENCES_PER_SAMPLE`` while the size lists default to empty, so the
+        # all-default combination is exactly the shape the mirror guard would refuse) — a
+        # sub-model cannot see ``model.family`` (same reason the frame-law / resolution-bucket
+        # checks live on ``SignetConfig`` instead of here, per the comment at H3Config's `family`
+        # field). The mirror guard is asserted in ``SignetConfig._cross_field_checks``'s h3 branch,
+        # where the family is known to actually BE h3.
+        #
+        # ENVIRONMENT-REFS-NEED-2-SLOTS (#39 finding 1) — an environment reference SUBSTITUTES for
+        # the LAST character slot (never appended), so it needs >= 2 total slots to have a
+        # character slot to substitute for. `resolve_reference_slots` (conditioning/h3_ref.py) and
+        # `H3RefStrategy._resolve_slots` both refuse ANY environment-bearing sample at 1 slot by
+        # construction — but nothing tied `environment_reference_sizes` to
+        # `references_per_sample >= 2` at config load, so a 1-slot config with environment sizes
+        # declared passed load, and `h3_reference_pairing_domain` priced a domain containing
+        # environment-only pairs the runtime can never produce. Message text matches
+        # `resolve_reference_slots`' own ValueError (h3_ref.py) verbatim so the local and the
+        # runtime refusal read identically.
+        if self.environment_reference_sizes and self.references_per_sample < 2:
             raise ValueError(
-                f"H3 reference field(s) {nondefault} set while references_per_sample is 0 "
-                f"(NO-REFERENCE, ALPHA): with zero reference slots these knobs act on nothing and "
-                f"would be silently ignored (lean field-split — no silently-ignored config block). "
-                f"Remove them, or set references_per_sample: 2 for Ref2VA."
+                f"invalid references_per_sample {self.references_per_sample}: with an environment "
+                f"reference present there is no character slot left. The environment reference "
+                f"SUBSTITUTES for the LAST character slot — it is never appended — so at least 2 "
+                f"slots are needed for an environment-bearing sample. "
+                f"h3.environment_reference_sizes has {len(self.environment_reference_sizes)} "
+                f"entry(ies) declared; remove them, or set references_per_sample: "
+                f"{H3_PHASE10_REFERENCES_PER_SAMPLE}."
             )
         return self
 
@@ -2783,6 +2816,31 @@ class SignetConfig(_Base):
         if self.model.family == "h3":
             validate_h3_frames(self.training_dims[2])
             validate_h3_resolution_buckets(self.data.resolution_buckets)
+            # MIRROR DIRECTION (#31 finding 1, H3 audit @742b676) — H3Config._check_no_reference_
+            # fields only guards the references_per_sample == 0 direction (a ref-only knob set while
+            # there are no slots for it to act on); nothing guarded the OTHER direction: a 1- or
+            # 2-slot config with BOTH size lists left empty passes H3Config's own validation (its
+            # all-default combination is legitimate there — an LTX/qwen_edit config carries an
+            # inert, all-default h3 block for free), but HERE the family is actually h3, so the
+            # branch below keys on the size lists and would take the "no reference corpus declared"
+            # arm — certifying the reference-free layout for a run that resolves
+            # ``references_per_sample`` REAL slots per sample at preprocess/train time. Measured: a
+            # 2-slot / empty-list config prices/dry-run-"proves" 7,226 rows against a realized
+            # 11,162 (ceiling 13,777) — a 3,936-row understatement the free gate exists precisely to
+            # catch, reopened through this exact door.
+            if self.h3.references_per_sample != 0 and not (
+                self.h3.character_reference_sizes or self.h3.environment_reference_sizes
+            ):
+                raise ValueError(
+                    f"h3.references_per_sample is {self.h3.references_per_sample} but neither "
+                    f"h3.character_reference_sizes nor h3.environment_reference_sizes is declared: "
+                    f"the packed-sequence budget has no reference corpus to price against, so "
+                    f"config load would certify the reference-free ('no corpus declared') layout "
+                    f"for a run that resolves {self.h3.references_per_sample} real slot(s) per "
+                    f"sample at preprocess/train time — silently understating the packed-row "
+                    f"ceiling. Declare the reference size list(s), or set "
+                    f"h3.references_per_sample: 0 for NO-REFERENCE (ALPHA) training."
+                )
             max_rows = max_packed_rows_for_budget(
                 self.h3.gpu_usable_gib, self.h3.resident_gib, self.h3.mib_per_packed_row
             )
