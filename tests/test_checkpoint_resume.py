@@ -95,6 +95,41 @@ def test_find_latest_picks_highest_step(tmp_path) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# latest_step — AUDIT #34 direction 7's cheap "how far did this run get" read (no model needed)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_latest_step_is_none_on_a_cold_start(tmp_path) -> None:
+    assert CheckpointManager(tmp_path).latest_step() is None
+    # Also true when the dir does not even exist yet (find_latest's own cold-start branch).
+    assert CheckpointManager(tmp_path / "never-created").latest_step() is None
+
+
+def test_latest_step_matches_find_latest_highest_step(tmp_path) -> None:
+    model = _wrapped()
+    opt, sched = _opt_and_sched(model)
+    mgr = CheckpointManager(tmp_path)
+    mgr.save(model, opt, sched, step=50, loss=1.0)
+    mgr.save(model, opt, sched, step=400, loss=0.5)
+    mgr.save(model, opt, sched, step=200, loss=0.7)
+    assert mgr.latest_step() == 400
+
+
+def test_latest_step_ignores_a_half_written_newer_dir(tmp_path) -> None:
+    """Mirrors ``find_latest``'s walk-back (audit #3): a half-written dir must not be reported as
+    the latest step just because its name sorts highest."""
+    model = _wrapped()
+    opt, sched = _opt_and_sched(model)
+    mgr = CheckpointManager(tmp_path)
+    mgr.save(model, opt, sched, step=100, loss=1.0)
+    # A half-written "checkpoint-step-00500..." dir with only the adapter, no training_state.pt.
+    half = tmp_path / "checkpoint-step-00500-loss-0.1000"
+    half.mkdir()
+    (half / ADAPTER_FILENAME).touch()
+    assert mgr.latest_step() == 100
+
+
+# --------------------------------------------------------------------------------------------------
 # THE landmine #1 proof
 # --------------------------------------------------------------------------------------------------
 

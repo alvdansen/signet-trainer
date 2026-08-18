@@ -297,6 +297,17 @@ def train_loop(
     dtype = torch.bfloat16 if t.mixed_precision == "bf16" else torch.float32
     rng = np.random.default_rng(t.seed)
 
+    # AUDIT #34 direction 1 — training.seed previously reached only the numpy generator above; the
+    # flow-match noise (torch.randn_like in conditioning/single_frame.py) and the DataLoader's
+    # RandomSampler both drew off the global, unseeded torch RNG, so two runs of one config were not
+    # reproducible. Seed torch here, BEFORE the DataLoader is constructed (so shuffle order is pinned
+    # by the generator passed below) and BEFORE ckpt_manager.resume() (so a resume's
+    # torch.set_rng_state — landmine #1 — still wins over this initial seed).
+    torch.manual_seed(t.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(t.seed)
+    shuffle_generator = torch.Generator().manual_seed(t.seed)
+
     if step_fn is None:
         # The LTX default, built here so the ltx_core import NEVER runs when a caller injects its
         # own forward (h3_gpu_image has no ltx_core — the import itself would be the failure).
@@ -327,6 +338,9 @@ def train_loop(
         num_workers=0,
         pin_memory=torch.cuda.is_available(),
         collate_fn=collate_fn,
+        generator=shuffle_generator,  # pin shuffle order to training.seed independently of any
+        # other torch draw (AUDIT #34 direction 1) — RandomSampler otherwise falls back to the
+        # global torch RNG, which other code (e.g. the flow-match noise draw) also consumes.
     )
 
     total_steps = t.max_steps  # STEP-driven, authoritative (NOT epoch — HANDOFF landmine 44)

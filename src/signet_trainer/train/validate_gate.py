@@ -605,6 +605,11 @@ def check_training_step(
         lora_config = build_lora_config(
             rank=getattr(getattr(config, "lora", None), "rank", 64),
             alpha=getattr(getattr(config, "lora", None), "alpha", 64),
+            # AUDIT #34 direction 2 — this is the adapter check #4 PASS reuses verbatim on the
+            # shipped default path (fns.py `model = gate_adapter`, runner.py same); without
+            # dropout= threaded here every default-path run trained at lora_dropout=0.0 regardless
+            # of the config's lora.dropout.
+            dropout=getattr(getattr(config, "lora", None), "dropout", 0.0),
             targets=getattr(getattr(config, "lora", None), "target_modules", None) or P1_FF_LORA_TARGETS,
         )
         model = inject_lora(

@@ -74,3 +74,28 @@ def test_train_body_reuses_gate_adapter_no_double_inject() -> None:
     assert inject_calls[0] > builder_idx, (
         "inject_lora() must live inside the use_builder branch, not the Open-Q1 default path"
     )
+
+
+def test_train_body_asserts_gate_adapter_dropout_matches_config_before_reuse() -> None:
+    """AUDIT #34 direction 2 belt-and-braces — the gate's check #5 built ``gate_adapter``'s
+    dropout from ``config.lora.dropout`` too (``validate_gate.check_training_step``); ``train()``
+    must assert the two still agree BEFORE reusing the adapter as the training model, so a future
+    drift between the gate's build and this reuse site aborts pre-spend instead of silently
+    training at the wrong dropout — the exact #34 defect, guarded against recurring.
+    """
+    code = _train_body(_strip(_FNS.read_text(encoding="utf-8")))
+
+    assert "gate_adapter" in code and "lora_dropout" in code and "config.lora.dropout" in code
+    assert re.search(
+        r"lora_dropout(?:.|\n)*?!=(?:.|\n)*?config\.lora\.dropout"
+        r"|config\.lora\.dropout(?:.|\n)*?!=(?:.|\n)*?lora_dropout",
+        code,
+    ), "train() must compare gate_adapter's lora_dropout against config.lora.dropout"
+
+    dropout_idx = code.index("lora_dropout")
+    reuse_idx = code.index("model = gate_adapter")
+    assert dropout_idx < reuse_idx, (
+        "the dropout consistency assertion must run BEFORE `model = gate_adapter` reuses the "
+        "adapter, not after"
+    )
+    assert "RuntimeError" in code[dropout_idx : reuse_idx + 50]
