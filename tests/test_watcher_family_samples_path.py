@@ -24,6 +24,7 @@ import pytest
 
 from signet_trainer.inference.render_key import h3_render_key
 from signet_trainer.inference.samples_layout import (
+    committed_clip_names,
     expected_h3_render_key,
     landed_render_ids,
     samples_root,
@@ -118,6 +119,42 @@ def test_h3_reference_order_is_not_collapsed():
     assert fwd != rev
 
 
+# ---- fine-grained clip progress (issue #45 PR-1 must-fix #1) ---------------------------------
+
+_RENDER_DIR_BASE_LISTING_TWO_CLIPS = (
+    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f22_A-029/base/prompt_one_s42.mp4\n"
+    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f22_A-029/base/prompt_two_s42.mp4\n"
+)
+
+
+def test_committed_clip_names_reads_mp4_filenames_only():
+    # The progress probe cares about CLIPS, not the render's own index.html/delta.json — those two
+    # never grow mid-render at the cadence a clip does, and delta.json's own absence is what "not
+    # yet landed" MEANS; treating it as progress would defeat the point of the finer signal.
+    listing = _RENDER_DIR_BASE_LISTING_TWO_CLIPS + (
+        "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f22_A-029/base/index.html\n"
+    )
+    names = committed_clip_names(listing)
+    assert names == ["prompt_one_s42.mp4", "prompt_two_s42.mp4"]
+    assert "index.html" not in names
+
+
+def test_committed_clip_names_grows_as_clips_land():
+    # The exact defect the stall clock needs a signal for: render_landed's coarse identity check
+    # cannot distinguish "one clip in" from "eleven clips in" — this probe can, and it must actually
+    # CHANGE as more clips commit, or resetting pending_since on it would be a no-op.
+    one_clip = committed_clip_names(
+        "outputs/x/samples_h3/key/base/prompt_one_s42.mp4\n"
+    )
+    two_clips = committed_clip_names(_RENDER_DIR_BASE_LISTING_TWO_CLIPS)
+    assert len(two_clips) > len(one_clip)
+
+
+def test_committed_clip_names_empty_listing_is_empty():
+    assert committed_clip_names("") == []
+    assert committed_clip_names("\n") == []
+
+
 # ---- the watcher actually USES it (source scan — the watcher drives metered renders) ----------
 
 
@@ -149,6 +186,34 @@ def test_watcher_render_landed_is_family_aware():
     body = src.split("def render_landed")[1].split("\ndef ")[0]
     assert "expected_h3_render_key(" in body
     assert 'FAMILY != "h3"' in body, "the LTX branch must keep its any-new-stamp behaviour"
+
+
+def test_watcher_render_landed_requires_explicit_checkpoint():
+    # issue #45 PR-1 must-fix #2: the checkpoint identity used to verify a PENDING render must be the
+    # value captured at dispatch time, not re-derived here every poll (a re-derivation could drift
+    # onto a checkpoint newer than the one actually dispatched and never find the real render). Kill
+    # the checkpoint=None match-anything path: render_landed takes checkpoint as a parameter and
+    # refuses None rather than silently resolving one internally.
+    src = _watcher_src()
+    assert "def render_landed(step: int, checkpoint: str | None) -> bool:" in src
+    body = src.split("def render_landed")[1].split("\ndef ")[0]
+    assert "ckpt = latest_checkpoint_name()" not in body, (
+        "render_landed must not re-derive the checkpoint itself — it must be handed the dispatch-"
+        "time value by the caller, not resolve a fresh (possibly drifted) one internally"
+    )
+    assert "checkpoint is None" in body
+    assert "raise ValueError" in body
+
+
+def test_watcher_progress_probe_exists_and_is_finer_than_landed():
+    # issue #45 PR-1 must-fix #1: a distinct progress probe, reading one level deeper than
+    # render_landed's coarse identity check, is what lets the stall clock refresh on evidence of
+    # life instead of firing on every multi-hour H3 render.
+    src = _watcher_src()
+    assert "def render_progress_artifacts(" in src
+    body = src.split("def render_progress_artifacts")[1].split("\ndef ")[0]
+    assert "committed_clip_names(" in body
+    assert '"base"' in body and '"lora"' in body
 
 
 def test_watcher_grid_refresh_uses_gridwatch_driver_for_h3():

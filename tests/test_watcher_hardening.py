@@ -174,6 +174,75 @@ def test_both_append_spend_every_dispatch_not_only_on_success():
         assert _first(body, "append_spend(") < _first(body, "dispatch_render(")
 
 
+# ---- issue #45 PR-1 must-fix #2 — checkpoint captured BEFORE append_spend, refuse on None ----
+# (GENERALIZED only: the campaign FORK does not exist in this repo and is not in this fix's scope.)
+
+
+def test_generalized_captures_checkpoint_before_booking_spend():
+    # The regression: `ckpt_at_dispatch = latest_checkpoint_name()` must run BEFORE `append_spend(
+    # step)`, never after — a failed capture (None, on a modal volume ls timeout) must be caught
+    # before spend is booked, not discovered afterward with the spend already ledgered.
+    body = _main_body(GENERALIZED)
+    assert "ckpt_at_dispatch = latest_checkpoint_name()" in body
+    assert _first(body, "ckpt_at_dispatch = latest_checkpoint_name()") < _first(body, "append_spend(")
+
+
+def test_generalized_refuses_dispatch_on_unresolved_checkpoint():
+    # A None capture must REFUSE the dispatch — no append_spend, no dispatch_render — rather than
+    # booking spend for (and dispatching) a render this watcher could never verify as landed.
+    body = _main_body(GENERALIZED)
+    guard_i = _first(body, "ckpt_at_dispatch is None")
+    # Isolate the guard's own if-branch: everything up to the following `else:` at the same
+    # dispatch-block indentation (the branch that DOES proceed to append_spend/dispatch_render).
+    refusal_branch = body[guard_i:body.find("\n            else:", guard_i)]
+    assert "append_spend(" not in refusal_branch
+    assert "dispatch_render(" not in refusal_branch
+    assert "REFUSING" in refusal_branch
+
+
+def test_generalized_render_landed_receives_the_captured_checkpoint():
+    # render_landed must be called with the DISPATCH-TIME identity (`pending_checkpoint`), never a
+    # fresh lookup — closing the drift hole must-fix #2 exists to close.
+    body = _main_body(GENERALIZED)
+    assert "render_landed(pending_step, pending_checkpoint)" in body
+
+
+# ---- issue #45 PR-1 must-fix #1 — the stall clock refreshes on progress ----------------------
+# (GENERALIZED only: the campaign FORK already has its own artifact-freshness gate, out of scope.)
+
+
+def test_generalized_progress_probe_runs_before_staleness_is_measured():
+    # The clock must be given the chance to reset BEFORE age_min is computed against it this same
+    # iteration — reversing the order would measure staleness against a clock that could have just
+    # been refreshed, one poll too late.
+    body = _main_body(GENERALIZED)
+    assert _first(body, "render_progress_artifacts(") < _first(body, "age_min = ")
+
+
+def test_generalized_progress_refresh_resets_pending_since():
+    # The regression itself: pending_since used to be assigned exactly ONCE in main() (at dispatch,
+    # `pending_step, pending_since = step, time.time()`) and never touched again. A SECOND
+    # reassignment — inside the progress-changed branch — is what makes the clock refresh on
+    # evidence of life instead of counting straight from dispatch for the render's whole life.
+    body = _main_body(GENERALIZED)
+    reassignments = re.findall(r"pending_since[,\s]*=.*time\.time\(\)", body)
+    assert len(reassignments) >= 2, (
+        f"pending_since must be reassigned on progress in addition to the dispatch-time assignment "
+        f"(found {len(reassignments)} reassignment(s), expected >= 2)"
+    )
+
+
+def test_generalized_stall_path_still_fires_without_progress():
+    # A render is STALLED only when NO new artifact has appeared for render_stall_minutes — the
+    # genuinely-hung-render path must survive the progress-refresh addition unchanged.
+    body = _main_body(GENERALIZED)
+    assert "elif age_min > RENDER_STALL_MIN:" in body
+    stall_i = _first(body, "elif age_min > RENDER_STALL_MIN:")
+    stall_branch = body[stall_i:body.find("\n            else:", stall_i)]
+    assert "declaring STALLED" in stall_branch
+    assert "pending_step, pending_checkpoint, pending_progress = None, None, frozenset()" in stall_branch
+
+
 # ---- OBS-01 Task 1 — the four watcher-supervision tunables are documented config fields ----
 
 

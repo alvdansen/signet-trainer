@@ -36,6 +36,7 @@ from signet_trainer.inference.render_key import h3_render_key, qwen_edit_render_
 
 __all__ = [
     "SAMPLES_SUBDIR_BY_FAMILY",
+    "committed_clip_names",
     "expected_h3_render_key",
     "expected_qwen_edit_band_keys",
     "expected_qwen_edit_render_key",
@@ -227,5 +228,29 @@ def landed_render_ids(listing: str, family: str) -> list[str]:
         # segment after the render root so a checkpoint name containing `/` can never leak through.
         name = raw.strip().rstrip("/").split(f"{subdir}/")[-1].split("/")[-1]
         if name and key_re.match(name):
+            found.add(name)
+    return sorted(found)
+
+
+def committed_clip_names(listing: str) -> list[str]:
+    """Every ``*.mp4`` filename visible in a ``modal volume ls`` listing of ONE render's own column
+    (``base/`` or ``lora/``) — the fine-grained PROGRESS signal a multi-hour render's stall clock
+    needs (issue #45 PR-1 must-fix #1), distinct from ``landed_render_ids``'s coarse existence check.
+
+    ``landed_render_ids`` answers "has this render's IDENTITY directory appeared at all?", which
+    saturates the moment the render's first clip commits (``h3_sample`` commits per clip —
+    ``checkpoints_vol.commit()`` inside ``_render()``, ``modal/fns.py``) and stays true for the whole
+    rest of an up-to-6h render; it cannot tell "still writing clips" apart from "fully done", so a
+    stall-freshness clock cannot safely reset on it alone. Reading one level deeper — the individual
+    clip filenames inside the render's own directory — gives a signal that keeps changing for as long
+    as the render keeps committing clips, which is exactly what that clock needs.
+
+    Same string-only contract as ``landed_render_ids``: pure, zero Modal, zero spend, testable with a
+    canned ``modal volume ls`` stdout.
+    """
+    found: set[str] = set()
+    for raw in (listing or "").splitlines():
+        name = raw.strip().rstrip("/").split("/")[-1]
+        if name.endswith(".mp4"):
             found.add(name)
     return sorted(found)
