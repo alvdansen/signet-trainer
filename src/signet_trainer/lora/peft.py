@@ -337,7 +337,9 @@ def build_lora_config(
 # --------------------------------------------------------------------------------------------------
 
 
-def inject_lora(model: nn.Module, lora_config: LoraConfig) -> nn.Module:
+def inject_lora(
+    model: nn.Module, lora_config: LoraConfig, gradient_checkpointing: bool = True
+) -> nn.Module:
     """Enable gradient checkpointing, THEN wrap the model with ``get_peft_model``.
 
     Order is load-bearing (train.py:1814-1847): grad-checkpointing must be enabled on the BASE
@@ -349,15 +351,23 @@ def inject_lora(model: nn.Module, lora_config: LoraConfig) -> nn.Module:
     MiniMax-H3 diffusers module, which exposes neither of the other two (confirmed by the P10-1
     probe, ``scripts/_h3_probe_modal.py:360``). A silent no-op here is not cosmetic: without GC the
     H3 activation budget collapses and the run OOMs on the A100 (P10-1-MEASURED §4).
+
+    ``gradient_checkpointing`` (default ``True``, matching every shipped config's
+    ``training.gradient_checkpointing``) previously had ZERO effect — this function enabled GC
+    UNCONDITIONALLY regardless of what the config declared (#20: a Tier-1 knob the harness mode is
+    authorised to auto-select and log as the lever it pulled, that no code ever read). A run that
+    declared it off trained with it on anyway, at whatever VRAM ceiling GC was measured against,
+    and the DECISION-LOG recorded a lever that was never pulled.
     """
     # 1. Gradient checkpointing FIRST (prefer the ltx-core method, fall back to the HF method,
-    #    then the diffusers method used by H3).
-    if hasattr(model, "set_gradient_checkpointing"):
-        model.set_gradient_checkpointing(True)
-    elif hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    elif hasattr(model, "enable_gradient_checkpointing"):
-        model.enable_gradient_checkpointing()
+    #    then the diffusers method used by H3) — only when the config actually asked for it.
+    if gradient_checkpointing:
+        if hasattr(model, "set_gradient_checkpointing"):
+            model.set_gradient_checkpointing(True)
+        elif hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        elif hasattr(model, "enable_gradient_checkpointing"):
+            model.enable_gradient_checkpointing()
 
     # 2. THEN inject LoRA and switch to train mode.
     model = get_peft_model(model, lora_config)

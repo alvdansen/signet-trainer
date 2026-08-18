@@ -100,6 +100,9 @@ def _h3_payload(**over) -> dict:
             "character_reference_sizes": list(CHARACTER_REFS),
             "environment_reference_sizes": list(ENVIRONMENT_REFS),
         },
+        # #20 (checklist item 1): the render triple is now family-validated at load — the shared
+        # default frame_count=49 is an LTX clip length and is OUTSIDE the H3 renderable band.
+        "validation": {"frame_count": 124},
     }
     payload.update(over)
     return payload

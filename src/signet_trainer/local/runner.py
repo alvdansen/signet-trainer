@@ -301,7 +301,11 @@ def run(
             dropout=config.lora.dropout,
             targets=config.lora.target_modules or P1_FF_LORA_TARGETS,
         )
-        model = inject_lora(base_transformer, lora_config)
+        model = inject_lora(
+            base_transformer,
+            lora_config,
+            gradient_checkpointing=config.training.gradient_checkpointing,
+        )
     else:
         base_transformer = components.transformer
         if gate_adapter is None:

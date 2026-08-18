@@ -607,7 +607,13 @@ def check_training_step(
             alpha=getattr(getattr(config, "lora", None), "alpha", 64),
             targets=getattr(getattr(config, "lora", None), "target_modules", None) or P1_FF_LORA_TARGETS,
         )
-        model = inject_lora(transformer, lora_config)  # GC-before-get_peft_model (TRAIN-06)
+        model = inject_lora(
+            transformer,
+            lora_config,
+            gradient_checkpointing=getattr(
+                getattr(config, "training", None), "gradient_checkpointing", True
+            ),
+        )  # GC-before-get_peft_model (TRAIN-06)
 
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()

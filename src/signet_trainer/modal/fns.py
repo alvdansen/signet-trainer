@@ -553,7 +553,11 @@ def train(config_yaml: str) -> None:
             dropout=config.lora.dropout,
             targets=config.lora.target_modules or P1_FF_LORA_TARGETS,
         )
-        model = inject_lora(base_transformer, lora_config)
+        model = inject_lora(
+            base_transformer,
+            lora_config,
+            gradient_checkpointing=config.training.gradient_checkpointing,
+        )
     else:
         base_transformer = components.transformer  # Open-Q1 default (check #4 PASS).
         # (5) REUSE the gate's injected + roundtrip-proved adapter — no second injection.
@@ -4240,7 +4244,9 @@ def h3_train(config_yaml: str) -> None:
         dropout=config.lora.dropout,
         targets=config.resolved_lora_targets(),
     )
-    model = inject_lora(transformer, lora_config)
+    model = inject_lora(
+        transformer, lora_config, gradient_checkpointing=config.training.gradient_checkpointing
+    )
     del transformer
     trainable = [p for p in model.parameters() if p.requires_grad]
     print(
@@ -4782,7 +4788,9 @@ def h3_sample(config_yaml: str) -> None:
             "partition the workflow denoises against; injecting into anything else renders a "
             "base-only grid under an adapter label."
         )
-    adapted = inject_lora(base_transformer, lora_config)
+    adapted = inject_lora(
+        base_transformer, lora_config, gradient_checkpointing=config.training.gradient_checkpointing
+    )
     # load_adapter_into is FAIL-LOUD (empty file / unexpected keys / cold lora tensors all raise):
     # a checkpoint that does not FULLY apply refuses the render here, for the same reason the
     # component check above raises — anything less renders a base-only grid under an adapter label.
@@ -5994,7 +6002,9 @@ def qwen_edit_train(config_yaml: str) -> None:
         dropout=config.lora.dropout,
         targets=config.resolved_lora_targets(),
     )
-    model = inject_lora(transformer, lora_config)
+    model = inject_lora(
+        transformer, lora_config, gradient_checkpointing=config.training.gradient_checkpointing
+    )
     del transformer
     gc.collect()
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -6418,6 +6428,7 @@ def qwen_edit_sample(config_yaml: str) -> None:
             dropout=0.0,  # a render is not a training step; dropout would randomise the comparison
             targets=config.resolved_lora_targets(),
         ),
+        gradient_checkpointing=config.training.gradient_checkpointing,
     )
     del transformer
     adapted.eval()  # inject_lora leaves the model in train mode + grad checkpointing (TRAIN-06)

@@ -83,6 +83,10 @@ def _h3_payload(**over) -> dict:
             "character_reference_sizes": list(CHARACTER_REFS),
             "environment_reference_sizes": list(ENVIRONMENT_REFS),
         },
+        # #20 (checklist item 1): the render triple (validation.width/height/frame_count) is now
+        # family-validated at load — the shared default frame_count=49 is an LTX clip length and
+        # is OUTSIDE MiniMax-H3's renderable band, so an h3 payload must declare a legal one.
+        "validation": {"frame_count": 124},
     }
     payload.update(over)
     return payload

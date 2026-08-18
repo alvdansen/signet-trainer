@@ -63,6 +63,19 @@ from signet_trainer.conditioning.h3_geometry import (
     h3_packed_seq_len,
     h3_worst_case_packed_seq_len,
     max_packed_rows_for_budget,
+    resolve_canvas_size,
+)
+
+# Single home for H3's RENDER frame-count law (D-10-DEF-15) — a DIFFERENT law from the 17n+5
+# TRAINING bucket law above (satisfying one says nothing about the other). Re-export, do not
+# duplicate (#20 / #4). ``h3_pipeline_source`` is ALSO stdlib-confined by its own module
+# docstring ("tests/ must be able to drive this without importing modal.fns ... without
+# diffusers or torch"), so this import adds ZERO new third-party roots to the
+# ``config.validators`` closure either — same guarantee as the ``h3_geometry`` import above.
+from signet_trainer.inference.h3_pipeline_source import (
+    assert_h3_frame_count_is_renderable,
+    h3_aligned_num_frames,
+    h3_renderable_frame_bounds,
 )
 
 # Single home for the Qwen-Image-Edit-2511 arch math (family #3). Re-export, do not duplicate.
