@@ -3,13 +3,17 @@
 Config-first / D-NOHARDCODE (D-BK-1/2/5): the auto-backup surface is a documented, defaulted
 Pydantic block wired into SignetConfig default-off, so every existing YAML loads byte-identically.
 Its cross-field validator is SYMMETRIC across all three destinations (each rejects every stray
-field a mode wouldn't consume) and fail-fasts an enabled destination='cloud' block as
-not-yet-implemented AT CONFIG LOAD (never deep in a Modal function).
+field a mode wouldn't consume) and fail-fasts an ENABLED destination='local' OR 'cloud' block AT
+CONFIG LOAD (never deep in a Modal function) — 'local' because a Modal container's filesystem is
+not durable (issue #23 finding 1: backup_sync never commits a Volume for it), 'cloud' because it is
+not yet implemented.
 
 Asserts, CPU-only (no modal / torch / GPU import):
   * a backup-unaware SignetConfig loads with enabled=False, what='all', destination='hf', private=True;
   * enabled + hf + no repo_id raises; enabled + hf + stray path raises;
-  * enabled + local + path (repo_id=None) loads;
+  * enabled + local (otherwise clean) raises "not durable on Modal" (issue #23 finding 1);
+  * enabled + local + stray repo_id/cloud_secret_name raises (symmetric stray-field rejection);
+  * disabled + local loads clean (inert block, byte-identical to today);
   * what != 'final+intervals' + interval set raises;
   * a typo key inside the backup block raises (extra='forbid');
   * enabled + cloud (otherwise clean) raises "not yet implemented";
@@ -94,23 +98,49 @@ def test_enabled_hf_with_repo_id_loads():
     assert b.private is True
 
 
-# ---- (d) local validator: path required; symmetric stray repo_id rejected ----
+# ---- (d) local fail-fast: not durable on Modal (issue #23 finding 1), plus symmetric stray-field
+#          rejection and inert-when-disabled (byte-identical to today) ----
 
 
-def test_enabled_local_with_path_loads():
-    b = BackupConfig(enabled=True, destination="local", path="/backups/run1", repo_id=None)
-    assert b.destination == "local"
-    assert b.path == "/backups/run1"
+def test_enabled_local_clean_block_raises_not_durable_on_modal():
+    # issue #23 finding 1: destination='local' writes into the Modal container's own ephemeral
+    # filesystem and no code ever commits it to a Volume, so the copy would report success and then
+    # vanish. Fail fast at config load, mirroring the cloud precedent exactly, rather than let a
+    # non-durable "backup" run to a false "copied N dir(s)" success line.
+    with pytest.raises(ValidationError, match="not durable on Modal"):
+        BackupConfig(enabled=True, destination="local", path="/backups/run1")
 
 
-def test_enabled_local_without_path_raises():
-    with pytest.raises(ValidationError, match="requires backup.path"):
+def test_enabled_local_without_path_also_raises_not_durable():
+    # 'local' fails fast unconditionally when enabled — even with path=None, the "not durable"
+    # message fires (not a stray/missing-field message), because the destination itself is refused.
+    with pytest.raises(ValidationError, match="not durable on Modal"):
         BackupConfig(enabled=True, destination="local", path=None)
 
 
-def test_enabled_local_with_stray_repo_id_raises():
+def test_enabled_local_with_stray_repo_id_raises_symmetric():
     with pytest.raises(ValidationError, match="repo_id is set while destination='local'"):
         BackupConfig(enabled=True, destination="local", path="/backups", repo_id="owner/repo")
+
+
+def test_enabled_local_with_stray_cloud_secret_raises_symmetric():
+    with pytest.raises(ValidationError, match="cloud_secret_name is set while destination='local'"):
+        BackupConfig(enabled=True, destination="local", cloud_secret_name="my-cloud-secret")
+
+
+def test_disabled_local_loads_clean():
+    # Byte-identical-when-off contract (schema.py's enabled=False precedent): a disabled 'local'
+    # block — even one that carries a path, as an operator's pre-existing YAML might — must NOT
+    # raise. Only an ENABLED local block is refused.
+    b = BackupConfig(enabled=False, destination="local", path="/backups/run1")
+    assert b.enabled is False
+    assert b.destination == "local"
+    assert b.path == "/backups/run1"
+    cfg = SignetConfig.model_validate(
+        _minimal_payload({"enabled": False, "destination": "local", "path": "/backups/run1"})
+    )
+    assert cfg.backup.enabled is False
+    assert cfg.backup.destination == "local"
 
 
 # ---- (e) interval only valid with what='final+intervals' ----

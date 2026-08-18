@@ -46,6 +46,12 @@ from signet_trainer.modal.cost import format_cost_line, guardrail_check
 # the ``.spawn()`` CALL still lives strictly after the approval pause in main().
 from signet_trainer.modal import fns as _fns  # noqa: F401 — import side-effect registers app functions
 
+# Issue #33 finding 3: the THIRD Secret.from_name(...) in the app graph (fuse's gated-adapter token),
+# captured the SAME way as HUGGINGFACE_SECRET_NAME / WANDB_SECRET_NAME above — at fns.py's
+# MODULE-IMPORT time, from the SIGNET_HF_GATED_SECRET_NAME env var. Needed here so step 1b below can
+# cover it too (previously the one secret name with NO config field and NO guard coverage).
+from signet_trainer.modal.fns import HF_GATED_SECRET_NAME
+
 
 def _require_approval(approve: bool) -> bool:
     """Blocking explicit-approval gate (D-03 / MODL-02) — the single seam all metered runs pass.
@@ -68,6 +74,29 @@ def _require_approval(approve: bool) -> bool:
         return True
     print("[signet-entrypoint] approval: DECLINED (no 'approved'/--approve) — aborting, no dispatch.")
     return False
+
+
+def _detach_requested() -> bool:
+    """True if this launch carries ``--detach`` OR modal's documented short alias ``-d`` (issue #33
+    finding 2).
+
+    ``_watch_dispatch`` used to string-match ONLY ``"--detach" in sys.argv`` — missing modal's own
+    ``-d`` flag (``modal/cli/run.py``: ``@click.option("-d", "--detach", ...)``). A genuinely
+    detached run launched as ``modal run -d -m signet_trainer.modal.entrypoint ...`` then printed a
+    FALSE "--detach was NOT passed" warning at dispatch and, ``dispatch_watch_seconds`` later, told
+    the operator to "treat this run as LOST and re-launch with --detach" — inverting the honesty fix
+    (audit 2026-08-11) into a lie in exactly the case it exists to protect, and inviting a duplicate
+    metered re-dispatch of an already-healthy run.
+
+    Still an argv scan (KEPT deliberately — ``tests/test_dispatch_is_spawned.py`` asserts both
+    ``"sys.argv"`` and ``"--detach"`` appear in this file's source), just one that also accepts a
+    short flag CLUSTER carrying ``d`` (e.g. ``-d``), mirroring how getopt-style CLIs bundle single-
+    dash flags. A long option (``--anything``) never matches the cluster branch.
+    """
+    return any(
+        arg == "--detach" or (arg.startswith("-") and not arg.startswith("--") and "d" in arg[1:])
+        for arg in sys.argv
+    )
 
 
 def _watch_dispatch(fc: object, watch_seconds: float, label: str) -> None:
@@ -107,7 +136,8 @@ def _watch_dispatch(fc: object, watch_seconds: float, label: str) -> None:
         f"[signet-entrypoint]   python -c \"import modal; "
         f"print(modal.FunctionCall.from_id('{fc.object_id}').get(timeout=1800))\""
     )
-    if "--detach" not in sys.argv:
+    detached = _detach_requested()
+    if not detached:
         print(
             "[signet-entrypoint] WARNING: --detach was NOT passed. .spawn() makes the INPUT async so "
             "the server will not cancel it when this client dies, but a NON-detached ephemeral app "
@@ -119,7 +149,7 @@ def _watch_dispatch(fc: object, watch_seconds: float, label: str) -> None:
     try:
         fc.get(timeout=watch_seconds)
     except TimeoutError:
-        if "--detach" in sys.argv:
+        if detached:
             print(
                 f"[signet-entrypoint] {label} still RUNNING after {watch_seconds:g}s — this client "
                 f"is disengaging, the run is NOT cancelled (async dispatch). Track it via "
@@ -1157,6 +1187,7 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
     #      failure into a pre-approval abort.
     os.environ["SIGNET_HUGGINGFACE_SECRET_NAME"] = cfg.modal.huggingface_secret_name
     os.environ["SIGNET_WANDB_SECRET_NAME"] = cfg.modal.wandb_secret_name
+    os.environ["SIGNET_HF_GATED_SECRET_NAME"] = cfg.modal.hf_gated_secret_name
     os.environ["SIGNET_APP_NAME"] = cfg.modal.app_name
     os.environ["SIGNET_WEIGHTS_VOLUME_NAME"] = cfg.modal.weights_volume_name
     os.environ["SIGNET_DATASET_VOLUME_NAME"] = cfg.modal.dataset_volume_name
@@ -1171,6 +1202,12 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             cfg.modal.huggingface_secret_name,
         ),
         ("secret-name", "SIGNET_WANDB_SECRET_NAME", WANDB_SECRET_NAME, cfg.modal.wandb_secret_name),
+        (
+            "secret-name",
+            "SIGNET_HF_GATED_SECRET_NAME",
+            HF_GATED_SECRET_NAME,
+            cfg.modal.hf_gated_secret_name,
+        ),
         ("app-name", "SIGNET_APP_NAME", APP_NAME, cfg.modal.app_name),
         (
             "volume-name",
@@ -1206,7 +1243,25 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
                 f"pre-approval, no dispatch.{silent_note}"
             )
 
-    # (1c) H3 NO-REFERENCE (ALPHA) routing — pre-approval, zero-spend. No new mode and no new entry
+    # (1c) BK-01 master-gate pre-approval refusal (issue #33 finding 1) — pre-approval, zero-spend.
+    #      backup.enabled is the DOCUMENTED master gate for ALL backup activity (schema.py's
+    #      BackupConfig.enabled), but before this fix no dispatch-side code read it: --mode
+    #      backup/restore with the SHIPPED default (enabled=False, destination='hf', repo_id=None)
+    #      booted a metered CPU container that then crashed inside api.create_repo(repo_id=None) —
+    #      a burned gate on every no-op periodic sync. Refuse here, before the dry-run gate and the
+    #      cost print, so a disabled block costs $0: no container boots at all. backup_sync/restore
+    #      ALSO carry their own `if not backup.enabled: return` no-op as defense-in-depth, for the
+    #      (unlikely) case either fn is ever reached by a path that bypasses this gate.
+    if mode in ("backup", "restore") and not cfg.backup.enabled:
+        raise SystemExit(
+            f"[signet-entrypoint] --mode {mode} requires backup.enabled=True (the BK-01 master "
+            f"gate); the shipped default is enabled=False. Nothing dispatches — no CPU container "
+            f"boots, no cost is incurred. Set backup.enabled: true (and backup.destination / "
+            f"backup.repo_id) in the config, or use a different --mode. Aborting pre-approval, no "
+            f"dispatch."
+        )
+
+    # (1d) H3 NO-REFERENCE (ALPHA) routing — pre-approval, zero-spend. No new mode and no new entry
     #      point: no-reference rides --mode train/preprocess through THIS same gate. `sample` is
     #      REFUSED here (and again in-container, belt to this brace): h3_sample is transcribed for
     #      the reference-conditioned ref2va workflow only, and the t2va workflow a no-reference

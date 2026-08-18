@@ -34,6 +34,16 @@ modal:
   huggingface_secret_name: "some-other-account-hf-secret"
 """
 
+_HF_GATED_MISMATCH_CONFIG = """
+training_dims: [768, 352, 25]
+data:
+  preprocessed_data_root: "precomputed"
+training:
+  max_steps: 10
+modal:
+  hf_gated_secret_name: "some-other-account-gated-secret"
+"""
+
 
 class _RecordingCall:
     """Stand-in for the ``modal.FunctionCall`` ``.spawn()`` returns (D-10-DEF-17)."""
@@ -88,6 +98,25 @@ def test_secret_name_mismatch_aborts_before_dispatch(tmp_path, monkeypatch) -> N
         raw_main(config=_write_config(tmp_path, _MISMATCH_CONFIG), approve=True, mode="train")
 
     assert "secret-name mismatch" in str(exc.value)
+    assert rec.calls == [], "a secret-name mismatch must abort before any dispatch"
+
+
+def test_hf_gated_secret_name_mismatch_aborts_before_dispatch(tmp_path, monkeypatch) -> None:
+    # Issue #33 finding 3: hf_gated_secret_name was the ONE secret name with no config field and no
+    # step-1b coverage — app.py's app graph resolves it for EVERY mode's dispatch (not "--mode fuse
+    # only" as the README used to claim), so a mismatch must abort here exactly like the other two
+    # secret names, before dry-run/cost/approval/dispatch.
+    entrypoint, raw_main = _raw_main()
+    rec = _stub_train(monkeypatch)
+    monkeypatch.setattr(
+        entrypoint, "run_dryrun", lambda cfg: pytest.fail("reached dry-run — 1b guard did not fire")
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        raw_main(config=_write_config(tmp_path, _HF_GATED_MISMATCH_CONFIG), approve=True, mode="train")
+
+    assert "secret-name mismatch" in str(exc.value)
+    assert "SIGNET_HF_GATED_SECRET_NAME" in str(exc.value)
     assert rec.calls == [], "a secret-name mismatch must abort before any dispatch"
 
 

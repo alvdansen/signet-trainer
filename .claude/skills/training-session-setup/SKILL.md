@@ -438,14 +438,14 @@ without a re-emit. `[house]`
      mid-run step, not the final). `repo_id: owner/name` is required for `hf`. HF auth reuses the
      EXISTING `huggingface-secret` Modal secret (`modal.huggingface_secret_name`) — no token in the
      config, ever.
-   - **Wired alternative:** `destination: local` — mirror to a local directory (`path: <dir>`
-     required; `repo_id` omitted). Fully functional this phase.
-   - **NOT a working option this phase — disclose honestly:** `destination: cloud` is schema-ready
-     (the enum + a reserved `cloud_secret_name` seam exist for forward-compat) but **not yet
-     implemented**. Never present it as a choice: an enabled `destination: cloud` config **fails fast
-     at load** with a "not yet implemented — only 'hf' and 'local' are wired this phase" error
-     (`BackupConfig` validator), so a presumed cloud backup can never silently no-op into false
-     durability. Offer only `hf` and `local`.
+   - **NOT a working option this phase — disclose honestly:** `destination: local` and
+     `destination: cloud` are both schema-ready (the enum + a reserved `cloud_secret_name` seam for
+     `cloud` exist for forward-compat) but neither is durable/implemented here. Never present either
+     as a choice: an enabled `destination: local` config **fails fast at load** — `backup_sync` runs
+     in a Modal container with an EPHEMERAL filesystem, so a "local" copy is never committed to a
+     Volume and would report success and then vanish (issue #23 finding 1) — and an enabled
+     `destination: cloud` config fails fast as "not yet implemented" (`BackupConfig` validator).
+     `hf` is the only wired, durable destination this phase — offer only `hf`.
    - **Default OFF is honest too:** if the user declines backup, leave `enabled: false` — every
      existing YAML loads byte-identically and no backup runs.
    - **How it runs (off the metered GPU):** backup is a CPU-only Modal job driven by
