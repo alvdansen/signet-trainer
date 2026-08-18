@@ -23,6 +23,27 @@ Save format mirrors the source: ``checkpoint-step-{step:05d}-loss-{loss:.4f}/`` 
 ``training_state.pt`` (``{step, loss, optimizer/scheduler state, RNG}``). The Volume ``.commit()``
 after each save is the loop's responsibility (commit-or-vanish — train/loop.py).
 
+⚠ AUDIT #34 FIX (destroy-then-republish window): ``loop.py:431``'s unconditional tail save re-saves
+the SAME step at the SAME (unchanged) loss right after the last in-loop save, so ``final_name`` is
+byte-identical and the publish must overwrite an already-committed, durable checkpoint. The old
+``save()`` did ``rmtree(ckpt_dir)`` THEN ``os.rename(staging, ckpt_dir)`` — a crash in that window
+left NEITHER name present and the checkpoint was gone outright (reproduced to ``find_latest() ->
+None``). ``save()`` now swaps the dir ASIDE first (``.old-{final_name}``), renames staging IN, then
+deletes the aside copy — at every point in the sequence either the live name or the aside alias is
+on disk, never neither. Both renames target a path that does not yet exist, which is required on
+Windows/NTFS (``os.rename`` onto an existing dir always raises there; POSIX only tolerates it onto
+an EMPTY dir). ``_recover_stale_swaps`` self-heals a ``.old-`` alias orphaned by a crash mid-swap.
+
+⚠ ISSUE #30 FINDING 5 FIX (orphaned staging leak): the staging dir used to be named after the
+LOSS-suffixed ``final_name``, so a resumed retry of the same step landing on a different loss got a
+DIFFERENT staging name and the previous attempt's ``.tmp-`` dir — a full adapter + optimizer-state
+copy — was never touched again by ``find_latest``/``prune`` (both filter on ``_STEP_RE``, which a
+leading ``.`` never matches). Staging is now named by STEP ONLY, so a same-step retry reclaims its
+own dir, and ``_sweep_orphaned_staging`` additionally clears any ``.tmp-`` dir for a step at or
+before the one now being committed — the case a same-step retry does not cover, e.g. the crash was
+on the never-revisited tail save. A ``.tmp-`` dir is by construction an incomplete write, so
+deleting one is never a completed-checkpoint loss (CONTRIBUTING rule 6 governs FINAL dirs only).
+
 Import note: the HEAVY peft/safetensors CALLS (``set_peft_model_state_dict`` /
 ``safetensors.load_file``) are imported FUNCTION-LOCAL inside ``resume`` so the manager's
 save/find_latest/prune surface stays usable without invoking peft. ``ADAPTER_FILENAME`` is the
@@ -82,18 +103,24 @@ class CheckpointManager:
 
         ATOMIC (audit #3): the adapter + ``training_state.pt`` are written into a STAGING dir whose
         name (leading ``.``) never matches ``_STEP_RE`` — so ``_all_checkpoints()``/``find_latest``
-        ignore it while it is being written — then ``os.rename``-d onto the final regex-matching name.
-        A directory ``os.rename`` is atomic on one filesystem (the Volume mount), so the final
-        ``checkpoint-step-*`` name only ever appears fully-written. A container killed mid-``save``
-        can therefore never publish a name-valid-but-half-written dir that poisons resume()/sample().
+        ignore it while it is being written — then swapped onto the final regex-matching name via
+        ``os.rename``. A container killed mid-write can therefore never publish a name-valid-but-
+        half-written dir that poisons resume()/sample(). The PUBLISH swap itself is audit #34's fix
+        (see the module docstring): never a destroy-then-republish window, always aside-then-in.
         """
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._recover_stale_swaps()  # heal a prior crash's `.old-` alias before touching anything
+        self._sweep_orphaned_staging(step)  # issue #30 f5 — drop already-superseded `.tmp-` dirs
+
         final_name = f"{CHECKPOINT_PREFIX}{step:05d}-loss-{loss:.4f}"
         ckpt_dir = self.output_dir / final_name
         # Leading '.' => never matches ^checkpoint-step- (invisible to _all_checkpoints/find_latest).
-        staging = self.output_dir / f".tmp-{final_name}"
+        # STEP-scoped only (no loss suffix) — a same-step retry at a different loss reclaims this
+        # exact name instead of orphaning the previous attempt's staging dir (issue #30 f5).
+        staging = self.output_dir / f".tmp-{CHECKPOINT_PREFIX}{step:05d}"
+        old_aside = self.output_dir / f".old-{final_name}"
 
-        # Clear any leftover staging dir from a prior crashed save before writing.
+        # Clear any leftover staging dir from a prior crashed save of this same step before writing.
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir(parents=True, exist_ok=True)
@@ -113,12 +140,19 @@ class CheckpointManager:
         }
         torch.save(state, staging / TRAINING_STATE_FILENAME)
 
-        # Atomic publish: the final regex-matching name appears only once fully written.
-        # If a stale final dir exists (e.g. a re-save of the same step), clear it first —
-        # os.rename onto a non-empty dir fails on some platforms.
-        if ckpt_dir.exists():
-            shutil.rmtree(ckpt_dir, ignore_errors=True)
+        # Publish swap (audit #34): aside -> in -> delete-aside. Never rmtree a durable dir before
+        # its replacement exists on disk — that destroy-then-republish window is what could lose an
+        # already-committed checkpoint outright on a re-save of the same step+loss (the guaranteed
+        # unconditional tail save, loop.py:431). Both renames target a path that does not yet exist
+        # (required on Windows/NTFS; POSIX only tolerates rename onto an EMPTY dir).
+        had_prior = ckpt_dir.exists()
+        if had_prior:
+            if old_aside.exists():
+                shutil.rmtree(old_aside, ignore_errors=True)
+            os.rename(ckpt_dir, old_aside)
         os.rename(staging, ckpt_dir)
+        if had_prior:
+            shutil.rmtree(old_aside, ignore_errors=True)
 
         # Prune AFTER the rename so it only ever sees completed dirs.
         if self.keep_n is not None:
@@ -126,6 +160,52 @@ class CheckpointManager:
 
         logger.info("Saved checkpoint: %s", ckpt_dir.name)
         return ckpt_dir
+
+    def _recover_stale_swaps(self) -> None:
+        """Self-heal a ``.old-`` alias left by a crash inside the publish swap (audit #34).
+
+        The swap is aside -> in -> delete-aside; a crash between the first and third step leaves
+        the previously-committed checkpoint sitting under its ``.old-`` alias instead of its
+        regex-matching name — data-safe (the rmtree-then-rename it replaces could lose the
+        checkpoint outright) but invisible to ``_all_checkpoints``/``find_latest`` until repaired.
+        Runs at the top of ``save()`` and ``_all_checkpoints()`` so both a fresh save and a bare
+        ``find_latest()``/``resume()`` call — with no further save in between — recover it.
+        """
+        if not self.output_dir.exists():
+            return
+        for stale in self.output_dir.glob(".old-*"):
+            if not stale.is_dir():
+                continue
+            restored = self.output_dir / stale.name[len(".old-") :]
+            if restored.exists():
+                # The publish's final rename already succeeded — this alias is a duplicate left by
+                # a crash landing AFTER that rename but before the aside cleanup; the fresh copy
+                # already under `restored` wins.
+                shutil.rmtree(stale, ignore_errors=True)
+            else:
+                # The publish never reached its final rename — this alias IS the only copy.
+                os.rename(stale, restored)
+
+    def _sweep_orphaned_staging(self, current_step: int) -> None:
+        """Delete ``.tmp-`` staging dirs for steps already superseded by ``current_step`` (#30 f5).
+
+        A ``.tmp-`` dir is by construction an incomplete write, so removing one for a step at or
+        before the one now being committed is never a completed-checkpoint loss (CONTRIBUTING
+        rule 6 governs FINAL dirs, not staging). The step-scoped staging name already lets a
+        same-step retry reclaim its own dir inline in ``save()``; this sweep catches the remaining
+        case — a step that crashes mid-save and is never revisited (e.g. the crash landed on the
+        unconditional tail save and training already ended) — which the old loss-suffixed staging
+        name left permanently orphaned on every crash-and-resume cycle.
+        """
+        if not self.output_dir.exists():
+            return
+        tmp_re = re.compile(rf"^\.tmp-{re.escape(CHECKPOINT_PREFIX)}(\d+)$")
+        for stale in self.output_dir.glob(f".tmp-{CHECKPOINT_PREFIX}*"):
+            if not stale.is_dir():
+                continue
+            match = tmp_re.match(stale.name)
+            if match is not None and int(match.group(1)) <= current_step:
+                shutil.rmtree(stale, ignore_errors=True)
 
     # ----------------------------------------------------------------------------------------------
     # find_latest / prune
@@ -135,6 +215,7 @@ class CheckpointManager:
         """All checkpoint dirs sorted by step ascending (the highest step is last)."""
         if not self.output_dir.exists():
             return []
+        self._recover_stale_swaps()  # a bare find_latest()/resume() must see a healed swap too
 
         def _step_of(path: Path) -> int:
             match = _STEP_RE.match(path.name)
