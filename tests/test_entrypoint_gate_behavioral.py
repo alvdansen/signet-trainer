@@ -128,7 +128,9 @@ def test_fuse_cost_print_names_the_128gib_reservation(tmp_path, monkeypatch, cap
     from signet_trainer.modal import fns
 
     entrypoint, raw_main = _raw_main()
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    # issue #45: main() now threads the dispatch mode through (`run_dryrun(cfg, mode=mode)`, gap-
+    # dryrun-ltx-0) so the mode-conditional refusals fire pre-approval — the stub must accept it.
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _RecordingFn()
     monkeypatch.setattr(fns, "fuse", rec)
 
