@@ -938,8 +938,13 @@ def test_an_environment_bearing_sample_packs_exactly_two_reference_blocks() -> N
         assert not batch.video_loss_mask[0, : batch.n_cond_video].any()
 
 
-def test_a_three_block_reference_set_is_unreachable_through_the_selection_helpers() -> None:
-    """The 3-slot case the packed budget never priced cannot be produced, environment or not."""
+def test_the_default_two_slot_regime_never_yields_three_blocks() -> None:
+    """At the DEFAULT slot count, selection yields 2 blocks, environment or not.
+
+    Was ``test_a_three_block_reference_set_is_unreachable_through_the_selection_helpers``. The
+    3-slot case is no longer unreachable — it is reachable only by asking for it explicitly via
+    ``references_per_sample=3`` (see the identity test below). This test pins the DEFAULT.
+    """
     from signet_trainer.conditioning.h3_ref import H3Reference, resolve_reference_slots
 
     characters = [
@@ -955,6 +960,61 @@ def test_a_three_block_reference_set_is_unreachable_through_the_selection_helper
         for i in range(88)
     }
     assert counts == {2}
+
+
+def test_three_of_three_selection_is_the_identity_permutation() -> None:
+    """At references_per_sample=3 over a 3-reference pool, selection cannot rotate.
+
+    combinations(range(3), 3) enumerates a SINGLE tuple, so every segment gets the same three
+    references in manifest order. This is what makes 3 safe for explicit-manifest sequence tasks:
+    order is load-bearing (opening / middle / closing) and the captions name the beats by index,
+    so a rotation would contradict text that is baked into the conditioning at PHASE A.
+    """
+    from signet_trainer.conditioning.h3_ref import H3Reference, resolve_reference_slots
+
+    refs = [
+        H3Reference(path=f"control_{tag}/clip.png", kind="prop", subject_id=f"clip__{tag}",
+                    width=1344, height=768)
+        for tag in ("first", "mid", "last")
+    ]
+    expected = ["clip__first", "clip__mid", "clip__last"]
+    for segment in range(64):
+        slots = resolve_reference_slots(segment, refs, None, references_per_sample=3)
+        assert [s.subject_id for s in slots] == expected, segment
+
+
+def test_at_most_one_environment_reference_even_at_three_slots() -> None:
+    """The environment cap is a property of SUBSTITUTION, not of the slot count.
+
+    Regression guard (house audit, PR #51, MAJOR-2): the cap used to be computed as
+    ``references_per_sample - 1``, which happened to equal 1 only while the count was pinned at 2.
+    At 3 it admitted a SECOND environment reference that the call site then dropped silently,
+    because only ``environments[0]`` is ever passed through to ``resolve_reference_slots``.
+
+    ``resolve_reference_slots`` itself has NO environment-cap logic — it just takes the single
+    ``environment_reference`` argument it is handed. The hardened cap lives one layer up, in
+    ``H3RefStrategy._resolve_slots`` (``h3_ref.py:854``), which is what must be driven here. A
+    version of this test that only calls the free function (as the original did) is vacuous: it
+    cannot fail even if the cap in ``_resolve_slots`` is reverted, because it never reaches that
+    line. Mutation-checked: reverting line 854 to ``references_per_sample - 1`` makes this test
+    fail.
+    """
+    from signet_trainer.conditioning.h3_ref import H3Reference, H3RefStrategy
+
+    strategy = H3RefStrategy(references_per_sample=3)
+    characters = [
+        H3Reference(path=f"refs/char_{s}.png", kind="character", subject_id=s,
+                    width=1024, height=1536)
+        for s in ("A", "B", "C")
+    ]
+    environments = [
+        H3Reference(path=f"refs/env{i}.png", kind="environment", subject_id=f"env{i}",
+                    width=1344, height=768)
+        for i in range(2)
+    ]
+    pool = [(ref, torch.zeros(1, 1, 1)) for ref in (*characters, *environments)]
+    with pytest.raises(ValueError, match="environment reference"):
+        strategy._resolve_slots(0, pool)
 
 
 # --------------------------------------------------------------------------------------------------

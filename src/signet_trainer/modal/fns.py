@@ -2480,6 +2480,14 @@ import os as _os  # noqa: E402  (module-tail import: keeps the Phase-1 header bl
 HF_GATED_SECRET_NAME = _os.environ.get("SIGNET_HF_GATED_SECRET_NAME", "hf-gated-secret")
 hf_gated_secret = modal.Secret.from_name(HF_GATED_SECRET_NAME)
 
+# H3-04 audit follow-up (house audit, PR #51, HIGH): `h3_sample`'s GPU is a LITERAL below, and a
+# 3-reference render leg is a known Qwen3-VL text-encode OOM on an A100 — the first 3-ref campaign
+# to reach `--mode sample` would burn a metered container discovering this. Same env-override seam
+# as the secret names above (`@app.function` binds `gpu=` at IMPORT time, so this must be read here,
+# not inside the function body): export BEFORE `modal run` to move the render leg to an H200 without
+# a code edit. Default is byte-identical to today — this changes nothing until the env var is set.
+H3_SAMPLE_GPU = _os.environ.get("SIGNET_H3_SAMPLE_GPU", "A100-80GB")
+
 # Fuse timeout: the prior project's fuse ran well under an hour on big-RAM CPU; 4h is a generous ceiling
 # (never 24h — a hung 44GB rewrite should die, not idle a paid container).
 FOUR_HOURS = 4 * 60 * 60
@@ -3266,12 +3274,19 @@ def _h3_resolve_references(
       * ``character_references`` (a pool) + optional ``environment_reference`` — the D-10-PAIRSEED
         round robin. The rotation is a pure function of ``reference_pair_seed`` and the row index,
         so which refs a sample gets is reproducible and debuggable across runs. Here the manifest
-        KEY supplies ``kind``, so an entry need only carry ``path`` + ``subject_id``.
+        KEY supplies ``kind``, so an entry need only carry ``path`` + ``subject_id``. This branch is
+        refused outright at ``references_per_sample >= 3`` — 3+ slots are EXPLICIT-MANIFEST ONLY
+        (every row names its own ``reference_paths``), because a pool at 3 slots either makes
+        conditioning constant across the corpus or lets the round robin wrap a pool entry into more
+        than one slot of the same sample.
 
     ⛔ D-10-REFORDER + the operator ruling: an environment reference **SUBSTITUTES** for the last
-    character slot — the character count is reduced by one — it is **never appended**. Three
-    references per sample was never priced by the packed-sequence VRAM budget, and rotating pairs
-    are what make identity the INVARIANT rather than letting the model copy a constant reference.
+    character slot — the character count is reduced by one — it is **never appended**. Rotating
+    pairs are what make identity the INVARIANT rather than letting the model copy a constant
+    reference; three explicit-manifest references per sample IS now priced by the packed-sequence
+    VRAM budget (``h3_packed_seq_len`` at short_edge 768 — see ``schema.py``'s
+    ``references_per_sample`` field), but the ROTATING-POOL branch above stays capped at 2 for the
+    reason just given.
 
     Returns:
         One DESCRIPTOR per slot, in D-10-REFORDER order::
@@ -3303,12 +3318,38 @@ def _h3_resolve_references(
                 "'character_references' (a pool for the seeded round robin), optionally plus "
                 "'environment_reference'. Refusing to encode a reference-less ref2v sample."
             )
+        # ⛔ MAJOR-1 (house audit, PR #51): the config-level widening to 3 slots is safe ONLY
+        # because it is reachable exclusively through the explicit 'reference_paths' branch above —
+        # every row supplying its own ordered manifest list, so conditioning varies per sample by
+        # construction. A 'character_references' POOL at 3 slots is the opposite: either the pool
+        # holds exactly 3 entries and every sample gets the SAME three references (conditioning
+        # CONSTANT across the corpus — the exact copy-collapse regime the 2-slot cap existed to
+        # prevent), or it holds fewer and the round-robin below wraps a pool entry into more than
+        # one slot of the SAME sample, silently duplicating a reference. Refusing here is what makes
+        # "the pool branch is unreachable at 3" code rather than prose.
+        if references_per_sample >= 3:
+            raise ValueError(
+                f"[h3_preprocess] manifest row {index} names a 'character_references' pool at "
+                f"references_per_sample={references_per_sample}: 3+ reference slots are "
+                "EXPLICIT-MANIFEST ONLY — every row must supply its own 'reference_paths' list "
+                "naming the sequence in order. A pool feeding the seeded round robin at 3 slots "
+                "either makes conditioning constant across the corpus or duplicates a reference via "
+                "modulo wraparound; neither is what a 3-slot campaign is priced for."
+            )
         environment = row.get("environment_reference")
         n_character = references_per_sample - (1 if environment else 0)
         if n_character < 1:
             raise ValueError(
                 f"[h3_preprocess] references_per_sample={references_per_sample} leaves no character "
                 f"slot once the environment reference substitutes for the last one (row {index})."
+            )
+        if n_character > len(pool):
+            raise ValueError(
+                f"[h3_preprocess] manifest row {index} needs {n_character} character reference(s) "
+                f"per sample but 'character_references' holds only {len(pool)}. The round-robin's "
+                "modulo wraparound would otherwise reuse a pool entry WITHIN the same sample "
+                f"(references_per_sample={references_per_sample}), silently duplicating a reference "
+                "slot instead of refusing. Add more pool entries or lower references_per_sample."
             )
         start = (reference_pair_seed + index) % len(pool)
         picks = [pool[(start + offset) % len(pool)] for offset in range(n_character)]
@@ -4533,7 +4574,10 @@ def _h3_fixed_delta_batch(config: Any, dataset: Any, strategy: Any, device: Any,
     # is now a safe change, but it is a COST decision (it multiplies the worst-case spend by
     # max_retries) and is left to the operator rather than taken here. The entrypoint applies the
     # config-derived timeout.
-    gpu="A100-80GB",
+    #
+    # gpu: SIGNET_H3_SAMPLE_GPU-overridable (default unchanged, "A100-80GB") — a 3-reference render
+    # leg is a known Qwen3-VL text-encode OOM here; see H3_SAMPLE_GPU above.
+    gpu=H3_SAMPLE_GPU,
     image=h3_gpu_image,
     volumes={**WEIGHTS_MOUNT, **DATASET_MOUNT, **CHECKPOINTS_MOUNT},
     # ⛔ HF_HUB_OFFLINE — the STRUCTURAL half of the D-10-DEF-14 egress guard, and it has to be set

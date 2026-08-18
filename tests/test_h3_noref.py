@@ -177,10 +177,10 @@ def test_schema_accepts_zero_references_per_sample() -> None:
 
 
 def test_schema_still_defaults_to_two_and_rejects_the_rest() -> None:
-    """Default 2 unchanged; the union {0, 1, 2} is LIVE (#6 merged 2026-08-11), 3/-1 still die
-    on the substitution rule."""
+    """Default 2 unchanged; the union is now {0, 1, 2, 3} (3 added 2026-08-16 for
+    explicit-manifest sequence tasks), 4/-1 still die on the substitution rule."""
     assert H3Config().references_per_sample == 2
-    for bad in (3, -1):
+    for bad in (4, -1):
         with pytest.raises(ValidationError) as exc:
             H3Config(references_per_sample=bad)
         msg = str(exc.value)
@@ -189,14 +189,15 @@ def test_schema_still_defaults_to_two_and_rejects_the_rest() -> None:
 
 
 def test_the_refusal_names_the_full_union() -> None:
-    """The refusal documents all three legal counts: 0 = no-reference (ALPHA), 1 = single-control
-    (#6, merged), 2 = Ref2VA — the one-token union, now live."""
+    """The refusal documents every legal count: 0 = no-reference (ALPHA), 1 = single-control
+    (#6, merged), 2 = Ref2VA, 3 = explicit-manifest sequence tasks."""
     with pytest.raises(ValidationError) as exc:
-        H3Config(references_per_sample=3)
+        H3Config(references_per_sample=4)
     msg = str(exc.value)
     assert "0" in msg and "ALPHA" in msg
     assert "single-control" in msg
     assert "Ref2VA" in msg
+    assert "explicit-manifest" in msg
 
 
 def test_the_field_description_carries_the_alpha_marking() -> None:

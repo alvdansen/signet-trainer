@@ -409,6 +409,68 @@ def test_budget_gate_delegates_to_the_shared_worst_pair_validator() -> None:
     assert "validate_h3_reference_budget" in source
 
 
+# ======================================================================================
+# Task 3 (house audit, PR #51) — the 3-reference explicit-manifest budget pin
+# ======================================================================================
+
+#: Three IDENTICAL 1344x768 references — the explicit-manifest shape (every row supplies its OWN
+#: ``reference_paths``, so there is no rotation domain and ``h3_worst_case_packed_seq_len`` enumerates
+#: exactly one combination, C(3,3)=1). ``prompt_tokens_estimate=200`` matches the PRICING TABLE the
+#: house audit verified reproduces exactly against this repo's own functions — see the comment beside
+#: ``H3Config.references_per_sample`` in ``schema.py`` (the field's own nominal default of 96 prices
+#: the same shape at 13,298, not 13,402).
+_THREE_REF_SIZES = [(1344, 768, "r0"), (1344, 768, "r1"), (1344, 768, "r2")]
+
+
+def _h3_three_ref_payload(short_edge: int, **over) -> dict:
+    payload = {
+        "training_dims": [1344, 768, 22],
+        "data": {
+            "preprocessed_data_root": "/data/h3_preprocessed",
+            "batch_size": 1,
+            "resolution_buckets": ["1344x768x22"],
+        },
+        "model": {"family": "h3"},
+        "training": {"max_steps": 100},
+        "h3": {
+            "references_per_sample": 3,
+            "character_reference_sizes": list(_THREE_REF_SIZES),
+            "prompt_tokens_estimate": 200,
+            "reference_image_short_edge": short_edge,
+        },
+    }
+    payload.update(over)
+    return payload
+
+
+def test_three_reference_config_loads_at_short_edge_768() -> None:
+    """PIN: a 3-reference explicit-manifest config at short_edge 768 prices at 13,402 packed rows
+    (prompt_tokens=200) against a computed ceiling of 13,777 — under, so config LOAD must succeed.
+    Mirrors the 2-slot precedent (``test_budget_accepts_the_worst_pair_at_the_phase10_short_edge``).
+    """
+    layout = h3_packed_seq_len(22, (16, 9), _THREE_REF_SIZES, 200, 768)
+    assert layout.total == 13402
+    assert layout.total < CEILING_ROWS
+
+    cfg = SignetConfig(**_h3_three_ref_payload(768))
+    assert cfg.h3.references_per_sample == 3
+    assert cfg.h3.reference_image_short_edge == 768
+
+
+def test_three_reference_config_refused_at_short_edge_896() -> None:
+    """Same 3-reference corpus at short_edge 896 prices at 15,586 rows — OVER the ceiling, so it
+    must be refused at config LOAD (not merely at the separate dry-run gate): the mismatch between
+    ``references_per_sample``'s allowlist and the packed-sequence budget is exactly what a 3-slot
+    campaign that skips straight to ``--mode sample`` would otherwise discover on a metered A100.
+    """
+    layout = h3_packed_seq_len(22, (16, 9), _THREE_REF_SIZES, 200, 896)
+    assert layout.total == 15586
+    assert layout.total > CEILING_ROWS
+
+    with pytest.raises(ValueError, match="exceeds the declared ceiling"):
+        SignetConfig(**_h3_three_ref_payload(896))
+
+
 # --------------------------------------------------------------------------------------------------
 # LTX regression controls — the LTX dry-run path must be untouched.
 # --------------------------------------------------------------------------------------------------

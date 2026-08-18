@@ -183,13 +183,24 @@ def test_no_arch_smoke_only_mode_switch_in_the_config_block() -> None:
     assert "arch_smoke_only" not in H3Config.model_fields
 
 
-def test_references_per_sample_is_pinned_at_two() -> None:
-    """The exactly-2-slot rule: the environment ref SUBSTITUTES for the second character slot."""
+def test_references_per_sample_accepts_three_for_explicit_manifest_tasks() -> None:
+    """3 is permitted for sequence tasks whose rows name their own ``reference_paths``.
+
+    Was ``test_references_per_sample_is_pinned_at_two``. The pin was lifted deliberately: the
+    refusal rested on the POOL/rotation branch, which a row carrying ``reference_paths`` never
+    enters, and on three slots being unpriced, which they no longer are (13,402 packed rows at
+    short_edge 768 against a computed 13,777 ceiling).
+    """
+    assert H3Config(references_per_sample=3).references_per_sample == 3
+
+
+def test_references_per_sample_still_refuses_four() -> None:
+    """The bound moved; it did not disappear. 4 slots are unpriced at any usable reference size."""
     with pytest.raises(ValidationError) as exc:
-        H3Config(references_per_sample=3)
+        H3Config(references_per_sample=4)
     msg = str(exc.value)
-    assert "2" in msg
-    assert "substitut" in msg.lower(), "the refusal must name the substitution rule, not just a bound"
+    assert "substitut" in msg.lower(), "the refusal must still name the substitution rule"
+    assert "priced" in msg.lower(), "the refusal must still name the budget as the binding reason"
 
 
 def test_reference_short_edge_must_be_a_multiple_of_32() -> None:
@@ -518,13 +529,18 @@ def test_a_single_control_task_may_declare_one_reference_slot() -> None:
     assert H3Config(references_per_sample=2).references_per_sample == 2
 
 
-def test_three_reference_slots_are_still_refused_and_the_refusal_says_why() -> None:
-    """The bound that carries real weight: three slots were never priced by the row budget."""
+def test_four_reference_slots_are_refused_and_the_refusal_says_why() -> None:
+    """SUPERSEDED premise (this test once refused 3, as ``..._three_reference_slots_...``).
+
+    3 is now permitted for explicit-manifest sequence tasks: the refusal rested on the POOL /
+    rotation branch, which a row carrying ``reference_paths`` never enters, and on three slots
+    being unpriced, which they no longer are. The bound moved to 4 and still carries weight —
+    4 slots are unpriced at any usable reference size.
+    """
     with pytest.raises(ValidationError) as excinfo:
-        H3Config(references_per_sample=3)
+        H3Config(references_per_sample=4)
     message = str(excinfo.value)
-    # An environment ref SUBSTITUTES for the second character slot rather than being appended,
-    # so a 3-reference case does not exist to be priced in the first place.
+    # An environment ref SUBSTITUTES for the last character slot rather than being appended.
     assert "SUBSTITUTES" in message
     assert "OOM" in message
 
@@ -532,7 +548,7 @@ def test_three_reference_slots_are_still_refused_and_the_refusal_says_why() -> N
 def test_zero_reference_slots_are_alpha_no_reference() -> None:
     """SUPERSEDED premise (this test once refused 0): 0 is now NO-REFERENCE training (ALPHA,
     2026-08-11) — text-only is a supported workflow on the same packing, with the ref-only
-    fields reverse-guarded. The bound that still carries weight is 3 (never priced)."""
+    fields reverse-guarded. The bound that still carries weight is 4 (never priced)."""
     assert H3Config(references_per_sample=0).references_per_sample == 0
     with pytest.raises(ValidationError):
-        H3Config(references_per_sample=3)
+        H3Config(references_per_sample=4)
