@@ -88,7 +88,7 @@ def _stub_train(monkeypatch) -> _RecordingFn:
 
 def test_declined_approval_raises_and_dispatches_nothing(tmp_path, monkeypatch) -> None:
     entrypoint, raw_main = _raw_main()
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)  # skip the heavy dry-run gate
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)  # skip the heavy gate
     monkeypatch.setattr(builtins, "input", lambda *a, **k: (_ for _ in ()).throw(EOFError()))
     rec = _stub_train(monkeypatch)
 
@@ -100,7 +100,7 @@ def test_declined_approval_raises_and_dispatches_nothing(tmp_path, monkeypatch) 
 
 def test_approved_run_dispatches_exactly_once(tmp_path, monkeypatch) -> None:
     entrypoint, raw_main = _raw_main()
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _stub_train(monkeypatch)
     # main() now books the dispatch into the cumulative session-spend ledger (D-8-YOLOCAP, issue
     # #37 finding 1/6) via entrypoint.append_spend — neutralize it here so this test (which is

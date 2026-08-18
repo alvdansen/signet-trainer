@@ -427,6 +427,11 @@ def _load_inpaint_cfg(training_dims=None):
 
     cfg = load_config(VALID_YAML)
     update = {"conditioning": cfg.conditioning.model_copy(update={"mode": "inpaint"})}
+    # model_copy skips the schema's inpaint cross-field checks, so mirror what a REAL loaded
+    # inpaint config carries: %64 buckets (validate_inpaint_resolution_buckets fires at load).
+    # The dry-run gate now builds + asserts at EVERY bucket (gap-dryrun-ltx-1), so the example's
+    # default %32-only buckets would be a fixture artifact, not a gate defect.
+    update["data"] = cfg.data.model_copy(update={"resolution_buckets": ["768x512x49"]})
     if training_dims is not None:
         update["training_dims"] = training_dims
     return cfg.model_copy(update=update)

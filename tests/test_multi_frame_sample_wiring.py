@@ -100,22 +100,29 @@ def test_train_fails_fast_on_sample_only_conditioning_items() -> None:
     Training is self-conditioning (D-6-CONDSOURCE 'self'): MultiFrameStrategy samples its own
     keyframe positions/strengths, so keyframe items in a TRAIN config would be silently ignored —
     the silently-ignored-config-block class the schema field-split doctrine forbids. The guard
-    must raise before any model load / GPU spend.
+    must raise before any model load / GPU spend. Since gap-dryrun-ltx-0 the predicate lives in
+    ONE CPU-pure home (config/mode_gate.py) shared with the free gates — the container calls the
+    shared validator instead of carrying its own copy.
     """
     code = _strip_comments_and_docstrings(_FNS.read_text(encoding="utf-8"))
 
     assert re.search(
-        r'if\s+config\.conditioning\.mode\s*==\s*["\']multi_frame["\']\s+and\s+'
-        r"config\.conditioning\.conditioning_items\s*:",
+        r'validate_mode_config\(\s*config\s*,\s*["\']train["\']\s*\)',
         code,
-    ), "train() must guard multi_frame + non-empty conditioning_items (WR-04 fail-fast)"
-    assert "sample-only" in code, (
-        "the WR-04 guard must explain that conditioning_items are sample-only in Phase 6"
-    )
+    ), "train() must call the shared mode gate (WR-04 fail-fast, one home: config/mode_gate.py)"
     # The guard must fire BEFORE the component load (no GPU spend on a doomed config).
-    guard_idx = code.index("sample-only")
+    guard_idx = code.index('validate_mode_config(config, "train")')
     load_idx = code.index("load_ltxv_components(")
     assert guard_idx < load_idx, "the WR-04 guard must precede load_ltxv_components in train()"
+
+    # The predicate + rationale live in the ONE shared home, not in a private fns.py copy.
+    gate_src = (_FNS.parents[1] / "config" / "mode_gate.py").read_text(encoding="utf-8")
+    assert re.search(
+        r'cfg\.conditioning\.mode\s*==\s*["\']multi_frame["\']', gate_src
+    ), "mode_gate.py must carry the multi_frame predicate (one home)"
+    assert "sample-only" in gate_src, (
+        "the WR-04 guard must explain that conditioning_items are sample-only in Phase 6"
+    )
 
 
 def test_column_plan_yields_ordered_sc3_columns() -> None:

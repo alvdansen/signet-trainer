@@ -418,23 +418,17 @@ def train(config_yaml: str) -> None:
     )
     from signet_trainer.train.validate_gate import run_validation_gate  # noqa: PLC0415
 
+    from signet_trainer.config.mode_gate import validate_mode_config  # noqa: PLC0415
+
     # ── (2) load + revalidate the config in-container (entrypoint passes only the PATH) ─────────
     config = load_config_from_text(config_yaml)
 
-    # Fail-fast (WR-04): conditioning_items are SAMPLE-grid-only in Phase 6 — training is
-    # self-conditioning (D-6-CONDSOURCE 'self': MultiFrameStrategy samples its own keyframe
-    # positions/strengths from the clip). A training config carrying items (e.g. the multi-frame
-    # SAMPLE example passed to train by mistake) would have them silently ignored — the exact
-    # silently-ignored-config-block class the schema's field-split doctrine forbids. Raise BEFORE
-    # any model load / GPU spend.
-    if config.conditioning.mode == "multi_frame" and config.conditioning.conditioning_items:
-        raise RuntimeError(
-            "[train] conditioning_items are sample-only in Phase 6 (conditioning_source='self': "
-            "MultiFrameStrategy samples keyframes from the clip itself); training would silently "
-            "ignore them. Remove conditioning_items from the training config (see "
-            "configs/ltx23_multi_frame_overfit.example.yaml) — keyframe items belong in the "
-            "sample config only."
-        )
+    # Fail-fast (WR-04): the mode-conditional refusals live in ONE CPU-pure home shared with the
+    # free gates (config/mode_gate.py — audit gap-dryrun-ltx-0): a train config carrying
+    # sample-only multi_frame conditioning_items is refused there. The dry-run gate + entrypoint
+    # now run the SAME check pre-dispatch, so reaching this raise means the free gate was
+    # bypassed — kept in-container as defence in depth, BEFORE any model load / GPU spend.
+    validate_mode_config(config, "train")
 
     device = "cuda"
     checkpoint_path = str(WEIGHTS_DIR / config.model.model_id)
@@ -988,6 +982,7 @@ def sample(config_yaml: str) -> None:
     from ltx_trainer.video_utils import save_video  # noqa: PLC0415
 
     from signet_trainer.config.load import load_config_from_text  # noqa: PLC0415
+    from signet_trainer.config.mode_gate import validate_mode_config  # noqa: PLC0415
     from signet_trainer.inference.grid import slug, write_comparison_gallery  # noqa: PLC0415
     from signet_trainer.inference.lora_load import (  # noqa: PLC0415
         ADAPTER_FILENAME,
@@ -998,6 +993,10 @@ def sample(config_yaml: str) -> None:
 
     # ── (2) load + revalidate the config in-container (entrypoint passes the YAML TEXT by value) ─
     config = load_config_from_text(config_yaml)
+    # WR-04 mirror (shared home, config/mode_gate.py — audit gap-dryrun-ltx-0): a multi_frame
+    # render with NO keyframe items has nothing to condition on. Refused by the free gates
+    # pre-dispatch; re-asserted here in-container, same defence-in-depth posture as train().
+    validate_mode_config(config, "sample")
     device = "cuda"
     checkpoint_path = str(WEIGHTS_DIR / config.model.model_id)
     text_encoder_path = str(WEIGHTS_DIR / config.model.text_encoder_id)
@@ -1477,14 +1476,9 @@ def sample(config_yaml: str) -> None:
         )
         from signet_trainer.inference.reference import to_condition_image  # noqa: PLC0415
 
+        # Non-empty is guaranteed: validate_mode_config(config, "sample") refused the empty-items
+        # multi_frame config at function entry (and the free gates refused it pre-dispatch).
         cond_items = list(config.conditioning.conditioning_items)
-        if not cond_items:
-            raise RuntimeError(
-                "[sample] conditioning.mode == 'multi_frame' but conditioning.conditioning_items is "
-                "empty — nothing to condition on. Stage the keyframe images "
-                "(scripts/_stage_multi_frame_refs.py, 06-07) and list them as conditioning_items "
-                "(image / frame_index / strength) in the run config."
-            )
 
         # Read the latest committed keyframe reference images from the checkpoints Volume.
         checkpoints_vol.reload()

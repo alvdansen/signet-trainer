@@ -407,7 +407,7 @@ def _sample_harness(monkeypatch):
     """``(raw_main, recorder)`` with the heavy dry-run gate skipped and the dispatch verb recorded."""
     from signet_trainer.modal import entrypoint, fns
 
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     recorder = _RecordingFn()
     monkeypatch.setattr(fns, "qwen_edit_sample", recorder)
     return entrypoint.main.info.raw_f, recorder

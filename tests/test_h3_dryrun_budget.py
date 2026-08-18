@@ -483,14 +483,20 @@ def test_three_reference_config_refused_at_short_edge_896() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-def test_ltx_ok_banner_is_byte_identical(capsys: pytest.CaptureFixture[str]) -> None:
-    """The LTX banner text is unchanged — no H3 field leaks into a non-H3 run."""
+def test_ltx_ok_banner_is_pinned(capsys: pytest.CaptureFixture[str]) -> None:
+    """The LTX banner is pinned — no H3/qwen_edit field leaks in, and the worst BUCKET is priced.
+
+    training_dims [768, 512, 49] -> 2688, but the default buckets 768x352x{25,49,81} are what
+    training actually shapes (gap-dryrun-ltx-1): worst = 768x352x81 -> 24*11*11 = 2904.
+    """
     assert run_dryrun(_ltx_cfg()) == 0
     out = capsys.readouterr().out
     assert out == (
         "[signet-dryrun] OK — config valid, synthetic ModelInputs built: "
         "dims [W=768, H=512, F=49] -> seq_len=2688, "
-        "video.latent (1, 2688, 128). Zero GPU, zero Modal spend.\n"
+        "video.latent (1, 2688, 128); worst bucket "
+        "[W=768, H=352, F=81] -> seq_len=2904, "
+        "video.latent (1, 2904, 128) (3 bucket(s) priced). Zero GPU, zero Modal spend.\n"
     )
 
 
