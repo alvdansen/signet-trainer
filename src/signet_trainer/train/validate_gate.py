@@ -240,9 +240,10 @@ def _synthetic_batch(
 
 
 def _make_schedule(config: Any) -> FlowMatchingSchedule:
-    """Build the flow-match schedule, carrying ``uniform_prob`` from config when present."""
+    """Build the flow-match schedule, carrying ``uniform_prob``/``timestep_std`` from config when present."""
     uniform_prob = getattr(getattr(config, "training", None), "uniform_prob", 0.30)
-    return FlowMatchingSchedule(uniform_prob=uniform_prob)
+    timestep_std = getattr(getattr(config, "training", None), "timestep_std", 1.0)
+    return FlowMatchingSchedule(uniform_prob=uniform_prob, std=timestep_std)
 
 
 def _grad_capable_transformer(components: Any) -> Any:

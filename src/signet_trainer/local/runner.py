@@ -418,7 +418,9 @@ def run(
 
         optimizer = build_optimizer(model, config)
         scheduler = build_scheduler(optimizer, config, total_steps=config.training.max_steps)
-        schedule = FlowMatchingSchedule(uniform_prob=config.training.uniform_prob)
+        schedule = FlowMatchingSchedule(
+            uniform_prob=config.training.uniform_prob, std=config.training.timestep_std
+        )
 
         final_step = train_loop(
             model,

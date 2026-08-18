@@ -1103,3 +1103,42 @@ def test_the_uniform_fallback_branch_is_reachable() -> None:
     always = {h3_draw_timesteps(np.random.default_rng(s), uniform_prob=1.0) for s in range(8)}
     never = {h3_draw_timesteps(np.random.default_rng(s), uniform_prob=0.0) for s in range(8)}
     assert always.isdisjoint(never)
+
+
+# ------------------------------------------------------------------------------------------------
+# Issue #13 step 2 — ``std`` was already an ``h3_draw_timesteps`` parameter but unreachable from
+# config (every call site hardcoded the ``1.0`` function default, ``modal/fns.py:4056, 4128, 4177,
+# 4222`` at the time the issue was filed). These pin that the default stays byte-identical and that
+# a non-default value threads through and actually moves the draw.
+# ------------------------------------------------------------------------------------------------
+
+
+def test_default_std_matches_the_unpassed_function_default() -> None:
+    """Passing ``std=1.0`` explicitly must reproduce the un-passed-``std`` draw exactly."""
+    import numpy as np
+
+    from signet_trainer.train.h3_step import h3_draw_timesteps
+
+    for seed in range(10):
+        unpassed = h3_draw_timesteps(np.random.default_rng(seed), uniform_prob=0.30)
+        explicit_default = h3_draw_timesteps(
+            np.random.default_rng(seed), uniform_prob=0.30, std=1.0
+        )
+        assert unpassed == explicit_default
+
+
+def test_nondefault_std_actually_changes_the_draw() -> None:
+    """The derived A/B value (``std=1.7``, issue #13 step 3) must produce a DIFFERENT draw."""
+    import numpy as np
+
+    from signet_trainer.train.h3_step import h3_draw_timesteps
+
+    baseline = [
+        h3_draw_timesteps(np.random.default_rng(seed), uniform_prob=0.0, std=1.0)
+        for seed in range(30)
+    ]
+    wider = [
+        h3_draw_timesteps(np.random.default_rng(seed), uniform_prob=0.0, std=1.7)
+        for seed in range(30)
+    ]
+    assert baseline != wider

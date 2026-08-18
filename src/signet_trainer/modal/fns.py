@@ -892,7 +892,9 @@ def train(config_yaml: str) -> None:
     # warm-started weights (D-9-CHAINED — no optimizer-state carry across rounds).
     optimizer = build_optimizer(model, config)
     scheduler = build_scheduler(optimizer, config, total_steps=config.training.max_steps)
-    schedule = FlowMatchingSchedule(uniform_prob=config.training.uniform_prob)
+    schedule = FlowMatchingSchedule(
+        uniform_prob=config.training.uniform_prob, std=config.training.timestep_std
+    )
 
     # ── (9) the step-driven loop: "done" == checkpoint-step-{max_steps} committed to the Volume ─
     final_step = train_loop(
@@ -4683,7 +4685,9 @@ def h3_train(config_yaml: str) -> None:
     _probe_batch["segment_index"] = int(_probe_batch.get("idx", 0))
     _probe_batch["step"] = 0
     _probe_batch["t_video"], _probe_batch["t_audio"] = h3_draw_timesteps(
-        np.random.default_rng(config.training.seed), uniform_prob=config.training.uniform_prob
+        np.random.default_rng(config.training.seed),
+        uniform_prob=config.training.uniform_prob,
+        std=config.training.timestep_std,
     )
     _probe_inputs = _build_strategy(preflight_deps).prepare_training_inputs(_probe_batch)
     print(
@@ -4757,7 +4761,7 @@ def h3_train(config_yaml: str) -> None:
         batch["segment_index"] = int(batch.get("idx", 0))
         batch["step"] = step_counter["n"]
         batch["t_video"], batch["t_audio"] = h3_draw_timesteps(
-            rng_, uniform_prob=config.training.uniform_prob
+            rng_, uniform_prob=config.training.uniform_prob, std=config.training.timestep_std
         )
         inputs = strategy.prepare_training_inputs(batch)
         # ⛔ NO autocast. MiniMaxH3Transformer3DModel declares
@@ -4806,7 +4810,9 @@ def h3_train(config_yaml: str) -> None:
     fixed["segment_index"] = int(fixed.get("idx", 0))
     fixed["step"] = 0
     fixed["t_video"], fixed["t_audio"] = h3_draw_timesteps(
-        np.random.default_rng(config.training.seed), uniform_prob=0.0
+        np.random.default_rng(config.training.seed),
+        uniform_prob=0.0,
+        std=config.training.timestep_std,
     )
     fixed_inputs = strategy.prepare_training_inputs(
         _h3_to_device(fixed, device, torch_dtype)
@@ -4857,7 +4863,9 @@ def _h3_fixed_delta_batch(config: Any, dataset: Any, strategy: Any, device: Any,
     batch["segment_index"] = int(batch.get("idx", 0))
     batch["step"] = 0
     batch["t_video"], batch["t_audio"] = h3_draw_timesteps(
-        np.random.default_rng(config.training.seed), uniform_prob=0.0
+        np.random.default_rng(config.training.seed),
+        uniform_prob=0.0,
+        std=config.training.timestep_std,
     )
     return strategy.prepare_training_inputs(_h3_to_device(batch, device, dtype))
 

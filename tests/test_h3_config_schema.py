@@ -556,3 +556,88 @@ def test_zero_reference_slots_are_alpha_no_reference() -> None:
     assert H3Config(references_per_sample=0).references_per_sample == 0
     with pytest.raises(ValidationError):
         H3Config(references_per_sample=4)
+
+
+# ======================================================================================
+# Issue #13 step 2 — training.timestep_std. Two 2026-08-11 operator rulings forbid changing the
+# shipped H3 sampler; the ONLY sanctioned action is exposing the knob with a byte-identical
+# default, sharing the field across families (H3-only threading was refuted as a new
+# validated-but-ignored knob on LTX — the #20 defect class), and refusing it under qwen_edit,
+# whose step path never consumes a std-bearing schedule at all.
+# ======================================================================================
+
+
+def _qwen_edit_payload(**over) -> dict:
+    """A minimal VALID ``qwen_edit`` config — mirrors ``test_qwen_edit_config.py::_qwen_payload``."""
+    payload: dict = {
+        "training_dims": [1024, 1024, 1],
+        "data": {
+            "preprocessed_data_root": "/data/qwen_edit",
+            "batch_size": 1,
+            "resolution_buckets": ["1024x1024x1"],
+        },
+        "model": {"family": "qwen_edit"},
+        "training": {"max_steps": 100},
+        "lora": {"rank": 42, "alpha": 42},
+        "validation": {"frame_count": 1},
+        "conditioning": {"mode": "none"},
+    }
+    payload.update(over)
+    return payload
+
+
+def test_timestep_std_defaults_to_one_under_every_family() -> None:
+    """default=1.0 == the pre-#13 hardcoded ``h3_draw_timesteps``/``FlowMatchingSchedule`` default
+    — every existing config (LTX or H3) must load and train byte-identically."""
+    from signet_trainer.config.schema import TrainingConfig
+
+    assert TrainingConfig(max_steps=100).timestep_std == 1.0
+    assert SignetConfig.model_validate(_ltx_payload()).training.timestep_std == 1.0
+    assert SignetConfig.model_validate(_h3_payload()).training.timestep_std == 1.0
+
+
+def test_timestep_std_is_documented() -> None:
+    """A tunable with no description is an undocumented hardcode wearing a config field's clothes
+    (the same doctrine ``test_every_h3_field_is_documented`` holds the h3 block to)."""
+    from signet_trainer.config.schema import TrainingConfig
+
+    assert TrainingConfig.model_fields["timestep_std"].description
+
+
+def test_timestep_std_must_be_positive() -> None:
+    """``std <= 0`` is not a shape a logit-normal draw can take — reject at config load."""
+    with pytest.raises(ValidationError):
+        SignetConfig.model_validate(_h3_payload(training={"max_steps": 100, "timestep_std": 0.0}))
+
+
+def test_nondefault_timestep_std_is_accepted_under_h3_and_ltx() -> None:
+    """The derived A/B value from issue #13 step 3 must load under both std-consuming families."""
+    cfg_h3 = SignetConfig.model_validate(
+        _h3_payload(training={"max_steps": 100, "timestep_std": 1.7})
+    )
+    assert cfg_h3.training.timestep_std == pytest.approx(1.7)
+    cfg_ltx = SignetConfig.model_validate(
+        _ltx_payload(training={"max_steps": 100, "timestep_std": 1.7})
+    )
+    assert cfg_ltx.training.timestep_std == pytest.approx(1.7)
+
+
+def test_nondefault_timestep_std_under_qwen_edit_is_rejected_not_silently_ignored() -> None:
+    """``qwen_edit_step.py`` draws from ai-toolkit's discrete uniform grid and never reads
+    ``FlowMatchingSchedule``'s ``std`` (the module's own DIVERGE note) — a non-default value under
+    this family would train a run that believes it set a knob that did nothing."""
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(
+            _qwen_edit_payload(training={"max_steps": 100, "timestep_std": 1.7})
+        )
+    msg = str(exc.value)
+    assert "timestep_std" in msg
+    assert "qwen_edit" in msg
+
+
+def test_default_timestep_std_loads_fine_under_qwen_edit() -> None:
+    """The reverse guard must fire on non-DEFAULT values only (T-10-05-T doctrine) — an untouched
+    field is invisible, same shape as ``test_all_default_h3_block_loads_fine_under_the_ltx_family``."""
+    cfg = SignetConfig.model_validate(_qwen_edit_payload())
+    assert cfg.model.family == "qwen_edit"
+    assert cfg.training.timestep_std == 1.0

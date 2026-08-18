@@ -1288,6 +1288,30 @@ class TrainingConfig(_Base):
     gradient_accumulation_steps: int = Field(default=1, ge=1)
     # 0.30 = the precedent's standing 'sharper detail' choice (0.10 was the less-preferred std chain).
     uniform_prob: float = Field(default=0.30, ge=0.0, le=1.0)
+    # Issue #13 (P10-0c erosion probe, step 2 of the sanctioned proposal): the shipped H3 base draw
+    # is logit-normal at std=1.0, which is NOT the schedule-matched distribution the P10-0c research
+    # justified (SCOPE.md:474-482 describes a uniform-index grid; h3_draw_timesteps draws
+    # sigmoid(randn*std)). Two 2026-08-11 operator rulings say do NOT change the shipped default —
+    # three finished 12k-step baselines (hero/tween/sequence) are built on it — so this field exists
+    # ONLY to let a parallel A/B arm reach the derived std=1.7 (which reproduces the deployment
+    # sigma-band figures near-exactly) without touching the default. default=1.0 is the exact value
+    # h3_draw_timesteps/FlowMatchingSchedule already hardcoded, so every existing config loads and
+    # trains byte-identically. qwen_edit's step path draws from ai-toolkit's discrete uniform grid
+    # and never consumes this (qwen_edit_step.py's DIVERGE note) — see the reverse guard in
+    # SignetConfig._cross_field_checks that refuses a non-default value under that family, so a
+    # setting that would be silently ignored dies at config load instead (the #20 defect class).
+    timestep_std: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="[Issue #13, P10-0c erosion probe step 2] logit-normal std for the base "
+        "timestep draw, BEFORE the exponential/shift reparameterization. 1.0 is the exact value "
+        "h3_draw_timesteps/FlowMatchingSchedule already hardcoded, so every existing config trains "
+        "byte-identically. Exists to let a parallel A/B arm reach the derived std=1.7 (reproduces "
+        "the H3 deployment sigma-band figures near-exactly) WITHOUT changing the default — two "
+        "2026-08-11 operator rulings forbid disturbing the three finished 12k-step baselines. "
+        "Refused under model.family == 'qwen_edit', whose step path never consumes a "
+        "std-bearing schedule (see SignetConfig._cross_field_checks).",
+    )
     scheduler: str = Field(default="cosine_with_min_lr")
     min_lr_ratio: float = Field(default=0.01, ge=0.0, le=1.0, description="flimmer template (source 0.1).")
     warmup_steps: int = Field(default=0, ge=0, description="flimmer template (source min(50, total//10)).")
@@ -2717,6 +2741,21 @@ class SignetConfig(_Base):
                     f"any other family they would be silently ignored (lean field-split — no "
                     f"silently-ignored config block). Remove them or set model.family: wan."
                 )
+        # Issue #13's reverse guard: training.timestep_std shapes the base draw BEFORE a
+        # std-consuming schedule's shift/exponential-reparameterization is applied. qwen_edit's step
+        # path (train/qwen_edit_step.py) draws from ai-toolkit's discrete uniform grid instead and
+        # never reads FlowMatchingSchedule's std at all (the module's own DIVERGE note) — so a
+        # non-default value under that family would be silently ignored exactly like the
+        # h3/qwen_edit block fields above, and dies here rather than training a run that believes it
+        # set a knob that did nothing.
+        if self.model.family == "qwen_edit" and self.training.timestep_std != 1.0:
+            raise ValueError(
+                f"training.timestep_std is {self.training.timestep_std} (non-default) while "
+                "model.family is 'qwen_edit': that family's step path draws timesteps from "
+                "ai-toolkit's discrete uniform grid (train/qwen_edit_step.py), NOT from "
+                "FlowMatchingSchedule, so this value would be silently ignored. Remove it (leave at "
+                "1.0) or set a family whose step path consumes it ('h3' or the LTX default)."
+            )
         # The family-only MODEL IDS (they live on ModelConfig — they are model IDs, not recipe
         # knobs — but are just as silently ignored under a family that reads none of them). This ran
         # as a flat "not h3 -> reject vae_id / audio_vae_id" list until family #3, which BREAKS on

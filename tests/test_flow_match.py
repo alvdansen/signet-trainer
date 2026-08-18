@@ -106,3 +106,32 @@ def test_constructor_default_uniform_prob_is_source_value():
     # The source __init__ default is 0.1; the locked 0.30 is passed from config in loop.py,
     # NOT hardcoded here (deviation note, PATTERNS.md:56).
     assert FlowMatchingSchedule().uniform_prob == 0.1
+
+
+# --------------------------------------------------------------------------------------------------
+# Issue #13 step 2 — training.timestep_std threading. default=1.0 must be byte-identical to today's
+# behavior (two 2026-08-11 operator rulings forbid changing the shipped default); a non-default
+# value must actually move the draw, or the knob is a no-op wearing a config field's clothes.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_default_std_is_byte_identical_to_the_unthreaded_constructor():
+    """Passing ``std=1.0`` explicitly must reproduce the pre-#13 (no-``std``-arg) draw exactly."""
+    rng_a = np.random.default_rng(7)
+    rng_b = np.random.default_rng(7)
+    unthreaded = FlowMatchingSchedule(uniform_prob=0.30).sample_timesteps(256, 2688, rng_a)
+    threaded_default = FlowMatchingSchedule(uniform_prob=0.30, std=1.0).sample_timesteps(
+        256, 2688, rng_b
+    )
+    assert np.array_equal(unthreaded, threaded_default)
+
+
+def test_nondefault_std_actually_changes_the_draw():
+    """The derived A/B value (``std=1.7``, issue #13 step 3) must produce a DIFFERENT draw."""
+    baseline = FlowMatchingSchedule(uniform_prob=0.30, std=1.0).sample_timesteps(
+        2000, 2688, np.random.default_rng(42)
+    )
+    wider = FlowMatchingSchedule(uniform_prob=0.30, std=1.7).sample_timesteps(
+        2000, 2688, np.random.default_rng(42)
+    )
+    assert not np.array_equal(baseline, wider)
