@@ -6,7 +6,10 @@
 # -> re-run this script; nothing else to change (scaffolded 2026-07-11, not prioritized).
 param([string]$GridDir = "_grid_campaign_r1_native", [int]$Port = 8000)
 $grid = Join-Path $PSScriptRoot "..\_tools\finetune-gridwatch\.venv\Scripts\grid.exe"
-Start-Process -NoNewWindow -FilePath $grid -ArgumentList @("watch", $GridDir)
+# -Port must reach `grid watch` itself (issue #40 finding 2) -- the printed URL and the tunnel
+# target are both built from $Port below, so leaving it off the ArgumentList made either break
+# silently (a busy default port) or deterministically (any explicit non-default -Port).
+Start-Process -NoNewWindow -FilePath $grid -ArgumentList @("watch", $GridDir, "--port", $Port)
 Write-Host "[serve_gridwatch] live at http://127.0.0.1:$Port"
 $ngrok = Get-Command ngrok -ErrorAction SilentlyContinue
 $cf = Get-Command cloudflared -ErrorAction SilentlyContinue

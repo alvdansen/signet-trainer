@@ -96,27 +96,33 @@ def sh(cmd: list[str] | str, cwd: Path | None = None, env: dict | None = None,
 
 
 def gpu_inventory() -> dict:
-    """nvidia-smi probe: totals, free, and compute-app holders. Empty dict if no smi."""
+    """nvidia-smi probe: totals, free, and compute-app holders (attributed to a GPU index where
+    nvidia-smi can tell us). Empty dict if no smi."""
     smi = shutil.which("nvidia-smi")
     if not smi:
         return {}
-    rc, out = sh([smi, "--query-gpu=index,name,memory.total,memory.used",
+    rc, out = sh([smi, "--query-gpu=index,uuid,name,memory.total,memory.used",
                   "--format=csv,noheader,nounits"])
     if rc != 0:
         return {}
     gpus = []
+    uuid_to_index = {}
     for line in out.strip().splitlines():
-        idx, name, total, used = [x.strip() for x in line.split(",")]
+        idx, uuid, name, total, used = [x.strip() for x in line.split(",")]
         gpus.append({"index": int(idx), "name": name, "total_mib": int(total),
                      "used_mib": int(used), "free_mib": int(total) - int(used)})
-    rc, out = sh([smi, "--query-compute-apps=pid,process_name,used_memory",
+        uuid_to_index[uuid] = int(idx)
+    # gpu_uuid lets a holder be attributed to the card it is actually sitting on (issue #40
+    # finding 3) — without it, a SKIP on a busy card cannot tell the operator which one is busy.
+    rc, out = sh([smi, "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
                   "--format=csv,noheader,nounits"])
     holders = []
     if rc == 0:
         for line in out.strip().splitlines():
             if line.strip():
-                pid, pname, mem = [x.strip() for x in line.split(",")]
-                holders.append({"pid": int(pid), "name": pname, "used_mib": int(mem)})
+                uuid, pid, pname, mem = [x.strip() for x in line.split(",")]
+                holders.append({"pid": int(pid), "name": pname, "used_mib": int(mem),
+                                "gpu_index": uuid_to_index.get(uuid)})
     return {"gpus": gpus, "holders": holders}
 
 
@@ -368,20 +374,33 @@ def stage_gpu(args, repo: Path) -> StageResult:
     inv = gpu_inventory()
     if not inv.get("gpus"):
         return StageResult("gpu", "SKIP", "no nvidia-smi / no GPU")
-    free = max(g["free_mib"] for g in inv["gpus"])
+    # Issue #40 finding 3: the "shared-GPU polite" gate must judge the SAME card the probe runs
+    # on. `_GPU_PROG` always opens `torch.device("cuda")`, i.e. whichever index the child process
+    # sees as device 0 — so the gate picks the card with the MOST free VRAM, compares THAT card's
+    # free against `need`, and (on PASS) pins the child to it with CUDA_VISIBLE_DEVICES so the
+    # child's "cuda:0" really is the card the gate just cleared. Taking max() across all cards
+    # while probing an unrelated, hardcoded device let the stage PASS on an idle card's headroom
+    # while allocating on a saturated one.
+    chosen = max(inv["gpus"], key=lambda g: g["free_mib"])
+    free = chosen["free_mib"]
     need = int(args.min_free_vram_gib * 1024)
     if free < need:
-        holders = ", ".join(f"pid {h['pid']} ({h['used_mib']} MiB)"
-                            for h in inv.get("holders", []))
+        holders = ", ".join(
+            f"pid {h['pid']} ({h['used_mib']} MiB, gpu{h['gpu_index']})"
+            if h.get("gpu_index") is not None else f"pid {h['pid']} ({h['used_mib']} MiB)"
+            for h in inv.get("holders", [])
+        )
         return StageResult("gpu", "SKIP",
-                           f"only {free} MiB free < {need} MiB required — GPU busy "
-                           f"({holders or 'holder unknown'}); shared box, not killing anything")
+                           f"gpu{chosen['index']} (most free): only {free} MiB free < {need} MiB "
+                           f"required — GPU busy ({holders or 'holder unknown'}); shared box, "
+                           f"not killing anything")
     py = _stage_python(args, repo)
     rc, out = sh([str(py), "-c", _GPU_PROG], cwd=repo,
-                 env={"PYTHONPATH": "src", "PYTHONUTF8": "1"}, timeout=600)
+                 env={"PYTHONPATH": "src", "PYTHONUTF8": "1",
+                      "CUDA_VISIBLE_DEVICES": str(chosen["index"])}, timeout=600)
     if rc != 0:
         return StageResult("gpu", "FAIL", out.strip()[-800:])
-    return StageResult("gpu", "PASS", out.strip().splitlines()[-1])
+    return StageResult("gpu", "PASS", f"gpu{chosen['index']}: " + out.strip().splitlines()[-1])
 
 
 STAGES = {

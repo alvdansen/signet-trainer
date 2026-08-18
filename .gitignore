@@ -46,11 +46,16 @@ scripts/_seg_preview/
 
 # Harness scratch (renders/grids/logs fetched locally). Everything a run drops in the repo root
 # is throwaway and regenerable from the Modal Volume, so none of it is a source of truth.
-_samples_*/
-_grid_*/
+# NOTE: no leading `_` before the `*` — every shipped fetch command (training-review/training-run
+# SKILL.md) names the BARE directory (`./_samples`, not `./_samples_anything`), and a glob that
+# requires a trailing underscore lets the bare name stay git-trackable. See
+# tests/test_gitignore_scratch_dirs.py, which walks the literal paths the skills instruct and
+# would have caught this by construction.
+_samples*/
+_grid*/
 grid-output/
 _tools/
-_reskin_grid_*/
+_reskin_grid*/
 # Generated run-status pages (scripts/_h3_run_status.py) — regenerable from the Volume in one
 # command, so the artifact is never the source of truth and must not be committed.
 _h3_status*/
