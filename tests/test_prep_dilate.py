@@ -11,6 +11,10 @@ tests lock, unconditionally (pure-numpy growth path — cv2 not required):
 4. A mask already >= ``target`` is returned effectively unchanged (no over-growth).
 5. The target/margin come from the passed spec dict (config-first, D-03) — a class absent from the
    spec's coverage_bands raises loudly.
+6. #36 finding 4: the cv2 path (``MORPH_RECT``) and the pure-numpy path grow a mask IDENTICALLY —
+   guarded skip only if cv2 is genuinely absent (a prior ``MORPH_ELLIPSE`` kernel was 4-connected
+   and grew a measurably SMALLER mask than the numpy path's 8-connected full 3x3 from the same
+   seed, while production always took the untested cv2 branch).
 
 House test rules honored: no metered dispatch, no modal, no network — synthetic in-memory fixtures.
 """
@@ -110,3 +114,45 @@ def test_target_is_spec_sourced_not_hardcoded():
     low = dilate_to_target(m, "face_hair", _spec(0.05, max_margin_px=64), use_cv2=False)
     high = dilate_to_target(m, "face_hair", _spec(0.30, max_margin_px=64), use_cv2=False)
     assert coverage_fraction(high) > coverage_fraction(low)
+
+
+def test_cv2_and_numpy_dilation_paths_agree_bit_for_bit():
+    """#36 finding 4: the shipped cv2 path (``MORPH_RECT``, full 3x3, 8-connected) must grow a mask
+    IDENTICALLY to the pure-numpy path it claims to be a "faster equivalent" of.
+
+    Before the fix, the cv2 branch used ``MORPH_ELLIPSE`` (4-connected diamond) — a DIFFERENT,
+    SMALLER kernel than the numpy path's full 3x3 — so ``_grow_one``'s stop-at-target loop
+    terminated at a different margin per backend (measured on the issue's repro: numpy 256 px vs
+    cv2 172 px for an identical seed). Multi-step growth (``max_margin_px`` > 1) is what makes a
+    per-step kernel mismatch compound into a visible coverage difference.
+    """
+    cv2 = pytest.importorskip("cv2")  # noqa: F841  (import used only to trigger the skip)
+    m = _center_dot()
+    spec = _spec(target=0.99, max_margin_px=6)  # unreachable target -> margin ceiling always binds
+
+    grown_cv2 = dilate_to_target(m, "face_hair", spec, use_cv2=True)
+    grown_np = dilate_to_target(m, "face_hair", spec, use_cv2=False)
+
+    assert np.array_equal(np.asarray(grown_cv2, dtype=bool), np.asarray(grown_np, dtype=bool))
+    # both actually grew past the seed — an accidental early-return can't pass this trivially
+    assert coverage_fraction(grown_cv2) > coverage_fraction(m)
+
+
+def test_cv2_dilation_uses_morph_rect_not_morph_ellipse():
+    """Pins the exact kernel choice (#36 finding 4) — a regression back to ``MORPH_ELLIPSE`` would
+    still coincidentally pass a coverage-only equivalence check on some shapes, so assert the
+    kernel itself is the numpy-equivalent full 3x3 all-ones.
+    """
+    cv2 = pytest.importorskip("cv2")
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    assert np.array_equal(kernel, np.ones((3, 3), dtype=kernel.dtype))
+
+    from signet_trainer.prep.dilate import _dilate_1px  # noqa: PLC0415
+
+    seed = np.zeros((9, 9), dtype=bool)
+    seed[4, 4] = True
+    grown_cv2 = _dilate_1px(seed, use_cv2=True)
+    grown_np = _dilate_1px(seed, use_cv2=False)
+    assert np.array_equal(np.asarray(grown_cv2, dtype=bool), np.asarray(grown_np, dtype=bool))
+    assert int(np.asarray(grown_cv2, dtype=bool).sum()) == 9  # full 3x3 neighborhood, not a 5-px diamond

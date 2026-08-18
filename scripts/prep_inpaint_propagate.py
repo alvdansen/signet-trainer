@@ -11,6 +11,9 @@ When SAM3 is unavailable this surfaces the D-14 FIX-IT-FIRST path (HF gated acce
 transformers -> weights auto-pull) — NOT an immediate SAM2.1 fallback.
 
 ``--rev <mask_stem>`` re-seeds a drifted clip on its LAST frame and propagates backward (D-08).
+``--directions <textseed_records.json>`` reads textseed's fwd/rev decision straight from its JSON
+output and unions the REV stems into ``--rev`` — the structured handoff (#36 finding 3); textseed's
+stdout print of the same list is a convenience only, never the transport.
 
 NO Modal import, NO metered dispatch — local/CPU-or-local-GPU only. The gated GPU staging + canonical
 preprocess come AFTER, separately. Nothing here launches a metered run.
@@ -22,9 +25,13 @@ Usage:
   # propagate (default sam3, real GPU box):
   PYTHONPATH=src PYTHONUTF8=1 python scripts/prep_inpaint_propagate.py --device cuda
 
-  # re-seed a drifted clip backward:
+  # re-seed a drifted clip backward (manual override):
   PYTHONPATH=src PYTHONUTF8=1 python scripts/prep_inpaint_propagate.py \
       --rev 07_012_source_film_part_11_scene003__face_hair
+
+  # propagate using textseed's decided fwd/rev set (structured handoff, no copy-paste):
+  PYTHONPATH=src PYTHONUTF8=1 python scripts/prep_inpaint_propagate.py \
+      --directions _inpaint_prep/textseed_records.json --device cuda
 """
 
 from __future__ import annotations
@@ -62,10 +69,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="NN|png|clip manifest for stem resolution (optional; sanitize fallback otherwise).")
     ap.add_argument("--masks-out", default=str(prop.DEFAULT_MASKS_OUT), help="Per-frame mask PNG output root.")
     ap.add_argument("--overlays-out", default=str(prop.DEFAULT_OVERLAYS_OUT), help="QA overlay mp4 output dir.")
-    ap.add_argument("--spec", default=str(prop.DEFAULT_SPEC),
+    ap.add_argument("--spec", default=str(prop.default_spec()),
                     help="MASK-SPEC.yaml — seed threshold + per-class D-02 dilation targets come FROM here (D-03).")
     ap.add_argument("--rev", action="append", default=[],
-                    help="Mask stem(s) to seed on the LAST frame + propagate backward (D-08, repeatable).")
+                    help="Mask stem(s) to seed on the LAST frame + propagate backward (D-08, repeatable). "
+                         "Manual override/re-seed path — for the textseed-decided set, use --directions.")
+    ap.add_argument("--directions", default=None,
+                    help="textseed_records.json — REV mask stems are read from its 'direction' field "
+                         "(the structured fwd/rev handoff, #36 finding 3). Unioned with --rev; any stem "
+                         "here that matches no discovered seed PNG is a fatal error, not a silent no-op.")
     ap.add_argument("--only", action="append", default=[], help="Process only these mask stem(s) (repeatable).")
     ap.add_argument("--force", action="store_true", help="Re-propagate even if output PNGs already exist.")
     ap.add_argument("--dry-run", action="store_true",
