@@ -722,6 +722,22 @@ def test_a_wan_dispatch_WITH_approve_still_refuses_on_the_declared_gaps(monkeypa
     raw = _EXAMPLE.read_text(encoding="utf-8")
     for line in ("  model_id:", "  vae_id:", "  text_encoder_id:", "  clip_id:"):
         raw = "\n".join(l for l in raw.split("\n") if not l.startswith(line))
+    # FILESYSTEM DISCIPLINE (mirrors test_entrypoint_session_cap.py): main() now resolves the
+    # WR-02 cumulative session-spend ledger BEFORE the approval pause (issue #37's session-cap
+    # enforcement). The schema default (``.planning/harness/SESSION-STATE.json``) is
+    # PROJECT-RELATIVE live state — reading the repo's real, accumulating ledger here would make
+    # this test's outcome depend on whatever spend already exists on disk, dropping --approve to
+    # an ask-first prompt that then reads stdin under pytest's capture and crashes before ever
+    # reaching the gap refusal this test is actually about. Point it at a fresh tmp_path ledger
+    # (never written to, so cumulative spend is always $0) by adding the field to the config's
+    # EXISTING ``modal:`` block rather than appending a second one (a duplicate top-level YAML key
+    # would silently drop hourly_rate_usd/cost_guardrail_usd/est_hours instead of merging).
+    ledger_path = str(tmp_path / "wan_session_ledger.json").replace("\\", "/")
+    assert "  est_hours: 6.0" in raw
+    raw = raw.replace(
+        "  est_hours: 6.0",
+        f'  est_hours: 6.0\n  session_spend_ledger_path: "{ledger_path}"',
+    )
     ungapped = tmp_path / "wan_undeclared.yaml"
     ungapped.write_text(raw, encoding="utf-8")
 

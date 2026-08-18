@@ -176,24 +176,46 @@ def test_both_cap_checked_before_dispatch():
 
 
 def test_both_append_spend_every_dispatch_not_only_on_success():
-    # #2: append_spend must fire on the dispatch path (before the `if dispatch_render(...)` success
-    # branch), so a killed render's spend is still ledgered — not solely inside the success block.
+    # #2 ORIGINAL SHAPE: append_spend used to fire on the dispatch path (before the `if
+    # dispatch_render(...)` success branch), so a killed render's spend was still ledgered — not
+    # solely inside the success block.
+    #
+    # Issue #37 finding 1/2 (single-source accounting): GENERALIZED no longer books its own spend —
+    # its local `append_spend(step)` wrapper was deliberately removed, and every dispatch it makes
+    # now gets booked INSIDE the entrypoint-gate subprocess (entrypoint.py's `_watch_dispatch`,
+    # covered by test_entrypoint_session_cap.py), unconditionally once `.spawn()` succeeds — i.e.
+    # still "not only on success" of the RENDER, just realized in a different process. For a watcher
+    # that still owns its own booking (e.g. a reinstated campaign fork), the original ordering
+    # invariant still applies and is asserted below.
     for path in _WATCHERS:
         body = _main_body(path)
+        if "append_spend(" not in body:
+            continue
         assert _first(body, "append_spend(") < _first(body, "dispatch_render(")
 
 
-# ---- issue #45 PR-1 must-fix #2 — checkpoint captured BEFORE append_spend, refuse on None ----
+# ---- issue #45 PR-1 must-fix #2 — checkpoint captured BEFORE dispatch, refuse on None -----------
 # (GENERALIZED only: the campaign FORK does not exist in this repo and is not in this fix's scope.)
 
 
 def test_generalized_captures_checkpoint_before_booking_spend():
-    # The regression: `ckpt_at_dispatch = latest_checkpoint_name()` must run BEFORE `append_spend(
-    # step)`, never after — a failed capture (None, on a modal volume ls timeout) must be caught
-    # before spend is booked, not discovered afterward with the spend already ledgered.
+    # The regression: `ckpt_at_dispatch = latest_checkpoint_name()` must run BEFORE the render is
+    # dispatched, never after — a failed capture (None, on a modal volume ls timeout) must be caught
+    # before anything is booked or dispatched, not discovered afterward with the spend already
+    # ledgered.
+    #
+    # Issue #37 finding 1/2 moved the actual ledger write server-side (GENERALIZED no longer calls
+    # `append_spend` at all — see test_both_append_spend_every_dispatch_not_only_on_success), so the
+    # gate this test now pins is `ckpt_at_dispatch` preceding `dispatch_render(` — dispatch_render()
+    # is what triggers the entrypoint subprocess that books the spend, so ordering the checkpoint
+    # capture before IT preserves the original CAPTURE-BEFORE-BOOK property end to end.
     body = _main_body(GENERALIZED)
     assert "ckpt_at_dispatch = latest_checkpoint_name()" in body
-    assert _first(body, "ckpt_at_dispatch = latest_checkpoint_name()") < _first(body, "append_spend(")
+    assert "append_spend(" not in body, (
+        "GENERALIZED must not reintroduce its own ledger write (issue #37 finding 1/2 — booking is "
+        "single-sourced inside the entrypoint gate subprocess dispatch_render() triggers)"
+    )
+    assert _first(body, "ckpt_at_dispatch = latest_checkpoint_name()") < _first(body, "dispatch_render(")
 
 
 def test_generalized_refuses_dispatch_on_unresolved_checkpoint():

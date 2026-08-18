@@ -22,9 +22,13 @@ Two closures, deliberately layered:
      consumes its return value.
 
 Zero GPU / zero Modal / zero spend: `dispatch_render`, `render_landed`, `render_progress_artifacts`,
-`append_spend`, `session_cap_check`, `read_ledger`, `list_checkpoint_steps`,
+`session_cap_check`, `read_ledger`, `list_checkpoint_steps`,
 `committed_render_stamps` and `refresh_grid` are all monkeypatched fakes; `time.time`/`time.sleep`
 are replaced with a deterministic fake clock that raises once the test has seen enough polls.
+
+Issue #37 finding 1/2: the watcher no longer owns an `append_spend` of its own (single-source
+ledger accounting moved into the entrypoint-gate subprocess `dispatch_render` triggers), so there
+is nothing left of that name on the module to monkeypatch here.
 """
 
 from __future__ import annotations
@@ -131,7 +135,6 @@ def _patch_common(monkeypatch, mod, tmp_path: Path, fake_time: _FakeTime, dispat
     monkeypatch.setattr(mod, "read_ledger", lambda *_a, **_k: 0.0)
     monkeypatch.setattr(mod, "_resolve_cap", lambda *_a, **_k: 1000.0)
     monkeypatch.setattr(mod, "session_cap_check", lambda *_a, **_k: SimpleNamespace(allowed=True))
-    monkeypatch.setattr(mod, "append_spend", lambda step: None)
     monkeypatch.setattr(mod, "dispatch_render", lambda step: (dispatches.append(step) or True))
     monkeypatch.setattr(mod, "render_landed", lambda step, ckpt: False)
     monkeypatch.setattr(mod, "render_progress_artifacts", lambda ckpt: progress_fn(ckpt))
