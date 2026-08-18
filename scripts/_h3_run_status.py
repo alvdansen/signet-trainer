@@ -1102,6 +1102,8 @@ def render_html(status: dict, command: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from signet_trainer.harness_state import session_ledger_path  # noqa: PLC0415
+
     parser = argparse.ArgumentParser(
         description="Self-contained HTML run-status page for a gated signet-trainer run "
                     "(read-only Modal CLI; zero metered spend).",
@@ -1111,7 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--card", default="",
                         help="Campaign card *.state.yaml (expected_peak_gib / expected_s_per_it). "
                              "Default: derived from the config stem.")
-    parser.add_argument("--session-state", default=".planning/harness/SESSION-STATE.json",
+    parser.add_argument("--session-state", default=session_ledger_path(),
                         help="Spend ledger — the single numeric source of truth for spend/cap.")
     parser.add_argument("--volume", default=None,
                         help="Modal Volume holding <output_dir>/checkpoint-step-*. Default: the "

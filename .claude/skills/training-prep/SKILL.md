@@ -133,6 +133,13 @@ PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoin
 the app shell down with the local client, killing the encode partway with nothing committed to the
 dataset Volume (README "The three things about this command that are not optional").
 
+> **Cap step (D-8-YOLOCAP) — before dispatching `--approve` here:** the cumulative session-spend
+> cap is enforced BY THE ENTRYPOINT GATE itself (`session_cap.read_ledger` + `session_cap_check`,
+> between the cost print and the approval pause) — going over cap disables `--approve` for that
+> dispatch and drops to an interactive ask-first prompt even when the flag was passed. This skill
+> does not re-derive that chain; see `training-run/SKILL.md` §3 for the full WR-02 cap/ledger-path
+> resolution and the blanket → strict/yolo dispatch decision every metered run here inherits.
+
 - The gate runs **load → dry-run → cost print → BLOCKING approval → dispatch**, identical to train.
   The **cost print + approval precede dispatch** — a metered encode can never auto-launch. Under an
   active blanket the approval stop is removed but the cost line still logs (accounting always runs).
@@ -159,6 +166,10 @@ existing arm. Same command, same gate, same cost line, same spend ledger:
 PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoint \
     --config configs/<your-h3-run>.yaml --mode preprocess [--approve]
 ```
+
+> **Cap step (D-8-YOLOCAP)** — same as §2: the entrypoint gate enforces the cumulative session cap
+> on this dispatch too (same single gate, all six `--mode` × family combinations). See
+> `training-run/SKILL.md` §3 before relying on `--approve` here.
 
 **What it writes** — FOUR sources under `cfg.data.preprocessed_data_root`, not two:
 

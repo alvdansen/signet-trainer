@@ -243,8 +243,11 @@ def test_restore_and_backup_dispatch_after_approval():
     # in main() — a Volume-mutating restore / a metered backup can never precede the approval pause.
     # (D-10-DEF-17 swapped the verb `.remote` -> `.spawn`; the ORDERING claim is unchanged.)
     body = _main_body(ENTRYPOINT)
-    approval_idx = body.find("_require_approval(approve)")
-    assert approval_idx != -1, "expected the _require_approval(approve) gate in main()"
+    # Issue #37 finding 1: the cumulative session-cap check now resolves an ask-first-downgraded
+    # ``approve_for_gate`` immediately before this call (never the raw ``approve`` param) — the
+    # literal call text changed; the single-gate ORDERING claim below is unchanged.
+    approval_idx = body.find("_require_approval(approve_for_gate)")
+    assert approval_idx != -1, "expected the _require_approval(approve_for_gate) gate in main()"
     for dispatch in ("restore.spawn(config_text)", "backup_sync.spawn(config_text)"):
         idx = body.find(dispatch)
         assert idx != -1, f"expected {dispatch} in main()"

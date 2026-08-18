@@ -79,6 +79,14 @@ PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoin
     --config <yaml> --mode sample [--approve]
 ```
 
+> **Cap step (D-8-YOLOCAP) — before dispatching `--approve` here:** the cumulative session-spend
+> cap is enforced BY THE ENTRYPOINT GATE itself (`session_cap.read_ledger` + `session_cap_check`,
+> between the cost print and the approval pause) — going over cap disables `--approve` for that
+> dispatch and drops to an interactive ask-first prompt even when the flag was passed. A `/review`
+> grading pass that dispatches **`--mode sample --approve` several times in a row** (one per
+> checkpoint) is exactly the repeated-dispatch case the cap exists for — see
+> `training-run/SKILL.md` §3 for the full WR-02 cap/ledger-path chain.
+
 - Gate order is **load → dry-run → cost print → BLOCKING approval → dispatch**; the **cost print +
   approval precede dispatch**. Under an active blanket the stop is removed but the cost line still logs.
 - **Declare the render's tier before dispatch (§11, D-24).** For a **`verdict`** tier, run
@@ -137,6 +145,10 @@ A config carrying `family: h3` makes `--mode sample` dispatch `h3_sample` instea
 PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoint \
     --config configs/<your-h3-run>_sample.yaml --mode sample [--approve]
 ```
+
+> **Cap step (D-8-YOLOCAP)** — same as §1: the entrypoint gate enforces the cumulative session cap
+> on this dispatch too (same single gate, all six `--mode` × family combinations). See
+> `training-run/SKILL.md` §3 before relying on `--approve` here.
 
 **The automated acceptance floor: `max|delta velocity|`.** Before rendering anything, `h3_sample`
 runs the base and adapted forwards on ONE fixed batch and reports

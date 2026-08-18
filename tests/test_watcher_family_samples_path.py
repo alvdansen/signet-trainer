@@ -3,11 +3,13 @@
 Why this file exists (the blocker, 2026-08-06): ``scripts/watch_parallel_inference.py`` hardcoded the
 LTX answer — it listed ``{output_dir}/samples`` and matched UTC wall-clock stamps. ``h3_sample``
 writes ``{output_dir}/samples_h3/<render key>/``. Run against an H3 config the watcher would dispatch
-a metered render, never see it land, mark it FAILED and re-dispatch on the next poll. Because
-``append_spend`` fires BEFORE the dispatch and has no refund path, that books the full per-render
-estimate every 240 s against renders that may have SUCCEEDED — the phantom-spend shape
+a metered render, never see it land, mark it FAILED and re-dispatch on the next poll. At the time
+the watcher's OWN ``append_spend`` fired BEFORE the dispatch with no refund path, booking the full
+per-render estimate every 240 s against renders that may have SUCCEEDED — the phantom-spend shape
 (``KNOWLEDGE.md`` ``watcher`` ``phantom-spend``), and the thing that would trip ``session_cap_usd``
-and halt a healthy campaign.
+and halt a healthy campaign. (Issue #37 findings 1/2 later moved the booking itself into the
+entrypoint gate, once per successful ``.spawn()`` — see ``test_watcher_no_longer_double_books_the_
+ledger_entry`` below; the family-aware landed-check this file exists for is unaffected.)
 
 Both families are pinned, in the same file, deliberately: the LTX path must stay byte-identically
 behaved, and a future "just make it H3" edit has to fail HERE rather than on a metered Volume.
@@ -272,3 +274,34 @@ def test_watcher_cadence_is_configurable_and_not_every_checkpoint():
     assert "s % RENDER_EVERY == 0 or s >= MAX_STEPS" in src, (
         "renders fire on cadence boundaries + the final step — never once per checkpoint"
     )
+
+
+# ---- issue #37 findings 1/2: the entrypoint gate books the ledger now, the watcher must not ----
+
+
+def test_watcher_no_longer_double_books_the_ledger_entry():
+    """The watcher must not append its own ledger entry — the entrypoint subprocess it dispatches
+    via `modal run ... --approve` now books that entry itself (issue #37 finding 1). A watcher
+    that ALSO appended would double-count every parallel-venue render against the cumulative cap.
+    """
+    src = _watcher_src()
+    assert "append_spend as _append_spend" not in src, (
+        "the watcher must not import append_spend at all — booking is the entrypoint's job now"
+    )
+    assert "def append_spend(" not in src, "the append_spend(step) wrapper must be gone, not just unused"
+    main_body = src.split("\ndef main()")[1]
+    assert "append_spend(" not in main_body, (
+        "main() must not call append_spend anywhere — double-booking against the entrypoint's own "
+        "post-dispatch append"
+    )
+
+
+def test_watcher_still_runs_its_own_pre_dispatch_cap_check():
+    """The watcher's OWN session_cap_check before dispatch stays — it is a cheap local pre-check
+    that avoids shelling out to a dispatch the entrypoint's own cap gate would refuse anyway, and
+    is independent of (not a substitute for, and not redundant with) the entrypoint's booking."""
+    src = _watcher_src()
+    assert "from signet_trainer.modal.session_cap import" in src
+    assert "read_ledger" in src and "session_cap_check" in src
+    main_body = src.split("\ndef main()")[1]
+    assert "session_cap_check(" in main_body

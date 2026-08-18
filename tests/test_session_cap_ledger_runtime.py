@@ -102,13 +102,37 @@ def test_append_spend_raises_on_negative_est_usd(tmp_path):
 def test_watchers_do_not_subprocess_for_append_spend():
     # Structural guard IN ADDITION to the runtime proof above: lock out the CR-01 pattern so a future
     # edit cannot silently reintroduce a discarded-exit-code subprocess for the ledger write.
+    #
+    # Issue #37 finding 1/2 (single-source accounting): GENERALIZED no longer owns a ledger write at
+    # all — its own `def append_spend(step) -> None:` wrapper (the one this test used to isolate) was
+    # deliberately REMOVED. Every dispatch this watcher triggers goes through the entrypoint-gate
+    # subprocess in dispatch_render(), and THAT process now books the ledger in-process, once per
+    # successful ``.spawn()`` (entrypoint.py's ``_watch_dispatch`` — covered by
+    # test_entrypoint_session_cap.py, not this file). The CR-01 regression this test guards against —
+    # a fire-and-forget ``sys.executable -c ...`` subprocess with a discarded exit code — is therefore
+    # structurally impossible for a watcher that does not write the ledger itself; assert exactly
+    # that absence, plus (belt-and-braces) that no CR-01-shaped subprocess call sneaks back in under
+    # any other name.
     for path in _WATCHERS:
         src = _strip_comments(path.read_text(encoding="utf-8"))
-        # The append_spend wrapper is defined as `def append_spend(step: int) -> None:` — isolate its
-        # body (up to the next top-level `def `) and assert it no longer builds a `-c` code string
-        # nor invokes the interpreter.
         m = re.search(r"\ndef append_spend\(step: int\) -> None:\n(.*?)(?=\ndef )", src, re.DOTALL)
-        assert m is not None, f"{path.name}: append_spend(step) wrapper not found"
+        if m is None:
+            # No local ledger-write wrapper at all (the current GENERALIZED design) — the CR-01
+            # subprocess pattern has nothing to hide inside. Still guard against it reappearing
+            # ANYWHERE in the file under a different name.
+            assert "append_spend as _append_spend" not in src, (
+                f"{path.name}: imports the in-process append_spend alias but defines no wrapper that "
+                "calls it — dead import, or the wrapper was renamed without updating this test"
+            )
+            assert not re.search(r'sys\.executable.*["\']-c["\']', src), (
+                f"{path.name}: must not shell out to `sys.executable -c ...` for the ledger write "
+                "(CR-01) — booking now happens in-process inside the entrypoint gate subprocess"
+            )
+            continue
+        # A watcher that DOES still define its own wrapper (e.g. a reinstated campaign fork) must
+        # keep the original in-process discipline: isolate the wrapper body (up to the next
+        # top-level `def `) and assert it no longer builds a `-c` code string nor invokes the
+        # interpreter.
         body = m.group(1)
         assert "sys.executable" not in body, f"{path.name}: append_spend must not shell out (CR-01)"
         assert '"-c"' not in body and "'-c'" not in body, (

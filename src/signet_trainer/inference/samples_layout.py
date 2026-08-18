@@ -4,8 +4,8 @@ The parallel-inference watcher dispatches a metered render and then asks the Vol
 That question has a different answer per family, and getting it wrong is not a cosmetic bug — it is
 the phantom-spend shape (``KNOWLEDGE.md`` ``watcher`` ``PYTHONPATH`` ``phantom-spend``):
 
-  * ``append_spend`` fires BEFORE ``dispatch_render`` (deliberate — an ATTACHED render whose client
-    dies still burned A100 time) and there is NO refund path.
+  * the ledger booking (``append_spend``, now inside the entrypoint gate itself — issue #37 findings
+    1/2) fires on every successful dispatch and there is NO refund path.
   * ``rendered`` is success-gated.
 
 So a watcher that looks for landed artifacts in the WRONG directory sees every render as FAILED,

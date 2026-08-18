@@ -311,6 +311,46 @@ def test_pre_adoption_entries_are_exempt_by_entry_order() -> None:
     )
 
 
+# ------------------------------------------------ (4b) issue #37 finding 6: absent-adoption-entry
+# handling — a downstream project's own DECISION-LOG must never be permanently red with a message
+# naming no fix.
+
+
+def test_absent_adoption_entry_with_nothing_post_cutoff_lints_clean() -> None:
+    """No adoption entry AND nothing dated on/after the cutoff -> [] ('nothing post-cutoff to
+    lint'), not the old single pseudo-violation that short-circuited every real rule."""
+    log = (
+        "## 2026-06-01 - Some pre-cutoff entry\n"
+        "- what: routine note, no adoption title anywhere in this log.\n"
+        "- why: prove an absent title alone is not fatal.\n"
+        "- source-tags: [house]\n"
+        "- run-refs: none\n"
+    )
+    assert find_adoption_index(split_log_entries(log)) is None, "fixture must carry no adoption entry"
+    assert lint_typed_state_log(log) == []
+
+
+def test_absent_adoption_entry_still_catches_real_post_cutoff_violations() -> None:
+    """No adoption entry, but a post-cutoff entry HAS load-bearing numerics with no state block ->
+    the violation still reports (issue #37 finding 6: the date-based cutoff runs independently of
+    the title anchor, so a missing title can never silently exempt the whole log)."""
+    log = (
+        "## 2026-07-20 - Synthetic: numerics with no adoption entry in this log at all\n"
+        "- what: the run cost $12.34 at step 3000.\n"
+        "- why: prove the absent-title path still catches real numerics.\n"
+        "- source-tags: [house]\n"
+        "- run-refs: none\n"
+    )
+    violations = lint_typed_state_log(log)
+    assert any("no '- state:' typed block" in v for v in violations), (
+        f"the real violation must still be reported: {violations}"
+    )
+    assert any(_ADOPTION_TITLE in v and "NOTE" in v for v in violations), (
+        f"an informational note naming the missing adoption entry must accompany real "
+        f"violations: {violations}"
+    )
+
+
 @pytest.mark.requires_live_harness
 def test_lint_catches_numerics_without_state_block(tmp_path: Path) -> None:
     """A synthetic violating entry FAILS the lint — proven on a tmp copy, never the real log."""
