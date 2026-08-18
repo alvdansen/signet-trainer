@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -94,6 +95,8 @@ __all__ = [
     "reference_dropout_for",
     "resolve_reference_slots",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -308,10 +311,11 @@ def resolve_reference_slots(
     not. That is the asymmetry the operator called *"actually ideal"* — it stops the adapter binding
     to a fixed reference regime.
 
-    Why the length check is a ``raise`` and not an ``assert``: a 3-slot return is the specific
-    blocker this function exists to prevent, and it does not fail locally — it OOMs a metered A100,
-    because ``validate_h3_reference_budget`` priced a 2-reference pairing domain. A bare ``assert``
-    disappears under ``python -O``, and this guard must not.
+    Why the length check is a ``raise`` and not an ``assert``: a slot-count MISMATCH here is
+    invisible on CPU — ``validate_h3_reference_budget`` prices exactly ``references_per_sample``
+    slots (2, or 3 for an explicit-manifest sequence task), so a silently wrong count sails past
+    config load and OOMs a metered A100 instead of failing here. A bare ``assert`` disappears under
+    ``python -O``, and this guard must not.
     """
     if references_per_sample < 1:
         raise ValueError(
@@ -359,10 +363,11 @@ def resolve_reference_slots(
         raise RuntimeError(
             f"resolve_reference_slots produced {len(slots)} slot(s) for segment {segment_index}, "
             f"expected exactly {references_per_sample}. The environment reference SUBSTITUTES for "
-            f"the last character slot and is never appended, so a 3-slot sample cannot be correct. "
-            f"A wrong count was never priced by the packed-sequence budget check "
-            f"(config/validators.validate_h3_reference_budget) and would surface as a CUDA OOM on a "
-            f"metered A100 rather than as an error here."
+            f"the last character slot and is never appended, so any count other than "
+            f"references_per_sample cannot be correct. This would surface as a CUDA OOM on a "
+            f"metered A100 rather than as an error here — the packed-sequence budget check "
+            f"(config/validators.validate_h3_reference_budget) prices exactly "
+            f"references_per_sample slots, not whatever count actually came out."
         )
     return slots
 
@@ -780,6 +785,15 @@ class H3RefStrategy(TrainingStrategy):
         self.patch_size = None if patch_size is None else tuple(int(p) for p in patch_size)
         self.max_packed_rows = max_packed_rows
         self.expected_layout = expected_layout
+        # #52 interim mitigation: the cache records no provenance for HOW its pool was chosen
+        # (explicit-manifest vs rotating pool), so a pool larger than `references_per_sample` is
+        # indistinguishable, from the cache alone, from a genuine mismatch — a 3-reference cache
+        # pointed at by a `references_per_sample: 2` config sails through and silently rotates
+        # 2-of-3 while the cached text payload still describes three pictures. The real fix is
+        # provenance-tagging the payload (tracked separately); this is the cheap interim half —
+        # surface the mismatch ONCE in the run log rather than nowhere. `False` until the first
+        # resolved segment so it fires at most once per strategy instance, not once per step.
+        self._logged_pool_size = False
 
     def get_data_sources(self) -> Sequence[Any]:
         """The H3 precomputed sources this strategy reads — four for Ref2VA, three at zero slots.
@@ -844,6 +858,21 @@ class H3RefStrategy(TrainingStrategy):
         """Resolve THIS segment's reference set: substitution, then D-10-REFORDER."""
         characters = [reference for reference, _ in pool if reference.kind != "environment"]
         environments = [reference for reference, _ in pool if reference.kind == "environment"]
+
+        if not self._logged_pool_size:
+            # #52 interim mitigation — see __init__. Once, at the first resolved segment: the
+            # cached pool size next to the configured slot count, so a stale-cache/re-configured-
+            # slot-count mismatch is at least VISIBLE in the run log instead of nowhere.
+            logger.info(
+                "H3RefStrategy: cached reference pool holds %d entr%s "
+                "(%d character, %d environment) against references_per_sample=%d.",
+                len(pool),
+                "y" if len(pool) == 1 else "ies",
+                len(characters),
+                len(environments),
+                self.references_per_sample,
+            )
+            self._logged_pool_size = True
 
         # ⛔ At most ONE environment reference, ALWAYS — it SUBSTITUTES for the last character
         # slot and is never appended, so "one" is a property of the substitution rule, not of the

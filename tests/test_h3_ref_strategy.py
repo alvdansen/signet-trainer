@@ -663,6 +663,48 @@ def test_prepare_returns_a_model_inputs_subclass_carrying_the_packed_batch() -> 
 
 
 # --------------------------------------------------------------------------------------------------
+# 7b. #52 interim mitigation — the cached-pool-size-vs-slot-count startup log
+# --------------------------------------------------------------------------------------------------
+
+
+def _pool(*refs: H3Reference) -> list:
+    """A minimal ``(H3Reference, tensor)`` pool — ``_resolve_slots`` never reads the tensor."""
+    return [(ref, torch.zeros(1, 1, 1)) for ref in refs]
+
+
+def test_resolve_slots_logs_the_cached_pool_size_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #52's interim mitigation: no cache provenance exists yet to tell a genuinely rotating
+    pool apart from a stale/re-configured one, so the cheap half is to make the mismatch VISIBLE —
+    log the cached pool size against the configured slot count once, at the first resolved segment.
+
+    Logged ONCE per strategy instance, not once per step: a per-segment log would drown a real run
+    in noise the operator has to scroll past on every single sample.
+    """
+    import logging
+
+    strategy = H3RefStrategy(references_per_sample=2)
+    characters = [
+        H3Reference(path=f"refs/char_{s}.png", kind="character", subject_id=s,
+                    width=1024, height=1536)
+        for s in ("A", "B", "C")
+    ]
+    pool = _pool(*characters)
+
+    with caplog.at_level(logging.INFO):
+        strategy._resolve_slots(0, pool)
+        strategy._resolve_slots(1, pool)
+
+    pool_size_logs = [r for r in caplog.records if "cached reference pool" in r.message]
+    assert len(pool_size_logs) == 1, (
+        "the pool-size-vs-slot-count log must fire exactly ONCE per strategy instance"
+    )
+    assert "3" in pool_size_logs[0].message  # pool size
+    assert "references_per_sample=2" in pool_size_logs[0].message
+
+
+# --------------------------------------------------------------------------------------------------
 # 8. The reference prefix: length, mask, and D-10-REFPIN
 # --------------------------------------------------------------------------------------------------
 

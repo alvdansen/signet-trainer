@@ -397,6 +397,56 @@ def test_a_bare_path_string_entry_is_refused_with_the_shape_to_write() -> None:
         )
 
 
+def test_a_pool_row_is_refused_at_three_slots() -> None:
+    """MAJOR-1 (house audit, PR #51): 3+ slots are EXPLICIT-MANIFEST ONLY.
+
+    The config-level widening to ``references_per_sample=3`` is safe only because the pool /
+    round-robin branch is UNREACHABLE at 3 — every row must instead supply its own
+    ``reference_paths``. Before this fix that safety case was prose: a ``character_references`` pool
+    of exactly 3 sailed through and made conditioning CONSTANT across the corpus (the exact
+    copy-collapse regime the 2-slot cap existed to prevent), and a pool of 2 silently duplicated a
+    reference via the round-robin's modulo wraparound (``[c0, c1, c0]``) while the row-count check
+    passed. Refusing the pool branch outright at ``references_per_sample >= 3`` is what makes the
+    PR's safety case code, not prose.
+    """
+    row = {
+        "character_references": [
+            {"path": "refs/char_a.png", "subject_id": "A"},
+            {"path": "refs/char_b.png", "subject_id": "B"},
+            {"path": "refs/char_c.png", "subject_id": "C"},
+        ]
+    }
+    with pytest.raises(ValueError, match="EXPLICIT-MANIFEST"):
+        _resolver()(
+            row,
+            0,
+            Path("/dataset/h3_embe"),
+            references_per_sample=3,
+            reference_pair_seed=42,
+            environment_ref_last=True,
+        )
+
+
+def test_a_short_pool_is_refused_rather_than_silently_wrapping() -> None:
+    """A pool smaller than the character slots it must fill would otherwise wrap and DUPLICATE a
+    reference within the same sample — refused instead of padded (house audit, PR #51, MAJOR-1).
+
+    Two-character pool, ``references_per_sample=2``, no environment reference: 2 character slots
+    are needed but the pool holds only 1, so ``pool[(start + offset) % len(pool)]`` for
+    ``offset in (0, 1)`` would pick the SAME entry twice.
+    """
+    row = {"character_references": [{"path": "refs/char_a.png", "subject_id": "A"}]}
+    with pytest.raises(ValueError, match="modulo wraparound"):
+        _resolver()(
+            row,
+            0,
+            Path("/dataset/h3_embe"),
+            references_per_sample=2,
+            reference_pair_seed=42,
+            environment_ref_last=True,
+        )
+
+
 def test_a_flat_reference_paths_list_must_declare_its_own_kinds() -> None:
     """``reference_paths`` carries no key to read a kind from, so the entries must say."""
     resolve = _resolver()
