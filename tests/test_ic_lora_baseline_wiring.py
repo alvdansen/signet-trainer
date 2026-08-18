@@ -178,3 +178,54 @@ def test_official_adapter_repo_constant_matches_config() -> None:
     assert 'OFFICIAL_IC_LORA_BASELINE_REPO = "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control"' in code, (
         "fns.py must define OFFICIAL_IC_LORA_BASELINE_REPO = the Union-Control repo (the download source)"
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# (4) #22 finding 2 — the 22B + Gemma component load must be SKIPPED on this leg, not just unread
+# --------------------------------------------------------------------------------------------------
+#
+# Before the fix: sample() called load_ltxv_components(..., with_text_encoder=cached_by_prompt is
+# None) UNCONDITIONALLY at (3), before the ic_lora_baseline branch's `mode == "ic_lora" and
+# two_stage` gate. Because two_stage=True skips PHASE A (cached_by_prompt stays None),
+# with_text_encoder resolved True — dragging the full 22B transformer + Gemma-12B onto CUDA — and
+# the baseline branch below never reads `components` at all; it builds its own ICLoraPipeline from
+# raw weight paths and owns its own Gemma. Two 22B transformers + two Gemma-12Bs cannot coexist on
+# one A100-80GB (the two-phase VRAM rule): guaranteed OOM before the first clip, for a container
+# that goes on to do all its own loading anyway.
+
+
+def test_component_load_is_skipped_for_ic_lora_baseline() -> None:
+    """The load_ltxv_components() call at (3) must not fire when mode=='ic_lora' and two_stage."""
+    code = _fns_code()
+
+    # The `components = load_ltxv_components(...)` assignment must be conditioned on the SAME
+    # predicate that gates the ic_lora_baseline branch (`mode == "ic_lora" and two_stage`), so the
+    # 22B + Gemma load never executes on that leg.
+    m = re.search(
+        r'components\s*=\s*\(\s*None\s*\n\s*if\s*\(\s*config\.conditioning\.mode\s*==\s*'
+        r'["\']ic_lora["\']\s*and\s*two_stage\s*\)\s*\n\s*else\s*load_ltxv_components\(',
+        code,
+    )
+    assert m is not None, (
+        "sample()'s (3) component load must be `None if (config.conditioning.mode == 'ic_lora' "
+        "and two_stage) else load_ltxv_components(...)` — a bare unconditional "
+        "`load_ltxv_components(...)` call reintroduces the guaranteed-OOM-before-first-clip bug "
+        "(#22 finding 2): the ic_lora_baseline branch never reads `components`."
+    )
+
+    # The load call itself must sit strictly AFTER the guard predicate in source order (belt and
+    # suspenders — proves the guard actually wraps the load, not merely co-occurs with it).
+    guard_idx = code.index('if (config.conditioning.mode == "ic_lora" and two_stage)')
+    load_idx = code.index("load_ltxv_components(", guard_idx)
+    assert load_idx > guard_idx, (
+        "the ic_lora/two_stage guard must precede the load_ltxv_components(...) call it protects"
+    )
+
+    # And the ic_lora_baseline branch itself must appear AFTER the (now-guarded) load call — i.e.
+    # this is a gate on the load, not a relocation of the branch above it (either fix shape is
+    # acceptable per the issue, but the guard-shape fix must not also duplicate the branch).
+    baseline_branch_idx = code.index('if config.conditioning.mode == "ic_lora" and two_stage:')
+    assert baseline_branch_idx > load_idx, (
+        "the ic_lora_baseline branch should still appear once, after the guarded component load "
+        "statement"
+    )

@@ -11,6 +11,7 @@ Anti-Pattern 6: importing ``inference.lora_load`` must NOT pull modal / ltx_core
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -22,9 +23,11 @@ peft = pytest.importorskip("peft")
 from peft import LoraConfig  # noqa: E402  — after skip-guard
 
 from signet_trainer.inference.lora_load import (  # noqa: E402
+    ADAPTER_CONFIG_FILENAME,
     _extract_lora_target_modules,
     _get_lora_rank,
     build_inference_lora_config,
+    read_trained_alpha,
 )
 from signet_trainer.lora.peft import _PEFT_PREFIX, strip_peft_prefix  # noqa: E402
 
@@ -159,3 +162,85 @@ def test_build_inference_lora_config_scale_multiplies_alpha() -> None:
     cfg = build_inference_lora_config(sd, lora_scale=2.0)
     assert cfg.r == 64
     assert cfg.lora_alpha == 128  # alpha == int(rank * scale)
+
+
+# --------------------------------------------------------------------------------------------------
+# #22 finding 4 — read the TRAINED alpha from adapter_config.json when present; fall back to the
+# rank*lora_scale rebuild ONLY when it is absent (never refuse a bare adapter_model.safetensors);
+# refuse when the sidecar IS present and disagrees with the weights (a real contradiction).
+# --------------------------------------------------------------------------------------------------
+
+
+def _write_adapter_config(tmp_path: Path, *, r: int, lora_alpha: int) -> Path:
+    config_path = tmp_path / ADAPTER_CONFIG_FILENAME
+    config_path.write_text(json.dumps({"r": r, "lora_alpha": lora_alpha}), encoding="utf-8")
+    return config_path
+
+
+def test_read_trained_alpha_returns_none_when_sidecar_absent(tmp_path: Path) -> None:
+    # A bare adapter_model.safetensors with no adapter_config.json — legacy/external adapters
+    # that render fine today. Must NOT raise (#22 finding 4: "never refuse a bare
+    # adapter_model.safetensors").
+    assert read_trained_alpha(tmp_path, extracted_rank=64) is None
+
+
+def test_read_trained_alpha_reads_declared_alpha_when_rank_matches(tmp_path: Path) -> None:
+    _write_adapter_config(tmp_path, r=64, lora_alpha=32)
+    assert read_trained_alpha(tmp_path, extracted_rank=64) == 32
+
+
+def test_read_trained_alpha_raises_on_rank_mismatch(tmp_path: Path) -> None:
+    # The sidecar IS present and disagrees with the weights themselves — a corrupted/mismatched
+    # pair, not an absence. This is the ONLY case #22 finding 4 asks to refuse on.
+    _write_adapter_config(tmp_path, r=32, lora_alpha=32)
+    with pytest.raises(ValueError, match="declares r=32.*rank 64"):
+        read_trained_alpha(tmp_path, extracted_rank=64)
+
+
+def test_build_inference_lora_config_honors_trained_alpha_over_rank_rebuild(
+    tmp_path: Path,
+) -> None:
+    # rank=64, TRAINED alpha=32 (schema-legal: lora.alpha is independently settable) — the old
+    # `int(rank * lora_scale)` rebuild would render this at 2x the trained strength. With the
+    # sidecar present, the trained alpha must win.
+    _write_adapter_config(tmp_path, r=64, lora_alpha=32)
+    sd = strip_peft_prefix(_synthetic_prefixed_sd(rank=64))
+    cfg = build_inference_lora_config(sd, lora_scale=1.0, adapter_dir=tmp_path)
+    assert cfg.r == 64
+    assert cfg.lora_alpha == 32  # trained alpha, NOT rank * lora_scale (== 64)
+
+
+def test_build_inference_lora_config_applies_lora_scale_on_top_of_trained_alpha(
+    tmp_path: Path,
+) -> None:
+    _write_adapter_config(tmp_path, r=64, lora_alpha=32)
+    sd = strip_peft_prefix(_synthetic_prefixed_sd(rank=64))
+    cfg = build_inference_lora_config(sd, lora_scale=2.0, adapter_dir=tmp_path)
+    assert cfg.lora_alpha == 64  # trained_alpha (32) * lora_scale (2.0)
+
+
+def test_build_inference_lora_config_falls_back_loudly_when_sidecar_absent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # No adapter_config.json under adapter_dir — must fall back to the old rebuild (never refuse),
+    # but print a LOUD notice naming the assumption it is making (#22 finding 4).
+    sd = strip_peft_prefix(_synthetic_prefixed_sd(rank=64))
+    cfg = build_inference_lora_config(sd, lora_scale=1.0, adapter_dir=tmp_path)
+    assert cfg.lora_alpha == 64  # old rebuild: int(rank * lora_scale)
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "adapter_config.json" in out and "#22 finding 4" in out
+
+
+def test_build_inference_lora_config_raises_on_rank_mismatched_sidecar(tmp_path: Path) -> None:
+    _write_adapter_config(tmp_path, r=32, lora_alpha=16)
+    sd = strip_peft_prefix(_synthetic_prefixed_sd(rank=64))  # actual weights are rank 64
+    with pytest.raises(ValueError, match="declares r=32.*rank 64"):
+        build_inference_lora_config(sd, lora_scale=1.0, adapter_dir=tmp_path)
+
+
+def test_build_inference_lora_config_no_adapter_dir_matches_legacy_behavior() -> None:
+    # adapter_dir=None (the default) must reproduce the pre-fix behavior byte-for-byte — the
+    # backward-compat path for every existing caller that never learned about adapter_dir.
+    sd = strip_peft_prefix(_synthetic_prefixed_sd(rank=64))
+    cfg = build_inference_lora_config(sd, lora_scale=1.0)
+    assert cfg.lora_alpha == 64
