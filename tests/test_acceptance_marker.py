@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from signet_trainer.train.acceptance_marker import (
     ACCEPTANCE_FAILED_MARKER_NAME,
+    acceptance_marker_blocks,
     acceptance_marker_is_current,
     clear_acceptance_failed_marker,
     marker_path,
@@ -93,6 +94,38 @@ def test_marker_is_stale_when_latest_step_is_lower_than_recorded() -> None:
     """Defensive: a lower latest step (dir reset to an earlier checkpoint) is also "not current" —
     only an EXACT match is honoured, never a >= or <= comparison that could mask a real change."""
     assert acceptance_marker_is_current(recorded_step=800, latest_step=799) is False
+
+
+# --------------------------------------------------------------------------------------------------
+# acceptance_marker_blocks — the PLAN half of the key (current AND recorded_step >= max_steps)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_bumped_max_steps_is_not_blocked_even_though_the_marker_is_current() -> None:
+    """The operator bumps training.max_steps and re-dispatches into the SAME output_dir: nothing
+    has trained yet (the checkpoint is still at 800, so the marker is step-current), but this
+    dispatch has more training work to do (max_steps=1600 > recorded step 800) than the dispatch
+    that plateaued. Must NOT block — this is the bug the marker's docstring warned about."""
+    assert acceptance_marker_blocks(recorded_step=800, latest_step=800, max_steps=1600) is False
+
+
+def test_marker_at_max_steps_is_still_blocked() -> None:
+    """The real retry case: the marker's recorded step already equals THIS dispatch's max_steps,
+    so there is no further training this dispatch could ever do — the zero-delta verdict still
+    applies and the cheap re-raise must fire."""
+    assert acceptance_marker_blocks(recorded_step=1600, latest_step=1600, max_steps=1600) is True
+
+
+def test_marker_past_max_steps_is_still_blocked() -> None:
+    """Defensive: recorded_step > max_steps (e.g. max_steps lowered) is also blocked — the ">="
+    comparison, not "==", is what the conjunct uses."""
+    assert acceptance_marker_blocks(recorded_step=1600, latest_step=1600, max_steps=1000) is True
+
+
+def test_stale_marker_is_not_blocked_regardless_of_max_steps() -> None:
+    """If real training already moved the checkpoint past the recorded step, the marker is stale
+    on the STEP half alone — the max_steps conjunct must never rescue a stale marker into blocking."""
+    assert acceptance_marker_blocks(recorded_step=800, latest_step=1000, max_steps=800) is False
 
 
 # --------------------------------------------------------------------------------------------------

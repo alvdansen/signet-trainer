@@ -29,6 +29,14 @@ scoped in two independent ways:
     trained since it was written. If the latest checkpoint has moved past the recorded step, real
     training happened (a genuinely new attempt — an operator fix followed by a continued run) and
     the marker is STALE: it must be cleared, never honoured.
+  * **By PLAN** — a bumped ``max_steps`` is a genuinely new attempt too, even though nothing has
+    trained yet: an operator who raises ``training.max_steps`` and re-dispatches into the SAME
+    ``output_dir`` gives this dispatch more work to do than the one that plateaued. The step check
+    alone cannot see this (the checkpoint is untouched, so it still looks "current"), so
+    :func:`acceptance_marker_blocks` adds the conjunct ``recorded_step >= max_steps`` — the marker
+    is honoured only if the dispatch that wrote it had already reached (or passed) THIS dispatch's
+    target step. Below that, the verdict describes a plateau under a plan this dispatch no longer
+    has.
 
 Import tier: **stdlib only** (``json`` + ``pathlib``), no package side effects — for the same
 reason ``inference/render_key.py`` and ``train/loop.checkpoint_watchdog_exceeded`` live where they
@@ -45,6 +53,7 @@ from typing import Any
 
 __all__ = [
     "ACCEPTANCE_FAILED_MARKER_NAME",
+    "acceptance_marker_blocks",
     "acceptance_marker_is_current",
     "clear_acceptance_failed_marker",
     "marker_path",
@@ -102,6 +111,26 @@ def acceptance_marker_is_current(recorded_step: int, latest_step: int | None) ->
     legitimate run, which is the failure mode this function exists to rule out.
     """
     return latest_step == recorded_step
+
+
+def acceptance_marker_blocks(recorded_step: int, latest_step: int | None, max_steps: int) -> bool:
+    """True iff the marker must be HONOURED (re-raise, no reload) for THIS dispatch.
+
+    A prior zero-delta verdict only proves the run is deterministically stuck if the checkpoint it
+    was measured against was ALREADY at (or past) this dispatch's ``max_steps`` — i.e. this
+    dispatch, exactly like the one that wrote the marker, has no further steps left to take. That
+    is ``acceptance_marker_is_current`` (the step half of the key) AND ``recorded_step >=
+    max_steps`` (the config half): an operator who bumps ``training.max_steps`` and re-dispatches
+    into the SAME ``output_dir`` is not repeating the failed dispatch — this dispatch has *more*
+    training work to do than the one that failed, so the zero-delta verdict it recorded no longer
+    applies. Without this second conjunct, that legitimate continue would be blocked forever: the
+    marker matches on step (nothing has trained since — correctly, since the whole point is that
+    the checkpoint is unchanged) but describes a *different* config's plateau. Missing either half
+    is wrong in a different direction: current-but-not-yet-at-max_steps is a stale verdict from a
+    plan that has since changed (do NOT block); not-current is a stale verdict from real training
+    that happened since (do NOT block, handled by ``acceptance_marker_is_current`` alone).
+    """
+    return acceptance_marker_is_current(recorded_step, latest_step) and recorded_step >= max_steps
 
 
 def clear_acceptance_failed_marker(output_dir: Path | str) -> None:

@@ -3987,7 +3987,7 @@ def _h3_check_acceptance_marker(config: Any) -> None:
     ``train/acceptance_marker.py`` for the scoping rules this enforces.
     """
     from signet_trainer.train.acceptance_marker import (  # noqa: PLC0415
-        acceptance_marker_is_current,
+        acceptance_marker_blocks,
         clear_acceptance_failed_marker,
         marker_path,
         read_acceptance_failed_marker,
@@ -4000,14 +4000,16 @@ def _h3_check_acceptance_marker(config: Any) -> None:
         return
 
     current_step = CheckpointManager(run_dir).latest_step()
-    if acceptance_marker_is_current(recorded["step"], current_step):
+    if acceptance_marker_blocks(recorded["step"], current_step, config.training.max_steps):
         raise RuntimeError(
             f"[h3_train] acceptance-failed marker at {marker_path(run_dir)} — a prior life "
             f"already measured max|delta velocity| == 0.0 at step {recorded['step']} (recorded "
-            f"delta={recorded['delta']!r}) and the latest checkpoint is STILL that step, so "
-            "nothing has trained since. Re-raising WITHOUT re-loading the 61.7 GiB model (AUDIT "
-            "#34 direction 7) — this retry still reports FAILED, it just costs a container boot "
-            "instead of a full load. Delete the marker to force a genuine re-measurement."
+            f"delta={recorded['delta']!r}) and the latest checkpoint is STILL that step, with "
+            f"this dispatch's max_steps ({config.training.max_steps}) already reached, so nothing "
+            "has trained since and there is no further training this dispatch could do. Re-raising "
+            "WITHOUT re-loading the 61.7 GiB model (AUDIT #34 direction 7) — this retry still "
+            "reports FAILED, it just costs a container boot instead of a full load. Delete the "
+            "marker to force a genuine re-measurement."
         )
 
     # Stale: the latest checkpoint has moved past (or off of) the recorded step, so real training
