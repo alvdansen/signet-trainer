@@ -2896,7 +2896,17 @@ def _h3_manifest_rows(metadata_path: str) -> list[dict]:
         for line in handle:
             stripped = line.strip()
             if stripped:
-                rows.append(json.loads(stripped))
+                row = json.loads(stripped)
+                index = len(rows)
+                if not str(row.get("caption", "")).strip():
+                    raise ValueError(
+                        f"[h3_preprocess] manifest row {index} ({row.get('media_path')!r}) has an "
+                        "empty caption. H3 presents references as <Picture i> and then the prompt "
+                        "VERBATIM, so an empty caption conditions on nothing AND tokenizes to zero "
+                        "text rows, which the encoder cannot reshape. Refusing before PHASE A rather "
+                        "than failing inside it."
+                    )
+                rows.append(row)
     if not rows:
         raise RuntimeError(
             f"[h3_preprocess] the manifest {metadata_path} is empty — refusing to report a "
