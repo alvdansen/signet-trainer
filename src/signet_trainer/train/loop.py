@@ -222,9 +222,11 @@ def checkpoint_watchdog_exceeded(
     Scope (audit-scoped): this catches a wedged/slow cadence BETWEEN optimizer steps — a dataloader
     wedge, a degraded-throughput crawl, or a preempted-but-not-crashed container that stops committing
     — NOT a hard C-level hang inside a single forward (no Python frame runs to check the clock there).
-    When it trips, ``train_loop`` raises; ``train()`` carries ``modal.Retries(max_retries=3)``, so the
-    raise becomes an F9-retried IN-DIR resume from the latest committed checkpoint rather than a
-    silent burn to the 24h ceiling.
+    When it trips, ``train_loop`` raises; on Modal, ``train()`` carries ``modal.Retries(max_retries=
+    10)`` (issue #30 finding #3 — this was previously stale at 3; ``modal/fns.py``'s decorator is the
+    source of truth), so the raise becomes an F9-retried IN-DIR resume from the latest committed
+    checkpoint rather than a silent burn to the 24h ceiling. Off-Modal (``checkpoints_vol=None``)
+    there is no retry at all — see the raise site's conditional message.
 
     Pure (no modal / no ltx_* / no GPU) so the stall gate is CPU-testable in isolation.
     """
@@ -377,22 +379,35 @@ def train_loop(
 
             # AUDIT #11 — liveness gate: if no checkpoint has committed for longer than
             # checkpoint_expected_minutes * checkpoint_stall_multiplier, treat the round as
-            # hung/preempted and RAISE. train() carries modal.Retries(max_retries=3), so this
-            # becomes an F9 in-dir resume from the latest committed checkpoint instead of a silent
-            # burn to the 24h ceiling. Inert while checkpoint_expected_minutes is None.
+            # hung/preempted and RAISE. On Modal, train() carries modal.Retries(max_retries=10),
+            # so this becomes an F9 in-dir resume from the latest committed checkpoint instead of
+            # a silent burn to the 24h ceiling. Inert while checkpoint_expected_minutes is None.
             elapsed_minutes = (time.monotonic() - last_commit) / 60.0
             if checkpoint_watchdog_exceeded(
                 elapsed_minutes,
                 t.checkpoint_expected_minutes,
                 t.checkpoint_stall_multiplier,
             ):
+                # Issue #30 finding #3: off-Modal (checkpoints_vol is None, e.g. the local runner)
+                # there is NO retry -- the deadline is Modal-calibrated and promising "the train()
+                # retry resumes in-dir" off-Modal is false. Condition the recovery text on the
+                # actual caller instead of asserting a retry that may not exist.
+                if checkpoints_vol is not None:
+                    retry_note = (
+                        "Treating the round as hung/preempted — the train() retry resumes in-dir "
+                        "from the latest committed checkpoint."
+                    )
+                else:
+                    retry_note = (
+                        "The local runner does not retry: re-run the same command to resume "
+                        "in-dir from the latest committed checkpoint (if none exists yet, raise "
+                        "training.checkpoint_expected_minutes, or leave it unset for local runs)."
+                    )
                 raise RuntimeError(
                     f"Training liveness watchdog tripped at step {global_step}: no committed "
                     f"checkpoint for {elapsed_minutes:.1f} min > "
                     f"{t.checkpoint_expected_minutes} * {t.checkpoint_stall_multiplier} min "
-                    "(checkpoint_expected_minutes * checkpoint_stall_multiplier). Treating the "
-                    "round as hung/preempted — the train() retry resumes in-dir from the latest "
-                    "committed checkpoint."
+                    f"(checkpoint_expected_minutes * checkpoint_stall_multiplier). {retry_note}"
                 )
 
             if global_step % t.checkpoint_every == 0:

@@ -24,6 +24,8 @@ import io
 import tokenize
 from pathlib import Path
 
+import pytest
+
 from signet_trainer.train.loop import checkpoint_watchdog_exceeded
 
 _LOOP_SRC = (
@@ -141,3 +143,101 @@ def test_train_loop_refreshes_last_commit():
     assert names.count("last_commit") >= 3, "last_commit must be refreshed at each commit"
     # time.monotonic is the clock source.
     assert "monotonic" in names, "watchdog clock must use time.monotonic"
+
+
+# --------------------------------------------------------------------------------------------------
+# Issue #30 finding #3 — the watchdog's trip message must not promise a Modal retry off-Modal
+# --------------------------------------------------------------------------------------------------
+
+
+def _watchdog_trip_harness(monkeypatch: pytest.MonkeyPatch):
+    """A CPU/stub ``train_loop`` call that deterministically trips the watchdog on step 1.
+
+    ``time.monotonic`` is monkeypatched (rather than using a tiny ``expected_minutes`` and hoping
+    real wall-clock elapses enough) because on this machine's clock resolution two calls
+    microseconds apart can read back byte-identical, making a real-clock trip flaky.
+    ``loop.py``'s ``time.monotonic`` is called exactly twice on the untripped step-1 path: once to
+    seed ``last_commit`` before the loop, once inside the watchdog check -- so a 2-value sequence
+    (0.0, then a huge jump) trips it every time with zero timing dependence.
+    """
+    import torch
+    import torch.nn as nn
+    from types import SimpleNamespace
+
+    from signet_trainer.train import loop as loop_mod
+    from signet_trainer.train.flow_match import FlowMatchingSchedule
+
+    clock = iter([0.0, 10_000.0])
+    monkeypatch.setattr(loop_mod.time, "monotonic", lambda: next(clock))
+
+    param = nn.Parameter(torch.zeros(1))
+
+    class _Model:
+        def parameters(self):
+            return iter([param])
+
+    class _CkptManager:
+        def resume(self, model, optimizer, scheduler):  # noqa: ANN001
+            return 0
+
+        def save(self, *a, **k):  # noqa: ANN002, ANN003
+            pass
+
+    class _Optim:
+        def step(self):
+            pass
+
+        def zero_grad(self):
+            pass
+
+    class _Sched:
+        def step(self):
+            pass
+
+    def _step_fn(model, batch, schedule, rng, *, device, dtype):  # noqa: ANN001
+        return (param * 2).sum()  # a real graph so .backward() works
+
+    config = SimpleNamespace(
+        training=SimpleNamespace(
+            mixed_precision="fp32", seed=42, max_steps=1,
+            gradient_accumulation_steps=1, max_grad_norm=1.0, checkpoint_every=1000,
+            checkpoint_expected_minutes=1.0, checkpoint_stall_multiplier=1.0,
+        ),
+    )
+    dataset = [torch.zeros(1)]
+    return dict(
+        model=_Model(), dataset=dataset, optimizer=_Optim(), scheduler=_Sched(),
+        schedule=FlowMatchingSchedule(uniform_prob=0.30), ckpt_manager=_CkptManager(),
+        config=config, step_fn=_step_fn,
+    )
+
+
+def test_watchdog_trip_promises_modal_retry_only_when_checkpoints_vol_present(monkeypatch):
+    # Issue #30 finding #3 check: on Modal (checkpoints_vol is not None) the F9 retry really
+    # exists — the trip message may promise it.
+    from signet_trainer.train.loop import train_loop
+
+    h = _watchdog_trip_harness(monkeypatch)
+    with pytest.raises(RuntimeError, match=r"the train\(\) retry resumes in-dir"):
+        train_loop(
+            h["model"], h["dataset"], h["optimizer"], h["scheduler"], h["schedule"],
+            h["ckpt_manager"], h["config"], checkpoints_vol=object(), step_fn=h["step_fn"],
+        )
+
+
+def test_watchdog_trip_off_modal_tells_operator_to_rerun_not_a_fake_retry(monkeypatch):
+    # Issue #30 finding #3 defect: off-Modal (checkpoints_vol=None, the local runner) there is NO
+    # retry — the old message unconditionally promised "the train() retry resumes in-dir", which
+    # is false off-Modal. The local-runner path must say to re-run manually instead, and must NOT
+    # repeat the Modal-only promise.
+    from signet_trainer.train.loop import train_loop
+
+    h = _watchdog_trip_harness(monkeypatch)
+    with pytest.raises(RuntimeError, match="local runner does not retry") as excinfo:
+        train_loop(
+            h["model"], h["dataset"], h["optimizer"], h["scheduler"], h["schedule"],
+            h["ckpt_manager"], h["config"], checkpoints_vol=None, step_fn=h["step_fn"],
+        )
+    assert "the train() retry resumes in-dir" not in str(excinfo.value), (
+        "the off-Modal trip message must not promise a retry that does not exist locally"
+    )

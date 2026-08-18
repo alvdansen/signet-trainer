@@ -15,9 +15,11 @@ import pytest
 from signet_trainer.config.load import load_config
 from signet_trainer.local import BETA_BANNER, ISSUES_URL, ROADMAP_ISSUE
 from signet_trainer.local.runner import (
+    EXIT_CRASHED,
     EXIT_NOT_APPROVED,
     EXIT_REFUSED,
     LocalPaths,
+    main,
     plan_text,
     refusals,
     resolve_paths,
@@ -88,6 +90,38 @@ def test_refuses_multi_frame_training_with_conditioning_items():
     assert any("sample-only" in b and "WR-04" in b for b in refusals(cfg))
 
 
+def test_refuses_armed_checkpoint_expected_minutes():
+    # Issue #30 finding #3: this deadline is Modal-calibrated -- an armed value deterministically
+    # kills a healthy local run (no retry off-Modal) and must be a loud refusal, not a silent pass.
+    cfg = _ltx_config().model_copy(deep=True)
+    object.__setattr__(cfg.training, "checkpoint_expected_minutes", 45.0)
+    blockers = refusals(cfg)
+    assert any("checkpoint_expected_minutes" in b and "45.0" in b for b in blockers)
+
+
+def test_unarmed_checkpoint_expected_minutes_has_no_refusal():
+    # None (the default) is the byte-identical off-state -- must not be refused.
+    cfg = _ltx_config()
+    assert cfg.training.checkpoint_expected_minutes is None
+    assert not any("checkpoint_expected_minutes" in b for b in refusals(cfg))
+
+
+def test_refuses_backup_enabled():
+    # Issue #30 finding #6: backup mirrors the Modal checkpoints Volume ONLY -- a local run's
+    # checkpoints are never enumerated, so silently passing backup.enabled=true is the exact
+    # silently-ignored-config-block class the multi_frame refusal already forbids.
+    cfg = _ltx_config().model_copy(deep=True)
+    object.__setattr__(cfg.backup, "enabled", True)
+    blockers = refusals(cfg)
+    assert any("backup.enabled" in b and "Modal checkpoints Volume" in b for b in blockers)
+
+
+def test_backup_disabled_by_default_has_no_refusal():
+    cfg = _ltx_config()
+    assert cfg.backup.enabled is False
+    assert not any("backup" in b for b in refusals(cfg))
+
+
 def test_failed_dryrun_gate_refuses_and_never_claims_passed(monkeypatch, capsys):
     # Parity-review BLOCKER regression: run_dryrun returns non-zero and NEVER raises; a discarded
     # rc printed 'PASSED' over a failed gate. The gate must be the rc check.
@@ -154,6 +188,180 @@ def test_plan_text_carries_typed_slots(tmp_path):
     for slot in ("max_steps:", "checkpoint_every:", "keep_checkpoints:", "blocks_to_swap:",
                  "rank", "wall-clock: UNKNOWN"):
         assert slot in text, slot
+
+
+def test_plan_text_prints_checkpoint_watchdog_and_backup_knobs(tmp_path):
+    # Issue #30 findings #3 / #6: plan_text claims to print every load-bearing value -- these two
+    # were previously silently omitted entirely.
+    cfg = _ltx_config()
+    paths = LocalPaths(tmp_path / "m", tmp_path / "t", tmp_path / "d", tmp_path / "o")
+    text = plan_text(cfg, paths, "vram: test")
+    assert "checkpoint_expected_minutes:" in text
+    assert "backup.enabled:" in text
+
+
+def _stage_runnable_config(tmp_path: Path) -> tuple[str, str]:
+    """Write weights + a data dir for the LTX example config under ``tmp_path``.
+
+    Returns ``(config_path, weights_root)`` -- both under ``tmp_path`` so ``output_root=tmp_path``
+    works too. Shared by the ``--dry-run-only`` and post-preflight-crash tests below.
+    """
+    import yaml
+
+    cfg = _ltx_config()
+    (tmp_path / cfg.model.model_id).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / cfg.model.model_id).touch()
+    (tmp_path / cfg.model.text_encoder_id).mkdir(parents=True, exist_ok=True)
+    data = tmp_path / "data"
+    data.mkdir()
+    doc = yaml.safe_load(LTX_EXAMPLE.read_text(encoding="utf-8"))
+    doc["data"]["preprocessed_data_root"] = str(data)
+    patched_cfg = tmp_path / "cfg.yaml"
+    patched_cfg.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    return str(patched_cfg), str(tmp_path)
+
+
+# ---- --dry-run-only is the FREE preview: no GPU, no training deps required (finding #2) --------
+
+
+def test_dry_run_only_never_probes_cuda(tmp_path, monkeypatch, capsys):
+    # Issue #30 finding #2: --dry-run-only is documented (README + --help) as FREE -- refusals +
+    # shape gate + plan print, nothing else. Before the fix, `torch.cuda.is_available()` was
+    # probed BEFORE this check, so a laptop (or a GPU box without a CUDA context) got a FALSE
+    # "REFUSED -- torch.cuda.is_available() is False" and never saw the plan. NOTE: the dry-run
+    # shape gate itself (signet_trainer.dryrun.shapes) legitimately imports torch for CPU shape
+    # math -- torch is a base dep repo-wide -- so this pins the actual defect (a CUDA probe, not
+    # torch import) rather than the broader, wrong claim that dry-run-only needs zero torch.
+    import torch
+
+    def _no_cuda_probe(*a, **k):
+        raise AssertionError("--dry-run-only must not probe torch.cuda")
+
+    monkeypatch.setattr(torch.cuda, "is_available", _no_cuda_probe)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", _no_cuda_probe)
+
+    config_path, weights_root = _stage_runnable_config(tmp_path)
+    rc = run(config_path, weights_root=weights_root, output_root=str(tmp_path), dry_run_only=True)
+    out = capsys.readouterr().out
+
+    assert rc == 0, "the FREE preview must succeed without ever probing CUDA"
+    assert "not probed (--dry-run-only" in out
+    assert "PLAN (nothing has run yet)" in out
+    assert "--dry-run-only: stopping before the approval gate" in out
+    assert "REFUSED" not in out
+
+
+# ---- main() installs the process's only logging handler (finding #1) ---------------------------
+
+
+def _reset_root_logger():
+    import logging
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    for h in saved_handlers:
+        root.removeHandler(h)
+    return root, saved_handlers, saved_level
+
+
+def _restore_root_logger(root, saved_handlers, saved_level):
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    for h in saved_handlers:
+        root.addHandler(h)
+    root.setLevel(saved_level)
+
+
+def test_main_installs_a_logging_handler_that_carries_library_info_lines(monkeypatch, capsys):
+    # Issue #30 finding #1: before the fix, `logging.getLogger().handlers == []`, so every
+    # logger.info in train/loop.py (the VRAM gauge) and train/checkpoint.py (saved/resumed/pruned)
+    # was silently dropped for the whole run. main() must install a handler that actually surfaces
+    # them.
+    monkeypatch.delenv("SIGNET_LOG_LEVEL", raising=False)
+    root, saved_handlers, saved_level = _reset_root_logger()
+    try:
+        rc = main(["--config", str(REFUSED_EXAMPLE)])
+        assert rc == EXIT_REFUSED
+        assert root.handlers, "main() must install a logging handler"
+
+        import signet_trainer.train.checkpoint as ck
+
+        ck.logger.info("Saved checkpoint: %s", "checkpoint-step-00200-loss-0.1234")
+        out = capsys.readouterr().out
+        assert "Saved checkpoint: checkpoint-step-00200-loss-0.1234" in out
+    finally:
+        _restore_root_logger(root, saved_handlers, saved_level)
+
+
+def test_main_honors_signet_log_level_env_override(monkeypatch):
+    import logging
+
+    monkeypatch.setenv("SIGNET_LOG_LEVEL", "DEBUG")
+    root, saved_handlers, saved_level = _reset_root_logger()
+    try:
+        main(["--config", str(REFUSED_EXAMPLE)])
+        assert root.level == logging.DEBUG
+    finally:
+        _restore_root_logger(root, saved_handlers, saved_level)
+
+
+# ---- FileNotFoundError: REFUSED only pre-approval, a propagated crash after (finding #4) --------
+
+
+def test_main_labels_pre_approval_filenotfound_as_refused_not_crashed():
+    # REFUSED_EXAMPLE's ic_lora conditioning.mode is refused before any path is even touched --
+    # a baseline that the pre-approval path still gets the friendly line + EXIT_REFUSED.
+    rc = run(str(REFUSED_EXAMPLE))
+    assert rc == EXIT_REFUSED
+
+
+def test_run_reraises_filenotfound_once_preflight_is_done(tmp_path, monkeypatch):
+    # Issue #30 finding #4 regression: drive run() all the way past the approval gate (approve=
+    # True, faked CUDA + deps), then make the first post-approval loader raise FileNotFoundError.
+    # Before the fix this was caught by the SAME handler as a bad --weights-root and relabelled
+    # "REFUSED" (exit 2) with the traceback swallowed -- indistinguishable from "your config is
+    # unsupported, nothing was loaded" even though 22B+Gemma had already loaded.
+    import sys
+    import types
+
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (80 * 2**30, 80 * 2**30))
+    for dep in ("bitsandbytes", "ltx_trainer"):
+        monkeypatch.setitem(sys.modules, dep, types.ModuleType(dep))
+
+    import signet_trainer.models.loader as loader_mod
+
+    def _boom(*a, **k):
+        raise FileNotFoundError("dataset .pt vanished 6h into the run")
+
+    monkeypatch.setattr(loader_mod, "load_ltxv_components", _boom)
+
+    config_path, weights_root = _stage_runnable_config(tmp_path)
+    with pytest.raises(FileNotFoundError, match="dataset .pt vanished"):
+        run(config_path, weights_root=weights_root, output_root=str(tmp_path), approve=True)
+
+
+def test_main_turns_post_preflight_filenotfound_into_exit_crashed_with_traceback(
+    monkeypatch, capsys
+):
+    # main()'s own boundary: it must NOT relabel a FileNotFoundError re-raised by run() as
+    # EXIT_REFUSED -- it prints the traceback (the bug report the beta asks for) and returns the
+    # distinct EXIT_CRASHED code.
+    import signet_trainer.local.runner as runner_mod
+
+    def _fake_run(*a, **k):
+        raise FileNotFoundError("simulated post-approval crash: dataset .pt vanished")
+
+    monkeypatch.setattr(runner_mod, "run", _fake_run)
+    rc = runner_mod.main(["--config", "whatever.yaml"])
+    err = capsys.readouterr().err
+
+    assert rc == EXIT_CRASHED
+    assert rc != EXIT_REFUSED
+    assert "simulated post-approval crash" in err
+    assert "Traceback" in err, "the traceback must be printed, not swallowed"
 
 
 # ---- structural: the local package must never touch Modal --------------------------------------
