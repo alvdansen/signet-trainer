@@ -146,7 +146,13 @@ def _watch_dispatch(
 
     Five things happen here, in order:
 
-    0. Book the dispatch-time estimate into the cumulative session-spend ledger (D-8-YOLOCAP /
+    0. Print the ``FunctionCall`` id — the handle that OUTLIVES this client, and the whole point of
+       the change: any later process can re-attach with ``modal.FunctionCall.from_id("<id>")``
+       (``poll_function`` uses ``clear_on_success=False``, so a client that did not dispatch the call
+       can still collect its output). Printed BEFORE the ledger booking below so a raising
+       ``append_spend`` (ledger-lock timeout, corrupt-ledger shape) never costs the re-attach handle
+       of an already-spawned run.
+    1. Book the dispatch-time estimate into the cumulative session-spend ledger (D-8-YOLOCAP /
        issue #37 finding 1/6) — ``append_spend(ledger_path, est_usd, run_ref=fc.object_id)``, when
        both are given (every real caller in ``main()`` passes them; tests that stub the dispatch
        function may omit them). This is the code-side half of CR-01 airtight accounting: every
@@ -154,10 +160,6 @@ def _watch_dispatch(
        cumulative cap check in ``main()`` — reflect REAL cumulative spend, not only the spend an
        agent remembered to append from prose. Booking the ``FunctionCall`` id (rather than no
        ``run_ref`` at all) makes the entry reconcilable against the actual Modal dispatch.
-    1. Print the ``FunctionCall`` id — the handle that OUTLIVES this client, and the whole point of
-       the change: any later process can re-attach with ``modal.FunctionCall.from_id("<id>")``
-       (``poll_function`` uses ``clear_on_success=False``, so a client that did not dispatch the call
-       can still collect its output).
     2. Warn — advisory only, never a hard failure — when ``--detach`` is absent. ``.spawn()`` fixes
        the INPUT; ``--detach`` keeps the ephemeral app SHELL alive. Both are required and neither
        alone is sufficient, so this converts a doc-prose rule into a runtime check.
@@ -172,18 +174,18 @@ def _watch_dispatch(
     builtin on expiry; ``modal.exception.TimeoutError`` is NOT a builtin-TimeoutError subclass, and
     catching it here would instead swallow ``OutputExpiredError``.
     """
-    if ledger_path is not None and est_usd is not None:
-        append_spend(ledger_path, est_usd, run_ref=str(fc.object_id))
-        print(
-            f"[signet-entrypoint] ledger: booked ${est_usd:.2f} for {label} against {ledger_path} "
-            f"(run_ref={fc.object_id})."
-        )
     print(
         f"[signet-entrypoint] {label} dispatched ASYNC (spawn). FunctionCall id: {fc.object_id}\n"
         f"[signet-entrypoint]   re-attach from ANY later process (this id outlives this client):\n"
         f"[signet-entrypoint]   python -c \"import modal; "
         f"print(modal.FunctionCall.from_id('{fc.object_id}').get(timeout=1800))\""
     )
+    if ledger_path is not None and est_usd is not None:
+        append_spend(ledger_path, est_usd, run_ref=str(fc.object_id))
+        print(
+            f"[signet-entrypoint] ledger: booked ${est_usd:.2f} for {label} against {ledger_path} "
+            f"(run_ref={fc.object_id})."
+        )
     detached = _detach_requested()
     if not detached:
         print(
@@ -1416,7 +1418,11 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
     # yolo bound working, not a bug in it.
     ledger_path = cfg.modal.session_spend_ledger_path
     session_cap_usd = _resolve_session_cap_usd(Path(ledger_path), cfg.modal.session_cap_usd)
-    spent_so_far = read_ledger(ledger_path)
+    try:
+        spent_so_far = read_ledger(ledger_path)
+    except ValueError as exc:
+        print(f"[signet-entrypoint] {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     cap_decision = session_cap_check(decision.est_usd, spent_so_far, session_cap_usd)
     print(f"[signet-cap] {cap_decision.reason}")
     approve_for_gate = approve

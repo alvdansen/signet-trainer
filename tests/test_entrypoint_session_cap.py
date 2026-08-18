@@ -211,6 +211,30 @@ def test_cumulative_spend_across_two_dispatches_trips_the_cap(tmp_path, monkeypa
     )
 
 
+def test_corrupt_ledger_refuses_with_an_actionable_message_not_a_traceback(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A present-but-unparseable ledger must refuse via SystemExit with a [signet-entrypoint]
+    message on stderr -- never a bare ValueError traceback out of ``main()`` (medium finding,
+    verify2_r.json #1)."""
+    entrypoint, raw_main = _raw_main()
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    rec = _stub_train(monkeypatch)
+    ledger_path = tmp_path / "SESSION-STATE.json"
+    ledger_path.write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        raw_main(
+            config=_write_config(tmp_path, session_cap_usd=10.0, ledger_path=ledger_path),
+            approve=True,
+            mode="train",
+        )
+
+    assert rec.calls == [], "a corrupt ledger must fail closed -- never dispatch"
+    err = capsys.readouterr().err
+    assert "[signet-entrypoint]" in err, "the refusal must print the house actionable-message prefix"
+
+
 def test_resolve_session_cap_usd_is_tolerant_of_a_missing_or_malformed_ledger(tmp_path) -> None:
     """The cap resolver never raises on a missing/malformed ledger -- falls back to the config default."""
     from signet_trainer.modal import entrypoint
