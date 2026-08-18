@@ -313,6 +313,72 @@ def test_read_ledger_clamps_negative_entry_to_zero(tmp_path) -> None:
     assert read_ledger(ledger) == pytest.approx(3.0)  # 3.0 + max(0, -2.0)
 
 
+def test_read_ledger_non_dict_root_raises_fail_closed(tmp_path) -> None:
+    # Issue #24 finding 1: a non-dict root used to return 0.0 (indistinguishable from a fresh,
+    # missing-file session) while the strictly narrower malformed-entry case already raised. The
+    # container being wrong must fail CLOSED exactly like the entry case, not fail open.
+    import json
+
+    ledger = tmp_path / "SESSION-STATE.json"
+    ledger.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="root is not an object"):
+        read_ledger(ledger)
+
+
+def test_read_ledger_non_list_spend_field_raises_fail_closed(tmp_path) -> None:
+    # Issue #24 finding 1: "spend": {} is a plausible hand/agent-edit typo for "spend": [] — it must
+    # raise, not silently read back as 0.0 spent.
+    import json
+
+    ledger = tmp_path / "SESSION-STATE.json"
+    ledger.write_text(json.dumps({"spend": {}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="spend is not a list"):
+        read_ledger(ledger)
+
+
+def test_read_ledger_valid_ledger_reads_unchanged(tmp_path) -> None:
+    # The fail-closed shape checks must not disturb a well-formed ledger's normal read path.
+    import json
+
+    ledger = tmp_path / "SESSION-STATE.json"
+    ledger.write_text(
+        json.dumps(
+            {
+                "triage_mode": "yolo",
+                "session_cap_usd": 10.0,
+                "blankets": [],
+                "spend": [{"ts": "2026-01-01T00:00:00+00:00", "est_usd": 1.5, "run_ref": "r1"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert read_ledger(ledger) == pytest.approx(1.5)
+
+
+def test_append_spend_refuses_non_dict_root(tmp_path) -> None:
+    # Issue #24 finding 2: append_spend used to substitute {} for a non-dict root before overwriting
+    # the file — the money-safe direction is to refuse and halt the harness, not reset the counter.
+    import json
+
+    ledger = tmp_path / "SESSION-STATE.json"
+    ledger.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="root is not an object"):
+        append_spend(ledger, est_usd=1.0, run_ref="r1")
+    # And the original corrupt content must survive untouched — no silent overwrite.
+    assert json.loads(ledger.read_text(encoding="utf-8")) == ["not", "a", "dict"]
+
+
+def test_consume_blanket_refuses_non_dict_root(tmp_path) -> None:
+    # Issue #24 finding 2, blanket side: same refuse-not-reset posture as append_spend.
+    import json
+
+    ledger = tmp_path / "SESSION-STATE.json"
+    ledger.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="root is not an object"):
+        consume_blanket(ledger, blanket_index=0, est_usd=1.0, run_ref="r1")
+    assert json.loads(ledger.read_text(encoding="utf-8")) == ["not", "a", "dict"]
+
+
 # --------------------------------------------------------------------------------------------------
 # Anti-Pattern 6 invariant — session_cap.py must be Modal-agnostic
 # --------------------------------------------------------------------------------------------------
