@@ -11,10 +11,19 @@ the training config.
 Prior-campaign style: while training runs on its own A100, this LOCAL watcher polls the
 checkpoints Volume and, for every NEW checkpoint-step-* dir, dispatches ONE gated
 ``--mode sample`` render (a second, separate single-A100 container — the single-A100-per-job
-house rule holds within each job; the parallel venue is the operator's explicit call). Every dispatch
-goes through the canonical entrypoint gate (cost print + --approve under the yolo session
-pre-authorization) and is appended to the SESSION-STATE spend ledger. After each render the
-newest samples dir is fetched and the local finetune-gridwatch grid is rebuilt, so
+house rule holds within each job; the parallel venue is the operator's explicit call). Every
+dispatch goes through the canonical entrypoint gate (cost print + --approve under the yolo
+session pre-authorization).
+
+Issue #37 finding 1/2: the entrypoint gate ITSELF now books the ledger entry (single-source
+accounting, CR-01) after every successful ``.spawn()`` — including the ones THIS watcher
+triggers via the ``modal run --detach -m signet_trainer.modal.entrypoint`` subprocess below. This
+watcher used to append its OWN ledger entry before that landed (fire hazard: had this watcher
+kept appending too, every parallel-venue render would book TWICE against the same cumulative
+cap). The watcher's own ``session_cap_check`` before dispatch (AUDIT #4) stays — it is a cheap
+LOCAL pre-check that avoids shelling out to a dispatch the entrypoint's own cap check would
+refuse anyway — but booking the actual spend is the entrypoint's job alone now. After each render
+the newest samples dir is fetched and the local finetune-gridwatch grid is rebuilt, so
 grid-output/index.html updates live.
 
 Exits when the final checkpoint (step == MAX_STEPS) has been rendered, or on WATCH_DEADLINE.
@@ -43,7 +52,6 @@ from signet_trainer.inference.samples_layout import (  # noqa: E402
 )
 from signet_trainer.inference.stall_clock import next_pending_since  # noqa: E402
 from signet_trainer.modal.session_cap import (  # noqa: E402
-    append_spend as _append_spend,
     read_ledger,
     session_cap_check,
 )
@@ -301,14 +309,11 @@ def list_checkpoint_steps() -> list[int]:
                    re.finditer(r"checkpoint-step-(\d+)-loss-", r.stdout or "")})
 
 
-def append_spend(step: int) -> None:
-    # In-process ledger write (AUDIT-#4 fix, CR-01): call session_cap.append_spend directly rather
-    # than shelling out to `sys.executable -c ...` with a discarded exit code. Under the documented
-    # bare invocation (no PYTHONPATH=src) the subprocess silently ModuleNotFoundError'd and the
-    # ledger never advanced, so the cumulative cap could not trip. A ValueError/OSError now
-    # PROPAGATES out of main() and halts the watcher BEFORE dispatch — the money-safe direction.
-    _append_spend(LEDGER_PATH, RENDER_EST_USD,
-                  run_ref=f"parallel render @ step {step} ({OUTPUT_DIR})")
+# Issue #37 finding 1/2: there is deliberately NO append_spend(step) wrapper here any more. The
+# entrypoint gate now books every dispatch's ledger entry itself (see the module docstring) —
+# including the ones this watcher triggers via the subprocess in dispatch_render() below. This
+# watcher appending its OWN entry on top of that would double-book every parallel-venue render
+# against the same cumulative cap (CR-01 airtight accounting means EXACTLY once, not at-least-once).
 
 
 def dispatch_render(step: int) -> bool:
@@ -453,22 +458,25 @@ def main() -> None:
                     "cap-stop: session cap reached — do NOT relaunch\n", encoding="utf-8")
                 sys.exit(CAP_STOP_EXIT)
             # CAPTURE-BEFORE-BOOK (issue #45 PR-1 must-fix #2): resolve the checkpoint identity the
-            # render will key on BEFORE append_spend, never after. `latest_checkpoint_name()` returns
+            # render will key on BEFORE dispatch, never after. `latest_checkpoint_name()` returns
             # None on a `modal volume ls` timeout (sh()'s VOLUME_OP_TIMEOUT_S catch) or an empty
-            # listing; booking spend and dispatching anyway would create a render this watcher could
-            # never verify, and at MAX_STEPS could write the run-complete sentinel having verified
-            # nothing. LTX has no checkpoint-keyed render identity to resolve, so it is exempt.
+            # listing; dispatching anyway would create a render this watcher could never verify, and
+            # at MAX_STEPS could write the run-complete sentinel having verified nothing. LTX has no
+            # checkpoint-keyed render identity to resolve, so it is exempt.
             ckpt_at_dispatch = latest_checkpoint_name() if FAMILY == "h3" else None
             if FAMILY == "h3" and ckpt_at_dispatch is None:
                 print(f"[watcher] step {step}: could not resolve the latest checkpoint name (modal "
                       "volume ls timeout or empty listing) — REFUSING to book spend/dispatch for a "
                       "render this watcher could never verify. Retrying next poll.", flush=True)
             else:
-                # AUDIT #2 — ledger EVERY dispatch (a dispatched render is booked A100 time whether
-                # or not it lands), then hand completion to the ARTIFACT gate below. Spend books once
-                # per DISPATCH, and single-flight + the stall gate mean a dispatch happens at most
-                # once per render identity per render_stall_minutes window — never once per poll.
-                append_spend(step)
+                # AUDIT #2 — dispatch, then hand completion to the ARTIFACT gate below. Issue #37
+                # finding 1/2: the ledger booking used to happen HERE, unconditionally, before knowing
+                # whether the dispatch even succeeded; it now happens INSIDE the entrypoint gate the
+                # subprocess below runs (once per successful ``.spawn()``, never on a refused/failed
+                # dispatch) — a single source of truth for every dispatch this program makes, and no
+                # double-booking against the same cumulative cap. Single-flight + the stall gate mean a
+                # dispatch happens at most once per render identity per render_stall_minutes window —
+                # never once per poll.
                 ok = dispatch_render(step)
                 if ok:
                     pending_step, pending_since = step, time.time()

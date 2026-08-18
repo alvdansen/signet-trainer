@@ -22,6 +22,12 @@ message rather than a stack trace when there is no project.
     The spent figure is read via ``signet_trainer.modal.session_cap.read_ledger`` (the one
     authoritative ledger reader — never re-summed ad hoc); ``session_cap_usd`` and the entry
     count are read from the same JSON directly because ``session_cap`` exposes no getter for them.
+    Its PATH is resolved by ``session_ledger_path()`` (issue #37 finding 3): the packaged default
+    mirrors ``config/schema.py::ModalConfig.session_spend_ledger_path``'s default byte-for-byte
+    (pinned by a test), and ``SIGNET_SESSION_LEDGER_PATH`` overrides it — set that env var to the
+    SAME value as a project's config override so this module reads the ledger the
+    entrypoint/watcher actually write, instead of rendering an authoritative-looking figure for a
+    path nothing writes to.
   * ``HOUSE-SPEC.yaml`` (PACKAGED — ``signet_trainer.harness_data``) — the typed home of the house VERDICT spec (D-29): the
     locked eval params (``frame_count`` / ``num_inference_steps`` / ``guidance_scale`` / ``seed`` /
     ``two_stage_upscale`` / ``min_prompt_count``) that ``assert_verdict_spec`` asserts a verdict
@@ -138,7 +144,44 @@ CARDS_DIR = f"{PLANNING_HARNESS_DIR}/cards"
 CARD_STATE_PREFIX = "TRAINING-CARD-"
 CARD_STATE_SUFFIX = ".state.yaml"
 CAMPAIGN_ENV_VAR = "SIGNET_CAMPAIGN"  # pins the campaign slug when multiple cards exist
+
+# WR-02 single-source ledger path (issue #37 finding 3). ``config/schema.py``'s
+# ``ModalConfig.session_spend_ledger_path`` is the declared-authoritative ledger path — an operator
+# is explicitly invited to set it to "wherever your project keeps it". This module CANNOT import
+# that field directly: ``test_emitter_is_import_confined`` pins harness_state.py to
+# yaml/json/stdlib + ``harness_data`` + ``session_cap.read_ledger`` ONLY (Anti-Pattern 6), closed by
+# equality, so importing ``config.schema`` here would fail that test even though schema.py itself
+# carries no torch/modal. ``SESSION_STATE_PATH`` below is therefore a LITERAL that must stay
+# byte-identical to that field's default — pinned by
+# ``test_session_ledger_path_matches_schema_default`` in tests/test_harness_state.py, so the two
+# can never silently diverge again.
+#
+# ``session_ledger_path()`` resolves the SAME override an operator uses on the config side: set
+# ``SIGNET_SESSION_LEDGER_PATH`` to the exact value you gave ``session_spend_ledger_path`` and this
+# module reads the SAME file the entrypoint gate/watcher/append_spend write to, instead of silently
+# rendering an authoritative-looking figure for a path nothing writes.
 SESSION_STATE_PATH = f"{PLANNING_HARNESS_DIR}/SESSION-STATE.json"
+SESSION_LEDGER_PATH_ENV_VAR = "SIGNET_SESSION_LEDGER_PATH"
+
+
+def session_ledger_path(explicit: str | None = None) -> str:
+    """Resolve the project-relative ledger path this module reads (WR-02 mirror, see above).
+
+    Resolution order, first hit wins:
+
+      1. ``explicit`` — what a caller passed (tests, a future config-aware caller).
+      2. ``SIGNET_SESSION_LEDGER_PATH`` — set this to the SAME value as
+         ``cfg.modal.session_spend_ledger_path`` when a project overrides it off the packaged
+         default, so this module reads the ledger the entrypoint/watcher actually write.
+      3. ``SESSION_STATE_PATH`` — the packaged default, identical to
+         ``ModalConfig.session_spend_ledger_path``'s schema default.
+    """
+    if explicit is not None:
+        return explicit
+    env = os.environ.get(SESSION_LEDGER_PATH_ENV_VAR, "").strip()
+    if env:
+        return env
+    return SESSION_STATE_PATH
 
 # Typed PACKAGED sources — real filesystem paths inside the installed package (or the
 # SIGNET_HARNESS_DATA_DIR override). Resolved lazily so an incomplete install fails at the call that
@@ -250,20 +293,49 @@ def campaign_card_md_path(state_rel_path: str) -> str:
 # registered artifact has none yet; anchor match is prefix-based because headings carry trailing
 # annotations (e.g. "## TYPED STATE (quotable slots — ...)"). The campaign card's .md is NOT
 # listed here — it is discovered (artifact_registry) alongside its .state.yaml source.
+#
+# Issue #37 finding 5: this used to ALSO hardcode one maintainer's in-flight phase directory
+# (".planning/phases/09-address-tech-debt-.../.continue-here.md") — a literal that exists on no
+# other project (this repo ships no ".planning/" at all), so ``emit``/``check`` died with a bare
+# 7-frame ``FileNotFoundError`` traceback everywhere but the maintainer's own checkout. That entry
+# is now DISCOVERED (``discover_continue_here_artifacts`` below) instead of named — zero matches is
+# a normal state (nothing in-flight to emit into), never an error. ``.planning/STATE.md`` stays
+# here because every project is expected to carry one; its absence is now a NAMED
+# ``FileNotFoundError`` from ``emit_into``'s existence guard (below) rather than a bare traceback,
+# so ``check`` can still tell "no project here" apart from "genuine drift" (both used to be exit 1
+# with no way to distinguish them).
 STATIC_ARTIFACTS: list[tuple[str, str]] = [
-    (
-        ".planning/phases/09-address-tech-debt-offloader-seam-lora-utility-dedup/"
-        ".continue-here.md",
-        "## TYPED STATE",
-    ),
     (".planning/STATE.md", "## Session Continuity"),
 ]
 
 
+def discover_continue_here_artifacts(repo_root: Path | None = None) -> list[tuple[str, str]]:
+    """Every ``.planning/phases/*/.continue-here.md`` present in THIS project (TS-01a), discovered.
+
+    Replaces a single hardcoded phase-directory literal (issue #37 finding 5) that named exactly
+    one maintainer's in-flight phase and existed on no other checkout. An empty result is the
+    NORMAL case — a project with no in-flight phase-continuity file simply has one fewer artifact
+    to emit into, not an error; a project with several gets every one of them, none hand-picked.
+    """
+    root = project_root(repo_root)
+    phases_dir = root / ".planning" / "phases"
+    if not phases_dir.is_dir():
+        return []
+    return [
+        (p.relative_to(root).as_posix(), "## TYPED STATE")
+        for p in sorted(phases_dir.glob("*/.continue-here.md"))
+    ]
+
+
 def artifact_registry(repo_root: Path | None = None) -> list[tuple[str, str]]:
-    """The full (artifact, anchor) registry: the DISCOVERED campaign card .md + the static set."""
+    """The full (artifact, anchor) registry: the DISCOVERED campaign card .md, every DISCOVERED
+    ``.continue-here.md``, + the static set."""
     state_rel = discover_campaign_state_path(repo_root)
-    return [(campaign_card_md_path(state_rel), "## TYPED STATE"), *STATIC_ARTIFACTS]
+    return [
+        (campaign_card_md_path(state_rel), "## TYPED STATE"),
+        *discover_continue_here_artifacts(repo_root),
+        *STATIC_ARTIFACTS,
+    ]
 
 # The knob->tier table (D-30 part 2) is emitted into KNOWLEDGE.md — a SEPARATE artifact/anchor from
 # artifact_registry (which carries the campaign/ledger block). One block type per file: KNOWLEDGE.md
@@ -318,13 +390,18 @@ def read_ledger_figures(session_state_path: str | Path) -> dict:
     reader (its fail-closed semantics for corrupt ledgers carry over verbatim: a corrupt file
     raises rather than rendering a stale/wrong figure). ``session_cap_usd`` + the entry count
     are read from the same JSON directly (``session_cap`` has no getter for them — noted seam).
-    A missing file is a fresh session: spent 0.0, cap ``null``, 0 entries.
+    A missing file is a fresh session: spent 0.0, cap ``null``, 0 entries — ``available`` is
+    ``False`` in that case so ``render_state_block`` can say so LOUDLY (issue #37 finding 3) rather
+    than render an authoritative-looking ``$0.00`` for a path this project may not even write to
+    (``session_ledger_path()`` resolves the SAME path an operator's ``session_spend_ledger_path``
+    override would point the entrypoint/watcher at — see the module-level constants above).
     """
     path = Path(session_state_path)
     spent = read_ledger(path)  # canonical read — raises LOUDLY on a corrupt ledger
     cap = None
     entries = 0
-    if path.is_file():
+    available = path.is_file()
+    if available:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             cap = data.get("session_cap_usd")
@@ -336,6 +413,7 @@ def read_ledger_figures(session_state_path: str | Path) -> dict:
         "session_cap_usd": cap,
         "entries": entries,
         "source": Path(session_state_path).as_posix(),
+        "available": available,
     }
 
 
@@ -687,7 +765,18 @@ def render_state_block(sources: dict) -> str:
         "spent_est_usd": ledger["spent_est_usd"],
         "entries": ledger["entries"],
         "source": ledger["source"],
+        "available": ledger.get("available", True),
     }
+    if not payload["ledger"]["available"]:
+        # Issue #37 finding 3: a hardcoded/mismatched ledger path used to render an
+        # authoritative-looking $0.00 for a file nothing writes to. Say so LOUDLY instead — the
+        # figures above are the FRESH-SESSION default (never a confirmed zero).
+        payload["ledger"]["WARNING"] = (
+            f"ledger file not found at {ledger['source']} — spent_est_usd/entries above are the "
+            "fresh-session default, NOT a confirmed zero. If this project's config sets "
+            "modal.session_spend_ledger_path to something else, set SIGNET_SESSION_LEDGER_PATH to "
+            "the SAME value so this block reads the ledger the entrypoint/watcher actually write."
+        )
 
     inner = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True, width=4096)
     # The campaign-source path in the header is threaded by the caller (emit_all sets it to the
@@ -794,8 +883,23 @@ def emit_into(
     The marker set defaults to the TYPED-STATE markers; pass ``MASK_SPEC_MARKER_*`` /
     ``_MASK_SPEC_*_PREFIX`` to emit the mask-spec block into a file that ALSO carries a TYPED-STATE
     block (KNOWLEDGE.md) — the distinct prefixes keep the two blocks independent.
+
+    Raises ``FileNotFoundError`` — with an actionable message, never a bare traceback — when
+    ``artifact_path`` does not exist (issue #37 finding 5). A registered artifact missing entirely
+    (e.g. this repo, which ships no ``.planning/`` at all) is a DIFFERENT failure than genuine
+    drift, and ``main()``'s ``check`` command must be able to tell the two apart rather than
+    reporting exit code 1 for both.
     """
     path = Path(artifact_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"emit_into: registered artifact not found: {path}\n"
+            "    a MISSING artifact is not the same as a STALE one — this raises FileNotFoundError "
+            "so callers (e.g. 'harness_state check') can tell the two apart.\n"
+            "    fix: create the artifact (with its anchor heading) before emitting into it, or "
+            "remove it from the registry (artifact_registry / STATIC_ARTIFACTS) if this project "
+            "does not carry it."
+        )
     raw = path.read_bytes().decode("utf-8")
     crlf = "\r\n" in raw
     text = raw.replace("\r\n", "\n") if crlf else raw
@@ -837,13 +941,14 @@ def emit_all(
     """
     root = project_root(repo_root)
     campaign_rel = discover_campaign_state_path(root)
+    ledger_rel = session_ledger_path()
     sources = {
         "campaign": load_campaign_state(root / campaign_rel),
-        "ledger": read_ledger_figures(root / SESSION_STATE_PATH),
+        "ledger": read_ledger_figures(root / ledger_rel),
         # Keep both source paths repo-relative in the rendered block (stable across machines).
         "campaign_source": campaign_rel,
     }
-    sources["ledger"]["source"] = SESSION_STATE_PATH
+    sources["ledger"]["source"] = ledger_rel
     block = render_state_block(sources)
 
     results: list[tuple[str, str]] = []
@@ -954,18 +1059,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "emit":
         root = project_root()
-        if args.dry_run:
-            campaign_rel = discover_campaign_state_path(root)
-            sources = {
-                "campaign": load_campaign_state(root / campaign_rel),
-                "ledger": read_ledger_figures(root / SESSION_STATE_PATH),
-                "campaign_source": campaign_rel,
-            }
-            sources["ledger"]["source"] = SESSION_STATE_PATH
-            print("[harness_state] rendered block:\n")
-            print(render_state_block(sources))
-            print()
-        results = emit_all(dry_run=args.dry_run, repo_root=root)
+        try:
+            if args.dry_run:
+                campaign_rel = discover_campaign_state_path(root)
+                ledger_rel = session_ledger_path()
+                sources = {
+                    "campaign": load_campaign_state(root / campaign_rel),
+                    "ledger": read_ledger_figures(root / ledger_rel),
+                    "campaign_source": campaign_rel,
+                }
+                sources["ledger"]["source"] = ledger_rel
+                print("[harness_state] rendered block:\n")
+                print(render_state_block(sources))
+                print()
+            results = emit_all(dry_run=args.dry_run, repo_root=root)
+        except FileNotFoundError as exc:
+            # Issue #37 finding 5: a missing LIVE artifact/source (e.g. no .planning/ at all in
+            # this checkout) is an actionable "no project here" message, never a bare traceback —
+            # and a DISTINCT exit code from both success (0) and "check found drift" (1), so a
+            # caller can tell "nothing to emit into" apart from either.
+            print(f"[harness_state] {exc}", file=sys.stderr)
+            return 2
         mode = "DRY-RUN, nothing written" if args.dry_run else "written"
         for rel_path, action in results:
             print(f"[harness_state] {action:9s} ({mode}): {rel_path}")
@@ -973,7 +1087,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check":
         root = Path(args.repo_root) if args.repo_root else None
-        drifted = check_stale(repo_root=root)
+        try:
+            drifted = check_stale(repo_root=root)
+        except FileNotFoundError as exc:
+            # Same distinction as 'emit' above: a missing artifact/source is NOT the same failure
+            # as genuine drift (both used to collapse to exit 1 with a bare traceback either way).
+            print(f"[harness_state] {exc}", file=sys.stderr)
+            return 2
         if drifted:
             print(f"[harness_state] STALE — {len(drifted)} artifact(s) drifted from the typed sources:")
             for rel_path, action in drifted:

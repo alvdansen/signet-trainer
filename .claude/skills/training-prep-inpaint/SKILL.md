@@ -224,6 +224,12 @@ PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoin
     --config <yaml> --mode preprocess [--approve]
 ```
 
+> **Cap step (D-8-YOLOCAP) — before dispatching `--approve` here:** the cumulative session-spend
+> cap is enforced BY THE ENTRYPOINT GATE itself (`session_cap.read_ledger` + `session_cap_check`,
+> between the cost print and the approval pause) — going over cap disables `--approve` for that
+> dispatch and drops to an interactive ask-first prompt even when the flag was passed. See
+> `training-run/SKILL.md` §3 for the full WR-02 cap/ledger-path chain.
+
 - The gate runs **load → dry-run → cost print → BLOCKING approval → dispatch**, identical to train. The
   **cost print + approval precede dispatch** — a metered encode can never auto-launch. Under an active
   blanket the approval stop is removed but the cost line still logs (accounting always runs).

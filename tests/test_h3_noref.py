@@ -421,7 +421,11 @@ def test_the_entrypoint_refuses_no_reference_sample_pre_approval() -> None:
     source = _ENTRYPOINT_SRC.read_text(encoding="utf-8")
     assert "references_per_sample == 0" in source
     refusal = source.index("no-reference H3 rendering is NOT supported")
-    approval = source.index("_require_approval(approve)")
+    # Issue #37 finding 1: the cumulative session-cap check now resolves an ask-first-downgraded
+    # ``approve_for_gate`` BEFORE this call (never the raw ``approve`` param) — the call site's
+    # literal text changed, but the invariant this test pins (refusal fires strictly BEFORE the
+    # approval gate, so a no-ref sample dispatch costs $0) is unchanged.
+    approval = source.index("_require_approval(approve_for_gate)")
     assert refusal < approval, "the sample refusal must fire BEFORE the approval gate (zero-spend)"
 
 

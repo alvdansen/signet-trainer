@@ -443,6 +443,12 @@ def test_an_approved_sample_run_dispatches_exactly_once_when_the_gaps_clear(monk
     # The two fields are DECLARED GAPS in the schema, so a YAML file cannot carry them yet; clearing
     # the gap function is the narrowest possible stand-in for the config that will.
     monkeypatch.setattr(entrypoint, "_qwen_edit_config_gaps", lambda cfg, *, mode: [])
+    # main() now books the dispatch into the cumulative session-spend ledger (D-8-YOLOCAP, issue
+    # #37 finding 1/6) via entrypoint.append_spend. _EXAMPLE_CONFIG is the real shared example
+    # config and does not (and must not, per its own scope) declare a tmp session_spend_ledger_path,
+    # so neutralize append_spend here rather than write the default project-relative ledger path
+    # onto the real filesystem as a side effect of this test.
+    monkeypatch.setattr(entrypoint, "append_spend", lambda *a, **k: None)
 
     raw_main(config=str(_EXAMPLE_CONFIG), approve=True, mode="sample")
 

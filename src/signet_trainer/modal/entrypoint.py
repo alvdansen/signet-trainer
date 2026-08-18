@@ -20,6 +20,7 @@ cost helpers it calls are Modal-agnostic.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -37,6 +38,7 @@ from signet_trainer.modal.app import (
     app,
 )
 from signet_trainer.modal.cost import format_cost_line, guardrail_check
+from signet_trainer.modal.session_cap import append_spend, read_ledger, session_cap_check
 
 # Register the @app.function stubs (train / preprocess / download_weights / sample / ...) on the app
 # graph at MODULE-LOAD time. ``modal run -m signet_trainer.modal.entrypoint`` builds the app from what
@@ -99,7 +101,39 @@ def _detach_requested() -> bool:
     )
 
 
-def _watch_dispatch(fc: object, watch_seconds: float, label: str) -> None:
+def _resolve_session_cap_usd(ledger_path: Path, config_default: float) -> float:
+    """The WR-02 per-session cap override: SESSION-STATE.json's ``session_cap_usd``, else the
+    config default (``cfg.modal.session_cap_usd``).
+
+    Mirrors ``harness_state.read_ledger_figures``' resolution — the setup gate WRITES this key
+    into the same ledger file ``training-run/SKILL.md`` §3 reads it from. Deliberately tolerant
+    (never raises): a missing/corrupt/legacy ledger falls back to the documented config default
+    rather than blocking a dispatch on a formatting problem that ``read_ledger`` (the actual spend
+    reader, called separately below) already owns raising on.
+    """
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return config_default
+    if not isinstance(data, dict):
+        return config_default
+    override = data.get("session_cap_usd")
+    if override is None:
+        return config_default
+    try:
+        return float(override)
+    except (TypeError, ValueError):
+        return config_default
+
+
+def _watch_dispatch(
+    fc: object,
+    watch_seconds: float,
+    label: str,
+    *,
+    ledger_path: str | None = None,
+    est_usd: float | None = None,
+) -> None:
     """Post-dispatch handling for a SPAWNED (async) gated run — D-10-DEF-17.
 
     Every arm in ``main()`` now dispatches with ``.spawn(...)`` rather than ``.remote(...)``. The
@@ -110,8 +144,16 @@ def _watch_dispatch(fc: object, watch_seconds: float, label: str) -> None:
     13) at the moment the dispatching agent returned. ``_Function.spawn`` carries
     ``FUNCTION_CALL_INVOCATION_TYPE_ASYNC``, which is not cancelled that way.
 
-    Four things happen here, in order:
+    Five things happen here, in order:
 
+    0. Book the dispatch-time estimate into the cumulative session-spend ledger (D-8-YOLOCAP /
+       issue #37 finding 1/6) — ``append_spend(ledger_path, est_usd, run_ref=fc.object_id)``, when
+       both are given (every real caller in ``main()`` passes them; tests that stub the dispatch
+       function may omit them). This is the code-side half of CR-01 airtight accounting: every
+       approved dispatch (strict, yolo, blanket) must be recorded so ``read_ledger`` — and the
+       cumulative cap check in ``main()`` — reflect REAL cumulative spend, not only the spend an
+       agent remembered to append from prose. Booking the ``FunctionCall`` id (rather than no
+       ``run_ref`` at all) makes the entry reconcilable against the actual Modal dispatch.
     1. Print the ``FunctionCall`` id — the handle that OUTLIVES this client, and the whole point of
        the change: any later process can re-attach with ``modal.FunctionCall.from_id("<id>")``
        (``poll_function`` uses ``clear_on_success=False``, so a client that did not dispatch the call
@@ -130,6 +172,12 @@ def _watch_dispatch(fc: object, watch_seconds: float, label: str) -> None:
     builtin on expiry; ``modal.exception.TimeoutError`` is NOT a builtin-TimeoutError subclass, and
     catching it here would instead swallow ``OutputExpiredError``.
     """
+    if ledger_path is not None and est_usd is not None:
+        append_spend(ledger_path, est_usd, run_ref=str(fc.object_id))
+        print(
+            f"[signet-entrypoint] ledger: booked ${est_usd:.2f} for {label} against {ledger_path} "
+            f"(run_ref={fc.object_id})."
+        )
     print(
         f"[signet-entrypoint] {label} dispatched ASYNC (spawn). FunctionCall id: {fc.object_id}\n"
         f"[signet-entrypoint]   re-attach from ANY later process (this id outlives this client):\n"
@@ -1354,10 +1402,43 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         )
         raise SystemExit(1)
 
+    # (3b) Cumulative session-spend cap (D-8-YOLOCAP; issue #37 finding 1/6) — reads/writes the SAME
+    # ledger append_spend below writes to. WR-02 chain, config-first (D-NOHARDCODE): the ledger path
+    # and the house-default cap both come from the loaded cfg; a SESSION-STATE.json session_cap_usd
+    # override, when present, is the LIVE cap (the setup gate writes it there).
+    #
+    # ⚠ BINDING SEMANTIC (adversarial audit, D-8-YOLOCAP): this is an ASK-FIRST DOWNGRADE, never a
+    # second hard refusal. The per-run cost_guardrail_usd above is the hard per-dispatch ceiling;
+    # the cumulative cap only narrows the APPROVAL PATH available for THIS dispatch — going over it
+    # DISABLES --approve (even when the flag was passed) and forces the interactive prompt below. A
+    # present operator can still type 'approved' and proceed over cap (the human IS the fail-safe);
+    # a genuinely non-interactive over-cap request (EOFError, nobody to ask) refuses — that IS the
+    # yolo bound working, not a bug in it.
+    ledger_path = cfg.modal.session_spend_ledger_path
+    session_cap_usd = _resolve_session_cap_usd(Path(ledger_path), cfg.modal.session_cap_usd)
+    spent_so_far = read_ledger(ledger_path)
+    cap_decision = session_cap_check(decision.est_usd, spent_so_far, session_cap_usd)
+    print(f"[signet-cap] {cap_decision.reason}")
+    approve_for_gate = approve
+    if not cap_decision.allowed:
+        print(
+            f"[signet-entrypoint] ⚠ CUMULATIVE SESSION CAP EXCEEDED — projected "
+            f"${cap_decision.projected_usd:.2f} + spent ${cap_decision.spent_so_far:.2f} = "
+            f"${cap_decision.projected_usd + cap_decision.spent_so_far:.2f} vs cap "
+            f"${cap_decision.session_cap_usd:.2f}. Dropping to ASK-FIRST (D-8-YOLOCAP): --approve is "
+            f"DISABLED for this dispatch even though it was passed. A present operator may still "
+            f"type 'approved' at the prompt below to proceed over cap; a non-interactive request "
+            f"(no operator to ask) will be refused there.",
+            file=sys.stderr,
+        )
+        approve_for_gate = False
+
     # (4) BLOCKING approval pause (D-03 / MODL-02) — AFTER the cost print/guardrail, BEFORE any
     #     ``.spawn()`` dispatch. This is the single gate all metered runs pass through. Declining
     #     aborts with NO dispatch — metered spend can never auto-launch (sponsor credits metered).
-    if not _require_approval(approve):
+    #     ``approve_for_gate`` (not the raw ``approve`` param) is what reaches this call — see the
+    #     cumulative-cap ask-first downgrade immediately above.
+    if not _require_approval(approve_for_gate):
         raise SystemExit(1)
 
     # (5) Dispatch the gated remote run — STRICTLY AFTER ``_require_approval`` returned True
@@ -1404,7 +1485,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "The H3 arch gate fires inside the stage — there is no separate smoke step."
         )
         fc = h3_sample.with_options(timeout=h3_sample_timeout_s).spawn(config_text)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "h3_sample")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "h3_sample",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif mode == "sample" and cfg.model.family == "qwen_edit":
         # Phase-11 qwen_edit arm of the SAME mode: the A/B-prompt x checkpoint-BAND render grid.
         # Routed by family, NOT by a new mode value — six dispatches, one gate, one ledger.
@@ -1433,7 +1520,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "read from this config. Cells already on the Volume are resumed, not re-rendered."
         )
         fc = qwen_edit_sample.with_options(timeout=qwen_edit_sample_timeout_s).spawn(config_text)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "qwen_edit_sample")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "qwen_edit_sample",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif mode == "sample":
         # Phase-4 base-vs-LoRA grid (D-RUN-1 part 1) — reuses the EXACT gate above; the
         # ``sample.with_options(...).spawn`` CALL sits strictly after ``_require_approval`` (MODL-02).
@@ -1452,7 +1545,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "to signe-trainer-checkpoints under <output_dir>/samples/."
         )
         fc = sample.with_options(timeout=sample_timeout_s).spawn(config_text)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "sample")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "sample",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif mode == "preprocess" and cfg.model.family == "h3":
         # Phase-10 (H3-07) H3 arm of the SAME mode: the signet-native MiniMax-H3 Ref2VA pre-encode
         # (there is no canonical H3 encoder anywhere, so the enochiatron "never write a custom
@@ -1475,7 +1574,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "The H3 arch gate fires inside the stage, before a single frame is decoded."
         )
         fc = h3_preprocess.with_options(timeout=h3_preprocess_timeout_s).spawn(**h3_params)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "h3_preprocess")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "h3_preprocess",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif mode == "preprocess" and cfg.model.family == "qwen_edit":
         # Phase-11 qwen_edit arm of the SAME mode: the signet-native Qwen-Image-Edit pre-encode.
         # There is no canonical Qwen encoder anywhere (not in-repo, not upstream), so the "never
@@ -1503,7 +1608,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         fc = qwen_edit_preprocess.with_options(timeout=qwen_edit_preprocess_timeout_s).spawn(
             **qwen_edit_params
         )
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "qwen_edit_preprocess")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "qwen_edit_preprocess",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif mode == "preprocess":
         # Phase-8 canonical pre-encode as a first-class GATED mode (D-8-PREPROC) — retires the
         # hardcoded hourly-rate drift in the throwaway scripts/_encode_demo*.py by routing the
@@ -1543,7 +1654,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             # default False keeps this dispatch byte-identical to before the field existed.
             overwrite=cfg.data.preprocess_overwrite,
         )
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "preprocess")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "preprocess",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif mode == "fuse":
         # Phase-9 (INPAINT, GATE-SPEC rev 2 build-order step 3): the In-Outpainting scaffold fuse —
         # a CPU-ONLY Modal job (no gpu=; big-RAM tensor arithmetic) that writes the fused base to
@@ -1558,7 +1675,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "verify_fused_metadata -> weights Volume commit)."
         )
         fc = fuse.spawn(config_text)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "fuse")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "fuse",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif mode == "restore":
         # BK-01 (09.1-08): the GATED rehydrate arm — a CPU-only Modal job (no gpu=; off the training
         # A100, D-BK-3) that downloads cfg.backup's mirrored checkpoints back onto the checkpoints
@@ -1576,7 +1699,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "deleted)."
         )
         fc = restore.spawn(config_text)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "restore")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "restore",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif mode == "backup":
         # BK-01 (09.1-08): the GATED mirror arm — a CPU-only Modal job (no gpu=; off the training A100,
         # D-BK-3) that mirrors ONLY new complete checkpoints from the Volume to cfg.backup (additive,
@@ -1593,7 +1722,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "checkpoints to cfg.backup (additive, 1:1 layout, HF token from the Modal secret only)."
         )
         fc = backup_sync.spawn(config_text)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "backup_sync")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "backup_sync",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif cfg.model.family == "h3":
         # Phase-10 (H3-07) H3 arm of the DEFAULT ``train`` mode. Routed by family, NOT by a new mode
         # value. ``h3_train`` takes the recipe BY VALUE and re-parses it in-container, so there is
@@ -1614,7 +1749,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "both fire inside the stage, before the 61.7 GiB load."
         )
         fc = h3_train.with_options(timeout=h3_train_timeout_s).spawn(config_text)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "h3_train")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "h3_train",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif cfg.model.family == "qwen_edit":
         # Phase-11 qwen_edit arm of the DEFAULT ``train`` mode. Routed by family, NOT by a new mode
         # value. ``qwen_edit_train`` takes the recipe BY VALUE and re-parses it in-container, so
@@ -1642,7 +1783,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             f"steps/hour over {cfg.training.max_steps} steps and the estimate becomes measured."
         )
         fc = qwen_edit_train.with_options(timeout=qwen_edit_train_timeout_s).spawn(config_text)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "qwen_edit_train")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "qwen_edit_train",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif cfg.model.family == "wan":
         # Family #4's ONLY arm, inside the DEFAULT ``train`` mode. Routed by family, not by a
         # seventh --mode value — six dispatches, one gate, one ledger, unchanged.
@@ -1677,7 +1824,13 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "the media-file count that completes it lives on the dataset Volume."
         )
         fc = wan_train.with_options(timeout=wan_train_timeout_s).spawn(**wan_params)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "wan_train")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "wan_train",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     else:
         from signet_trainer.modal.fns import train
 
@@ -1688,4 +1841,10 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "through this same gate."
         )
         fc = train.spawn(config_text)
-        _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "train")
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "train",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )

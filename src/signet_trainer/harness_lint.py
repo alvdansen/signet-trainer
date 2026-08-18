@@ -553,22 +553,45 @@ def lint_typed_state_log(text: str, tier_map: dict[str, int] | None = None) -> l
     (the adoption landed mid-day 2026-07-14 — several earlier same-date entries legitimately
     have no state block). Older entries are never retrofitted (forward-only law).
 
+    Issue #37 finding 6: an ABSENT adoption entry used to short-circuit here with a single
+    pseudo-violation naming the missing title — before a single real rule ever ran, so a
+    downstream project starting its own DECISION-LOG got a permanently red lint whose message
+    named no fix for the numerics it actually exists to catch. The date-based cutoff now runs
+    INDEPENDENTLY of the title anchor: with no adoption entry there is no entry-order anchor to
+    exempt anything against, so every entry is checked by DATE alone — a log with nothing dated
+    on/after the cutoff still lints clean (return ``[]``, "nothing post-cutoff to lint"), and a
+    log that DOES carry post-cutoff violations still reports them, prefixed with a note (never
+    silently exempted). Once the real adoption entry lands, entries strictly BEFORE it become
+    exempt even on the same date (the forward-only law above, pinned by
+    ``test_pre_adoption_entries_are_exempt_by_entry_order``) — so pasting the anchor in
+    retroactively exempts everything before it; land it at the point of actual adoption, not to
+    silence this note.
+
     The tier map (for the ``mode-pick`` Tier-2/3 rule) is loaded ONCE here and threaded down —
     fail-loud on a missing/zero-knob taxonomy (D-23), so a whole-log lint can never silently skip
     the safety mechanism.
     """
     entries = split_log_entries(text)
     adoption_idx = find_adoption_index(entries)
-    if adoption_idx is None:
-        return [f"adoption entry ({_ADOPTION_TITLE!r}) not found in the decision log"]
+    scoped_entries = entries[adoption_idx:] if adoption_idx is not None else entries
     if tier_map is None:
         tier_map = load_tier_map()
     violations: list[str] = []
-    for entry in entries[adoption_idx:]:
+    for entry in scoped_entries:
         date = entry_date(entry)
         if date is None or date < _TYPED_STATE_CUTOFF:
             continue
         violations.extend(lint_typed_state_entry(entry, tier_map))
+    if adoption_idx is None and violations:
+        violations.insert(
+            0,
+            f"NOTE: no {_ADOPTION_TITLE!r} adoption entry found — every entry dated on/after "
+            f"{_TYPED_STATE_CUTOFF} was still linted by DATE alone (the {len(violations)} "
+            "violation(s) below are real). Once the adoption entry lands, entries strictly "
+            "BEFORE it become exempt even on the same date (forward-only law) — appending the "
+            "title retroactively exempts everything before it, so add it at the point of actual "
+            "adoption, not merely to silence this note.",
+        )
     return violations
 
 

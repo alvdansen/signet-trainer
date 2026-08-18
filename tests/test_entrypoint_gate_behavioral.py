@@ -102,11 +102,21 @@ def test_approved_run_dispatches_exactly_once(tmp_path, monkeypatch) -> None:
     entrypoint, raw_main = _raw_main()
     monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
     rec = _stub_train(monkeypatch)
+    # main() now books the dispatch into the cumulative session-spend ledger (D-8-YOLOCAP, issue
+    # #37 finding 1/6) via entrypoint.append_spend — neutralize it here so this test (which is
+    # about dispatch COUNT, not ledger behavior) never writes the default project-relative ledger
+    # path onto the real filesystem. Ledger behavior itself is covered by
+    # test_entrypoint_session_cap.py.
+    ledger_calls: list[tuple] = []
+    monkeypatch.setattr(
+        entrypoint, "append_spend", lambda *a, **k: ledger_calls.append((a, k))
+    )
 
     # --approve authorizes non-interactively; no input() should be consulted.
     raw_main(config=_write_config(tmp_path), approve=True, mode="train")
 
     assert len(rec.calls) == 1, "an approved run must dispatch train.spawn() exactly once"
+    assert len(ledger_calls) == 1, "the approved dispatch must book exactly one ledger entry"
 
 
 def test_fuse_cost_print_names_the_128gib_reservation(tmp_path, monkeypatch, capsys) -> None:

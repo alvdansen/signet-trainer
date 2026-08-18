@@ -36,6 +36,7 @@ from signet_trainer.harness_state import (
     MASK_SPEC_ARTIFACT,
     MASK_SPEC_MARKER_BEGIN,
     MASK_SPEC_MARKER_END,
+    SESSION_LEDGER_PATH_ENV_VAR,
     SESSION_STATE_PATH,
     TAXONOMY_ARTIFACT,
     artifact_registry,
@@ -43,6 +44,7 @@ from signet_trainer.harness_state import (
     campaign_card_md_path,
     check_stale,
     discover_campaign_state_path,
+    discover_continue_here_artifacts,
     emit_all,
     emit_into,
     house_spec_path,
@@ -56,6 +58,7 @@ from signet_trainer.harness_state import (
     render_mask_spec_block,
     render_state_block,
     render_tier_table,
+    session_ledger_path,
     tier_taxonomy_path,
 )
 from signet_trainer.modal.session_cap import read_ledger
@@ -935,3 +938,107 @@ def test_real_knowledge_carries_mask_spec_section_and_is_clean() -> None:
     assert MASK_SPEC_MARKER_BEGIN in text and "#458070" in text
     assert "<!-- TYPED-STATE:BEGIN" in text and "<!-- MASK-SPEC:BEGIN" in text
     assert check_stale() == [], "committed KNOWLEDGE.md must match MASK-SPEC.yaml + the typed sources"
+
+
+# --------------------------------------------------------------------------- (11) issue #37 finding 3:
+# single-source the ledger path (SESSION_LEDGER_PATH_ENV_VAR / session_ledger_path)
+
+
+def test_session_ledger_path_matches_schema_default() -> None:
+    """SESSION_STATE_PATH must stay byte-identical to ModalConfig.session_spend_ledger_path's
+    default — the literal this module cannot import (test_emitter_is_import_confined), pinned
+    here instead so the two can never silently diverge (issue #37 finding 3)."""
+    from signet_trainer.config.schema import ModalConfig
+
+    assert SESSION_STATE_PATH == ModalConfig.model_fields["session_spend_ledger_path"].default
+
+
+def test_session_ledger_path_resolution_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """explicit > SIGNET_SESSION_LEDGER_PATH env var > the packaged SESSION_STATE_PATH default."""
+    monkeypatch.delenv(SESSION_LEDGER_PATH_ENV_VAR, raising=False)
+    assert session_ledger_path() == SESSION_STATE_PATH
+
+    monkeypatch.setenv(SESSION_LEDGER_PATH_ENV_VAR, ".planning/harness/campaign-x/SESSION-STATE.json")
+    assert session_ledger_path() == ".planning/harness/campaign-x/SESSION-STATE.json", (
+        "an operator who set cfg.modal.session_spend_ledger_path off the default must be able to "
+        "point this module at the SAME file via the env var (issue #37 finding 3)"
+    )
+
+    assert session_ledger_path("explicit/path.json") == "explicit/path.json", (
+        "an explicit caller-supplied path must win over the env var"
+    )
+
+
+def test_missing_ledger_renders_a_loud_warning_not_an_authoritative_zero(tmp_path: Path) -> None:
+    """A ledger path nothing writes must say so LOUDLY in the emitted block (issue #37 finding 3),
+    not render a plausible-looking $0.00 that could be a wrong-path artifact instead of real state."""
+    figures = read_ledger_figures(tmp_path / "absent.json")
+    assert figures["available"] is False
+
+    block = render_state_block({"campaign": _campaign_dict(), "ledger": figures})
+    parsed = _parse_block(block)
+    assert parsed["ledger"]["available"] is False
+    assert "WARNING" in parsed["ledger"], "a missing ledger file must carry a loud warning slot"
+    assert "not found" in parsed["ledger"]["WARNING"]
+
+    # And the present-ledger case carries no such warning (no false alarms on a real, fresh ledger).
+    session = tmp_path / "SESSION-STATE.json"
+    _write_session_state(session, cap=10.0, est_amounts=[1.0])
+    present_figures = read_ledger_figures(session)
+    assert present_figures["available"] is True
+    present_block = _parse_block(
+        render_state_block({"campaign": _campaign_dict(), "ledger": present_figures})
+    )
+    assert "WARNING" not in present_block["ledger"]
+
+
+# --------------------------------------------------------------------------- (12) issue #37 finding 5:
+# STATIC_ARTIFACTS discovery + emit_into's missing-artifact guard
+
+
+def test_discover_continue_here_artifacts_is_empty_when_no_phases_dir(tmp_path: Path) -> None:
+    """A project with no '.planning/phases' at all (like this repo) gets zero entries, not an error —
+    the old hardcoded phase-slug literal is gone; discovery replaces it (issue #37 finding 5)."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert discover_continue_here_artifacts(root) == []
+
+
+def test_discover_continue_here_artifacts_finds_every_continue_here_md(tmp_path: Path) -> None:
+    """Every '.planning/phases/*/.continue-here.md' is discovered, none hand-picked by name."""
+    root = tmp_path / "repo"
+    for slug in ("03-alpha", "07-beta"):
+        phase_dir = root / ".planning" / "phases" / slug
+        phase_dir.mkdir(parents=True)
+        (phase_dir / ".continue-here.md").write_text("## TYPED STATE\n\nprose\n", encoding="utf-8")
+    # A phase dir with no .continue-here.md must not be picked up as a false positive.
+    (root / ".planning" / "phases" / "11-gamma").mkdir(parents=True)
+
+    found = discover_continue_here_artifacts(root)
+    assert {rel for rel, _anchor in found} == {
+        ".planning/phases/03-alpha/.continue-here.md",
+        ".planning/phases/07-beta/.continue-here.md",
+    }
+    assert all(anchor == "## TYPED STATE" for _rel, anchor in found)
+
+
+def test_emit_into_raises_actionable_not_a_traceback_on_missing_artifact(tmp_path: Path) -> None:
+    """A registered artifact that does not exist raises FileNotFoundError with an actionable
+    message (issue #37 finding 5) — never the bare 7-frame traceback from an unguarded read."""
+    missing = tmp_path / "STATE.md"
+    with pytest.raises(FileNotFoundError, match="registered artifact not found"):
+        emit_into(missing, _SIMPLE_BLOCK, anchor="## H")
+
+
+def test_check_command_fails_actionably_not_with_a_bare_traceback_when_planning_is_absent(
+    tmp_path: Path,
+) -> None:
+    """'harness_state check' on a project shipping no .planning/ at all (this repo, per issue #37
+    finding 5) must exit 2 with an actionable message — never propagate a bare traceback, and
+    never collide with exit 1 (reserved for genuine drift, per the proposed fix)."""
+    empty_project = tmp_path / "empty-project"
+    empty_project.mkdir()
+
+    rc = main(["check", "--repo-root", str(empty_project)])
+
+    assert rc == 2, "a missing project (no campaign card, no .planning/) must exit 2, not crash"
