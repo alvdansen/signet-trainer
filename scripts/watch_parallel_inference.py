@@ -34,6 +34,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 from signet_trainer.config.load import load_config  # noqa: E402
 from signet_trainer.inference.samples_layout import (  # noqa: E402
+    committed_clip_names,
     expected_h3_render_key,
     landed_render_ids,
     samples_root,
@@ -75,6 +76,16 @@ DEADLINE_HOURS = 12.0
 # declared stalled and re-dispatch (still cap-gated, still ledgered) becomes eligible. This is what
 # kills the re-dispatch-and-re-bill-every-poll failure the attached assumption caused once the
 # entrypoint moved to .spawn() (D-10-DEF-17).
+#
+# ⛔ issue #45 PR-1 must-fix #1 — THE CLOCK MUST REFRESH ON PROGRESS, NOT ONLY START AT DISPATCH.
+# `pending_since` used to be set once when the render was dispatched and never touched again. A
+# single H3 render identity can legitimately keep committing clips for hours (`h3_sample` commits
+# per clip, `modal/fns.py`), so a clock that never refreshes declares every healthy long-running
+# render STALLED at `render_stall_minutes`, releases single-flight, and lets a second metered A100
+# dispatch OVER the still-running first — repeating until the session cap trips. `render_landed()`'s
+# own check is coarse (it saturates true-or-false the moment the FIRST clip commits) and cannot
+# supply that refresh signal by itself; `render_progress_artifacts()` below reads one level deeper
+# for exactly that reason, and main()'s loop resets `pending_since` whenever it changes.
 RENDER_STALL_MIN = float(_cfg.modal.render_stall_minutes)
 # AUDIT #4 — cumulative session-cap ledger (WR-02 authoritative chain, config-first). The dispatch
 # loop reads this before EVERY render and stops when the cap would be breached.
@@ -151,7 +162,7 @@ def latest_checkpoint_name() -> str | None:
     return max(names, key=lambda n: int(re.search(r"step-(\d+)", n).group(1))) if names else None
 
 
-def render_landed(step: int) -> bool:
+def render_landed(step: int, checkpoint: str | None) -> bool:
     """Did the render for `step` actually commit artifacts?  (carry-forward of aaaee62)
 
     The render key now carries checkpoint + seed + frame_count + ORDERED reference condition, so the
@@ -161,20 +172,65 @@ def render_landed(step: int) -> bool:
     `B+029` render landed, and the grid would come out labelled for a reference condition it does not
     contain. On LTX there is no per-render identity, so ANY new committed stamp is the signal — the
     historical behaviour, unchanged.
+
+    `checkpoint` MUST be the value main() captured AT DISPATCH TIME (issue #45 PR-1 must-fix #2),
+    never re-derived here via a fresh `latest_checkpoint_name()` call. Re-resolving "latest" on every
+    poll could drift onto a NEWER checkpoint that landed while THIS render was still pending, key
+    `expected_h3_render_key` on the wrong identity, and never find the render actually dispatched —
+    silently degrading into a permanent false STALL for a render that in fact landed.
     """
     ids = committed_render_stamps()
     if FAMILY != "h3":
         return bool(ids)
-    ckpt = latest_checkpoint_name()
-    if ckpt is None:
-        return False
+    if checkpoint is None:
+        # Kill the match-anything path: a caller with no resolved checkpoint must be REFUSED, never
+        # silently satisfied by whatever the identity-independent branch above would have returned.
+        # main() already refuses to dispatch (and to book spend) when this resolves to None at
+        # dispatch time — a None reaching here means that guard was bypassed, which is the bug, not
+        # a signal to paper over by matching any render under this output_dir.
+        raise ValueError(
+            "render_landed(family='h3') called with checkpoint=None. An unresolved checkpoint must "
+            "refuse verification, never match any committed render under this identity."
+        )
     want = expected_h3_render_key(
-        checkpoint=ckpt,
+        checkpoint=checkpoint,
         seed=int(_cfg.validation.seed),
         frame_count=int(_cfg.validation.frame_count),
         subject_ids=list(_cfg.validation.reference_subject_ids or []),
     )
     return want in ids
+
+
+def render_progress_artifacts(checkpoint: str | None) -> frozenset[str]:
+    """Every artifact committed so far under the PENDING render's own directory — the fine-grained
+    PROGRESS signal the stall clock needs (issue #45 PR-1 must-fix #1).
+
+    `render_landed` answers one coarse question — "has this render's identity directory appeared at
+    all?" — which saturates the moment the FIRST clip commits and stays true for the rest of an
+    up-to-6h render; it is useless as a freshness signal on its own. This reads one level deeper: the
+    render's own `base/`/`lora/` columns (the SAME convention `refresh_grid()` already reads), via
+    `committed_clip_names` (`inference/samples_layout.py`) — so a newly-committed clip shows up here
+    long before the whole render is judged landed, and a live render can be told apart from a hung
+    one.
+
+    On LTX, and while the checkpoint identity is not yet known, there is no per-render directory to
+    descend into ahead of time — falls back to the same top-level `committed_render_stamps()` set
+    `render_landed` itself reads on that family; a new stamp appearing is progress there too.
+    """
+    if FAMILY != "h3" or checkpoint is None:
+        return frozenset(committed_render_stamps())
+    key = expected_h3_render_key(
+        checkpoint=checkpoint,
+        seed=int(_cfg.validation.seed),
+        frame_count=int(_cfg.validation.frame_count),
+        subject_ids=list(_cfg.validation.reference_subject_ids or []),
+    )
+    render_dir = f"{SAMPLES_ROOT}/{key}"
+    found: set[str] = set()
+    for col in ("base", "lora"):
+        r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", f"{render_dir}/{col}"])
+        found.update(f"{col}/{name}" for name in committed_clip_names(r.stdout or ""))
+    return frozenset(found)
 
 
 def list_checkpoint_steps() -> list[int]:
@@ -282,9 +338,15 @@ def main() -> None:
     deadline = time.time() + DEADLINE_HOURS * 3600
     # Wave 2 #6 single-flight state: at most ONE render in flight. `pending_step` is the step whose
     # detached render has been dispatched (and ledgered) but whose artifact has not yet committed;
-    # `pending_since` anchors the render_stall_minutes freshness clock.
+    # `pending_since` anchors the render_stall_minutes freshness clock (issue #45 PR-1 must-fix #1:
+    # REFRESHED on progress, not just set once). `pending_checkpoint` is the identity captured AT
+    # DISPATCH TIME (must-fix #2) that `render_landed`/`render_progress_artifacts` verify against for
+    # the life of this pending render — never re-derived mid-flight. `pending_progress` is the last
+    # observed artifact snapshot, compared each poll to decide whether the clock resets.
     pending_step: int | None = None
     pending_since = 0.0
+    pending_checkpoint: str | None = None
+    pending_progress: frozenset[str] = frozenset()
     print(f"[watcher] watching {OUTPUT_DIR} (poll {POLL_SECONDS}s, deadline {DEADLINE_HOURS}h, "
           f"render stall gate {RENDER_STALL_MIN:g} min)", flush=True)
     while time.time() < deadline:
@@ -316,31 +378,54 @@ def main() -> None:
                 CAP_STOP_SENTINEL_FILE.write_text(
                     "cap-stop: session cap reached — do NOT relaunch\n", encoding="utf-8")
                 sys.exit(CAP_STOP_EXIT)
-            # AUDIT #2 — ledger EVERY dispatch (a dispatched render is booked A100 time whether or
-            # not it lands), then hand completion to the ARTIFACT gate below. Spend books once per
-            # DISPATCH, and single-flight + the stall gate mean a dispatch happens at most once per
-            # render identity per render_stall_minutes window — never once per poll.
-            append_spend(step)
-            ok = dispatch_render(step)
-            if ok:
-                pending_step, pending_since = step, time.time()
+            # CAPTURE-BEFORE-BOOK (issue #45 PR-1 must-fix #2): resolve the checkpoint identity the
+            # render will key on BEFORE append_spend, never after. `latest_checkpoint_name()` returns
+            # None on a `modal volume ls` timeout (sh()'s VOLUME_OP_TIMEOUT_S catch) or an empty
+            # listing; booking spend and dispatching anyway would create a render this watcher could
+            # never verify, and at MAX_STEPS could write the run-complete sentinel having verified
+            # nothing. LTX has no checkpoint-keyed render identity to resolve, so it is exempt.
+            ckpt_at_dispatch = latest_checkpoint_name() if FAMILY == "h3" else None
+            if FAMILY == "h3" and ckpt_at_dispatch is None:
+                print(f"[watcher] step {step}: could not resolve the latest checkpoint name (modal "
+                      "volume ls timeout or empty listing) — REFUSING to book spend/dispatch for a "
+                      "render this watcher could never verify. Retrying next poll.", flush=True)
             else:
-                print(f"[watcher] dispatch for step {step} REFUSED/FAILED before spawn — "
-                      "eligible again next poll (cap-gated).", flush=True)
+                # AUDIT #2 — ledger EVERY dispatch (a dispatched render is booked A100 time whether
+                # or not it lands), then hand completion to the ARTIFACT gate below. Spend books once
+                # per DISPATCH, and single-flight + the stall gate mean a dispatch happens at most
+                # once per render identity per render_stall_minutes window — never once per poll.
+                append_spend(step)
+                ok = dispatch_render(step)
+                if ok:
+                    pending_step, pending_since = step, time.time()
+                    pending_checkpoint, pending_progress = ckpt_at_dispatch, frozenset()
+                else:
+                    print(f"[watcher] dispatch for step {step} REFUSED/FAILED before spawn — "
+                          "eligible again next poll (cap-gated).", flush=True)
         if pending_step is not None:
             # ARTIFACT-VERIFIED completion (`processes lie, artifacts don't`): the render is done
             # when its identity-keyed dir is ON the Volume — never when a subprocess exits. The
             # freshness gate (render_stall_minutes, config-first) is the ONLY path that gives up on
             # a pending render; only then does re-dispatch (with a fresh, honest booking) become
             # eligible, and the pre-dispatch session-cap gate above still bounds the total.
-            landed = render_landed(pending_step)
+            landed = render_landed(pending_step, pending_checkpoint)
+            if not landed:
+                # PROGRESS REFRESH (issue #45 PR-1 must-fix #1): reset the clock on evidence of life
+                # BEFORE measuring staleness, not after — see the RENDER_STALL_MIN comment above for
+                # why render_landed's coarse check cannot supply this signal on its own.
+                progress = render_progress_artifacts(pending_checkpoint)
+                if progress != pending_progress:
+                    print(f"[watcher] render step {pending_step}: new committed artifact(s) "
+                          f"({len(progress)} total) — resetting the stall clock.", flush=True)
+                    pending_progress = progress
+                    pending_since = time.time()
             age_min = (time.time() - pending_since) / 60.0
             if landed:
                 ok, step = True, pending_step
                 rendered.update(s for s in steps
                                 if s <= step and (s % RENDER_EVERY == 0 or s >= MAX_STEPS))
                 refresh_grid()
-                pending_step = None
+                pending_step, pending_checkpoint, pending_progress = None, None, frozenset()
                 if ok and step >= MAX_STEPS:
                     # OBS-01 run-complete: success-gated — write the sentinel + exit 0 so the
                     # supervisor STOPS (does not relaunch).
@@ -349,10 +434,12 @@ def main() -> None:
                                              encoding="utf-8")
                     sys.exit(0)
             elif age_min > RENDER_STALL_MIN:
+                # A render is STALLED only when NO new artifact has appeared for render_stall_minutes
+                # (issue #45 PR-1 must-fix #1) — a genuinely hung render still fires this, unchanged.
                 print(f"[watcher] render step {pending_step}: no new committed render artifact "
                       f"after {age_min:.0f} min (> render_stall_minutes {RENDER_STALL_MIN:g}) — "
                       "declaring STALLED; re-dispatch eligible next poll (cap-gated).", flush=True)
-                pending_step = None
+                pending_step, pending_checkpoint, pending_progress = None, None, frozenset()
             else:
                 print(f"[watcher] render step {pending_step}: awaiting artifact "
                       f"({age_min:.0f}/{RENDER_STALL_MIN:g} min)", flush=True)
