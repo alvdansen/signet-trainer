@@ -76,6 +76,12 @@ asserts shapes and masks, and exits non-zero on any violation — before a GPU i
 `config/`, `conditioning/`, and `dryrun/` packages import neither `modal` nor `ltx_core`, so this
 runs on a laptop (including Windows) with zero cost.
 
+Pass `--mode <train|sample|preprocess|fuse|restore|backup>` to also fire the mode-conditional
+refusals the metered container would raise at load (e.g. a multi_frame sample config dispatched as
+train) — the same shared check the entrypoint runs pre-approval. For the LTX family the gate
+builds and asserts the batch at **every** `data.resolution_buckets` geometry (what training
+actually shapes) and reports the worst bucket's sequence length alongside `training_dims`.
+
 > See [Known beta gaps](#known-beta-gaps) for the parts of the test suite that need extra setup.
 
 ---

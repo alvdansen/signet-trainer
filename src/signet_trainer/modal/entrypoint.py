@@ -1336,8 +1336,11 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         )
 
     # (2) Dry-run hard gate (CONF-03) on the already-loaded cfg — must pass before ANY remote
-    #     dispatch. Non-zero -> abort.
-    rc = run_dryrun(cfg)
+    #     dispatch. Non-zero -> abort. The mode is threaded through (gap-dryrun-ltx-0) so the
+    #     mode-conditional refusals shared with the container bodies (config/mode_gate.py) fire
+    #     HERE, pre-approval — a config the metered container would refuse at load can never
+    #     burn the approval on a detached dispatch.
+    rc = run_dryrun(cfg, mode=mode)
     if rc != 0:
         print(
             f"[signet-entrypoint] dry-run gate FAILED (rc={rc}) — aborting before any launch.",

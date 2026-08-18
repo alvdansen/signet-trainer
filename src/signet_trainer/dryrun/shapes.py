@@ -71,6 +71,7 @@ from signet_trainer.conditioning.strategy import (
     compute_seq_len,
 )
 from signet_trainer.config.load import load_config
+from signet_trainer.config.mode_gate import KNOWN_MODES, validate_mode_config
 from signet_trainer.config.schema import SignetConfig
 from signet_trainer.config.validators import (
     validate_h3_reference_budget,
@@ -1954,7 +1955,56 @@ def _h3_ok_banner(cfg: SignetConfig, budget: H3DryrunBudget) -> str:
     )
 
 
-def run_dryrun(cfg: SignetConfig) -> int:
+@dataclass(frozen=True)
+class _BucketPrice:
+    """The WORST resolution bucket the gate priced (audit gap-dryrun-ltx-1)."""
+
+    dims: tuple[int, int, int]  # (W, H, F) of the worst bucket
+    seq_len: int  # its target seq_len (compute_seq_len)
+    latent_shape: tuple[int, ...]  # its built video.latent shape (combined for ic_lora)
+    n_buckets: int  # how many buckets were built + asserted
+
+
+def _price_resolution_buckets(cfg: SignetConfig) -> _BucketPrice:
+    """Build + assert the synthetic batch at EVERY ``data.resolution_buckets`` geometry (LTX only).
+
+    ``training_dims`` shapes ONLY the dry-run synthetic batch — the LTX container path never reads
+    it (the H3/qwen_edit arms and the ``validate_gate`` alignment re-check are the only other
+    consumers). What preprocess/training actually shape is ``data.resolution_buckets``, so a gate
+    priced at ``training_dims`` alone can bless a sequence a large multiple smaller than the one the
+    metered A100 will see mid-loop (the ic_lora doubled-sequence OOM class, Pitfall 2 — audit
+    gap-dryrun-ltx-1). Price the WORST bucket the same way the H3 arm prices the worst reference
+    pair: iterate the buckets, build/assert the synthetic batch at each, and return the max so the
+    gate's number is the number the container will actually see.
+
+    multi_frame + items: keyframe items are sample-only (WR-04) AND their frame indices are
+    range-checked against ``training_dims``, not the bucket grid — so each bucket is priced in the
+    posture the train loop actually runs: self-conditioning (items dropped for the bucket copy).
+    """
+    dims_list = [
+        # WxHxF strings, shape-validated at config load (WR-04) — the split cannot fail here.
+        tuple(int(part) for part in bucket.split("x"))
+        for bucket in cfg.data.resolution_buckets
+    ] or [tuple(cfg.training_dims)]
+
+    worst: _BucketPrice | None = None
+    for dims in dims_list:
+        update: dict[str, Any] = {"training_dims": dims}
+        if cfg.conditioning.mode == "multi_frame" and cfg.conditioning.conditioning_items:
+            update["conditioning"] = cfg.conditioning.model_copy(
+                update={"conditioning_items": []}
+            )
+        bucket_cfg = cfg.model_copy(update=update, deep=True)
+        mi = build_dryrun_inputs(bucket_cfg)
+        _assert_contract(bucket_cfg, mi)
+        bucket_seq = compute_seq_len(*dims)
+        if worst is None or bucket_seq > worst.seq_len:
+            worst = _BucketPrice(dims, bucket_seq, tuple(mi.video.latent.shape), len(dims_list))
+    assert worst is not None  # dims_list is never empty (training_dims fallback)
+    return worst
+
+
+def run_dryrun(cfg: SignetConfig, mode: str | None = None) -> int:
     """Run the dry-run hard gate on an ALREADY-validated config (CONF-03). Returns 0/non-zero.
 
     Split out from ``main`` (WR-03) so a caller that already holds a loaded ``SignetConfig`` — e.g.
@@ -1964,6 +2014,12 @@ def run_dryrun(cfg: SignetConfig) -> int:
 
     Assumes ``cfg`` is already validated (the CONF-02 validators fired at load time). Only the
     synthetic-batch build + contract assertions happen here.
+
+    ``mode`` (audit gap-dryrun-ltx-0): the entrypoint's ``--mode`` value, when the caller knows it.
+    The mode-conditional refusals (``validate_mode_config``, one home shared with the container
+    bodies) fire FIRST, so a train/sample mix-up of the two multi_frame example shapes is refused
+    on CPU, pre-dispatch, instead of post-approval on a metered A100. ``mode=None`` keeps the
+    historical mode-agnostic behaviour for callers that have no mode.
 
     For ``model.family == "h3"`` the gate additionally REFUSES an over-budget packed sequence
     (H3-07). That check runs FIRST, inside the same try/except, so the refusal becomes a non-zero
@@ -1983,11 +2039,19 @@ def run_dryrun(cfg: SignetConfig) -> int:
     the declared-vs-trained crop is reported) and returns before ``build_dryrun_inputs``, whose wan
     branch still refuses by name for any caller reaching it directly. The skip is guarded on
     ``wan_manifest is None``, so every other family's path through this function is byte-identical.
+
+    For the remaining (LTX) family the gate additionally prices EVERY ``data.resolution_buckets``
+    geometry (``_price_resolution_buckets``, audit gap-dryrun-ltx-1) and reports the worst — the
+    sequence the container will actually train, which ``training_dims`` alone does not bound. The
+    h3/qwen_edit/wan arms carry their own packed-layout/manifest budget systems and are not
+    re-priced here.
     """
     h3_budget: H3DryrunBudget | None = None
     qwen_edit_budget: QwenEditDryrunBudget | None = None
     wan_manifest: WanDryrunManifest | None = None
+    worst_bucket: _BucketPrice | None = None
     try:
+        validate_mode_config(cfg, mode)
         if cfg.model.family == "h3":
             h3_budget = assert_h3_seq_len_budget(cfg)
         elif cfg.model.family == "qwen_edit":
@@ -2003,6 +2067,8 @@ def run_dryrun(cfg: SignetConfig) -> int:
         if wan_manifest is None:
             mi = build_dryrun_inputs(cfg)
             _assert_contract(cfg, mi)
+            if cfg.model.family not in ("h3", "qwen_edit"):
+                worst_bucket = _price_resolution_buckets(cfg)
     except AssertionError as exc:
         print(f"[signet-dryrun] dry-run contract assertion FAILED: {exc}", file=sys.stderr)
         return 1
@@ -2024,10 +2090,14 @@ def run_dryrun(cfg: SignetConfig) -> int:
 
     width, height, frames = cfg.training_dims
     seq_len = compute_seq_len(width, height, frames)
+    bw, bh, bf = worst_bucket.dims
     print(
         f"[signet-dryrun] OK — config valid, synthetic ModelInputs built: "
         f"dims [W={width}, H={height}, F={frames}] -> seq_len={seq_len}, "
-        f"video.latent {tuple(mi.video.latent.shape)}. Zero GPU, zero Modal spend."
+        f"video.latent {tuple(mi.video.latent.shape)}; worst bucket "
+        f"[W={bw}, H={bh}, F={bf}] -> seq_len={worst_bucket.seq_len}, "
+        f"video.latent {worst_bucket.latent_shape} "
+        f"({worst_bucket.n_buckets} bucket(s) priced). Zero GPU, zero Modal spend."
     )
     return 0
 
@@ -2039,10 +2109,31 @@ def main(argv: list[str] | None = None) -> int:
     ``python -m signet_trainer.dryrun <config.yaml>``. This is the file-reading wrapper around
     ``run_dryrun``; callers that already hold a validated ``SignetConfig`` should call
     ``run_dryrun(cfg)`` directly (WR-03) to avoid a redundant/divergent second load.
+
+    ``--mode <value>`` (optional, audit gap-dryrun-ltx-0): the dispatch mode the config is destined
+    for, same vocabulary as the entrypoint's ``--mode``. With it, the mode-conditional refusals
+    fire here, for free — without it the gate stays mode-agnostic (historical behaviour), which
+    cannot model the train/sample multi_frame mix-up.
     """
+    usage = f"usage: signet-dryrun <config.yaml> [--mode <{ '|'.join(KNOWN_MODES) }>]"
     args = list(sys.argv[1:] if argv is None else argv)
+    mode: str | None = None
+    if "--mode" in args:
+        flag_idx = args.index("--mode")
+        if flag_idx + 1 >= len(args):
+            print(usage, file=sys.stderr)
+            return 2
+        mode = args.pop(flag_idx + 1)
+        args.pop(flag_idx)
+        if mode not in KNOWN_MODES:
+            print(
+                f"[signet-dryrun] unknown --mode {mode!r} "
+                f"(expected one of: {', '.join(KNOWN_MODES)}).",
+                file=sys.stderr,
+            )
+            return 2
     if len(args) != 1:
-        print("usage: signet-dryrun <config.yaml>", file=sys.stderr)
+        print(usage, file=sys.stderr)
         return 2
 
     config_path = Path(args[0])
@@ -2054,8 +2145,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[signet-dryrun] config validation FAILED: {exc}", file=sys.stderr)
         return 1
 
-    # (2-4) Build the synthetic batch + assert the real contract on the loaded config.
-    return run_dryrun(cfg)
+    # (2-4) Build the synthetic batch + assert the real contract on the loaded config —
+    # mode-conditionally when the caller named the destination mode (gap-dryrun-ltx-0).
+    return run_dryrun(cfg, mode=mode)
 
 
 if __name__ == "__main__":

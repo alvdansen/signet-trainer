@@ -91,7 +91,9 @@ def test_secret_name_mismatch_aborts_before_dispatch(tmp_path, monkeypatch) -> N
     # If the guard did NOT fire we would reach the dry-run — make that loud so the test can't pass
     # for the wrong reason.
     monkeypatch.setattr(
-        entrypoint, "run_dryrun", lambda cfg: pytest.fail("reached dry-run — 1b guard did not fire")
+        entrypoint,
+        "run_dryrun",
+        lambda cfg, mode=None: pytest.fail("reached dry-run — 1b guard did not fire"),
     )
 
     with pytest.raises(SystemExit) as exc:
@@ -125,7 +127,7 @@ def test_matching_secret_names_pass_the_1b_guard(tmp_path, monkeypatch) -> None:
     # dry-run gate (which we stub to abort with a sentinel rc, proving we got PAST 1b).
     entrypoint, raw_main = _raw_main()
     _stub_train(monkeypatch)
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 7)  # sentinel non-zero -> SystemExit(7)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 7)  # non-zero -> SystemExit(7)
 
     with pytest.raises(SystemExit) as exc:
         raw_main(config=_write_config(tmp_path, _MATCHING_CONFIG), approve=True, mode="train")
