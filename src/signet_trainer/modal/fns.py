@@ -434,6 +434,18 @@ def train(config_yaml: str) -> None:
     checkpoint_path = str(WEIGHTS_DIR / config.model.model_id)
     text_encoder_path = str(WEIGHTS_DIR / config.model.text_encoder_id)
 
+    # Fused-base pre-load gate (PR-6 gap-fuse-1): verify_fused_metadata is the advertised
+    # pre-dispatch gate but the entrypoint has no weights-Volume access, so this first-touch
+    # wiring is where it runs — header-only, ~seconds, BEFORE load_ltxv_components mounts 44GB.
+    # A truncated/damaged/unfused artifact dies here as a named RuntimeError, not a raw
+    # SafetensorError mid-load on the metered A100.
+    from signet_trainer.modal.fuse import is_fused_base_filename, verify_fused_metadata  # noqa: PLC0415
+
+    if is_fused_base_filename(config.model.model_id):
+        print(f"[train] fused-base gate: header-verifying {checkpoint_path}", flush=True)
+        gate_summary = verify_fused_metadata(checkpoint_path)
+        print(f"[train] fused-base gate PASSED: {gate_summary}", flush=True)
+
     # ── (3) load the LTX-2.3 components from the mounted weights Volume (MODL-01) ───────────────
     # OFFL-02 (D-9-OFFL02-CLOSE): drive the video VAE decoder from the config knob (config-first,
     # D-NOHARDCODE). ``in_loop_decoder_enabled`` is True iff ``validation.in_loop_sampling`` is set
@@ -1002,6 +1014,16 @@ def sample(config_yaml: str) -> None:
     device = "cuda"
     checkpoint_path = str(WEIGHTS_DIR / config.model.model_id)
     text_encoder_path = str(WEIGHTS_DIR / config.model.text_encoder_id)
+
+    # Fused-base pre-load gate (PR-6 gap-fuse-1) — same first-touch wiring as train(): the
+    # header-only verify runs BEFORE any model load so a damaged fused artifact fails in the
+    # container's first seconds as a named RuntimeError, not mid-load on the metered A100.
+    from signet_trainer.modal.fuse import is_fused_base_filename, verify_fused_metadata  # noqa: PLC0415
+
+    if is_fused_base_filename(config.model.model_id):
+        print(f"[sample] fused-base gate: header-verifying {checkpoint_path}", flush=True)
+        gate_summary = verify_fused_metadata(checkpoint_path)
+        print(f"[sample] fused-base gate PASSED: {gate_summary}", flush=True)
 
     prompts = list(config.validation.prompts)
     # Phase 9 (INPAINT): conditioned validation renders (validation.samples) carry their OWN
@@ -2596,6 +2618,7 @@ def fuse(config_yaml: str) -> None:
     from signet_trainer.config.load import load_config_from_text  # noqa: PLC0415
     from signet_trainer.modal.fuse import (  # noqa: PLC0415
         DEFAULT_BASE_FILENAME,
+        DEFAULT_FUSE_STRENGTH,
         DEFAULT_FUSED_FILENAME,
         fuse_inoutpaint,
         fuse_keycheck,
@@ -2604,15 +2627,25 @@ def fuse(config_yaml: str) -> None:
     config = load_config_from_text(config_yaml)  # revalidate in-container (T-03-63 convention)
     base_path = str(WEIGHTS_DIR / DEFAULT_BASE_FILENAME)
     out_path = str(WEIGHTS_DIR / DEFAULT_FUSED_FILENAME)
+    # The print interpolates the SAME value the call passes (PR-6 gap-fuse-3: the pre-fix print
+    # hardcoded the 1.0 literal and would keep claiming it if DEFAULT_FUSE_STRENGTH ever changed).
+    strength = DEFAULT_FUSE_STRENGTH
     print(
         f"[fuse] base={base_path} -> fused={out_path} "
-        f"(run config: {config.output_dir}; strength=1.0 [precedent])"
+        f"(run config: {config.output_dir}; strength={strength} [precedent])"
     )
 
     kc = fuse_keycheck(base_path)
     print(f"[fuse] keycheck: {kc.get('n_hits', '?')} adapter targets matched in the base header.")
 
-    summary = fuse_inoutpaint(base_path=base_path, out_path=out_path)
+    # overwrite is config-gated (fuse.allow_overwrite, default False — house rule 6): replacing
+    # the one global fused slot every inpaint run trains against must be an explicit opt-in.
+    summary = fuse_inoutpaint(
+        base_path=base_path,
+        out_path=out_path,
+        strength=strength,
+        overwrite=config.fuse.allow_overwrite,
+    )
     weights_vol.commit()  # commit-or-vanish — an uncommitted 44GB fuse is a wasted job.
     print(
         f"[fuse] DONE + committed — {summary.get('n_changed', '?')} tensors changed; "

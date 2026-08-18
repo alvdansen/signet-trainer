@@ -2308,6 +2308,24 @@ class DryRunConfig(_Base):
     )
 
 
+class FuseConfig(_Base):
+    """In-Outpainting fuse block (``--mode fuse``) — the CPU-only scaffold build (WR-04).
+
+    The fuse writes to ONE global slot on the shared weights Volume (``DEFAULT_FUSED_FILENAME``),
+    and every inpaint run trains against whatever lives there — so replacing it is a deliberate,
+    opted-into act, never a side effect of re-dispatching the fuse mode (house rule 6: never
+    auto-delete artifacts). Defaults keep every existing YAML loading byte-identically.
+    """
+
+    allow_overwrite: bool = Field(
+        default=False,
+        description="[house rule 6] False (default) = a fuse dispatch REFUSES to replace an existing "
+        "fused base at the canonical Volume path and raises naming the file (prior runs trained "
+        "against those exact bytes). True = explicit opt-in to re-fuse over it — the staged "
+        "tmp-then-os.replace write still guarantees the old artifact survives any FAILED re-fuse.",
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # BK-01 — checkpoint auto-backup config (Phase 09.1, D-BK-1/2/5). Config-first, DEFAULT-OFF so every
 # existing YAML loads byte-identically. This is the interface-first CONTRACT the Modal sync/restore
@@ -2516,6 +2534,8 @@ class SignetConfig(_Base):
     # every existing (video-only) config loads byte-identically.
     audio: AudioConfig = Field(default_factory=AudioConfig)
     dry_run: DryRunConfig = Field(default_factory=DryRunConfig)
+    # Fuse-mode knobs (PR-6) — DEFAULT-OFF overwrite opt-in; every existing YAML loads unchanged.
+    fuse: FuseConfig = Field(default_factory=FuseConfig)
     # BK-01 checkpoint auto-backup — DEFAULT-OFF (enabled=False), so every existing YAML loads
     # byte-identically. The Modal sync/restore consumers land in 09.1-08.
     backup: BackupConfig = Field(default_factory=BackupConfig)
