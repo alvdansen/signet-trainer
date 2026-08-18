@@ -3670,6 +3670,23 @@ def _h3_load_component(component_dir: str, *, device: str, dtype: Any) -> Any:
     return freeze_h3_component(component.to(device), what=f"the component at {component_dir}")
 
 
+def _h3_frame_buckets(config: Any) -> tuple[int, ...]:
+    """The declared frame buckets' F values, for the position-ids builder and the strategy.
+
+    SigneConfig guarantees every bucket parses, that their W x H equals the run's canvas, and that
+    `training_dims[2]` is among them — so this is a read, not a second opinion.
+
+    ⛔ Plain function, not an ``@app.function`` — it is a pure config read (no GPU, no weights).
+    A decorator inserted between it and ``h3_preprocess`` once bound to THIS helper instead,
+    which silently un-decorated ``h3_preprocess`` (breaking every H3 preprocess dispatch) and
+    turned a config read into an ungated A100-80GB app function. Keep this helper's definition
+    strictly ABOVE any ``@app.function(`` block so a future insertion can't repeat that.
+    """
+    from signet_trainer.config.validators import validate_h3_resolution_bucket  # noqa: PLC0415
+
+    return tuple(sorted({validate_h3_resolution_bucket(b)[2] for b in config.data.resolution_buckets}))
+
+
 @app.function(
     # The MiniMax-H3 family image (H3-07): diffusers at the pinned DIFFUSERS_SHA, NOT the LTX
     # ltx-core/ltx-trainer stack. A gpu= with the code-only default image boots an A100 and dies at
@@ -3683,17 +3700,6 @@ def _h3_load_component(component_dir: str, *, device: str, dtype: Any) -> Any:
     memory=(80 * 1024, 200 * 1024),
     timeout=TWENTY_FOUR_HOURS,
 )
-def _h3_frame_buckets(config: Any) -> tuple[int, ...]:
-    """The declared frame buckets' F values, for the position-ids builder and the strategy.
-
-    SigneConfig guarantees every bucket parses, that their W x H equals the run's canvas, and that
-    `training_dims[2]` is among them — so this is a read, not a second opinion.
-    """
-    from signet_trainer.config.validators import validate_h3_resolution_bucket  # noqa: PLC0415
-
-    return tuple(sorted({validate_h3_resolution_bucket(b)[2] for b in config.data.resolution_buckets}))
-
-
 def h3_preprocess(
     metadata_path: str,
     output_dir: str,
@@ -4687,19 +4693,27 @@ def h3_train(config_yaml: str) -> None:
         config.h3.gpu_usable_gib, config.h3.resident_gib, config.h3.mib_per_packed_row
     )
 
-    # ⛔ ``training_dims[2]`` and NOTHING ELSE. This builder re-derives the target latent grid and
-    # then PROVES it against the rows measured off the cached tensors, so it must be handed the very
-    # frame count the CACHE was encoded at — and that is the value ``entrypoint._h3_encode_params``
-    # threads into ``h3_preprocess(target_frames=...)``: ``cfg.training_dims[2]``. Two spellings
-    # that look plausible here are both wrong:
+    # ⛔ ``_h3_frame_buckets(config)`` — the DECLARED BUCKET SET, not a single scalar. Under
+    # FRAME-COUNT BUCKETING the builder no longer takes the one frame count the cache was encoded
+    # at; it takes every bucket the run declared and proves EACH sample's own frame count against
+    # the rows measured off that sample's cached tensors (``resolve_bucket(n_target_video)``), one
+    # bucket at a time. Handing it ``cfg.training_dims[2]`` here — the pre-cache-era single source —
+    # would price one bucket for every sample and make the RoPE builder raise on the first sample of
+    # any OTHER bucket, mid-run on a metered container.
+    # ``_h3_frame_buckets`` is itself single-sourced off ``config.data.resolution_buckets`` (the same
+    # field ``entrypoint._h3_encode_params`` reads for its own ``frame_buckets`` kwarg), so the two
+    # can never disagree about WHICH buckets exist even though they compute it independently
+    # (``entrypoint.py`` must not import this module — that builds the Modal app graph).
+    # Two spellings that look plausible here are still both wrong:
     #   * ``config.data.frame_count`` does not EXIST (frame_count is a ValidationConfig field) — a
     #     bare AttributeError, which is what D-10-DEF-1 was;
     #   * ``config.validation.frame_count`` resolves but is a RENDER field, and the training config
     #     (configs/h3_embe_r1.yaml) does not set it — it would silently take the schema default 49
     #     against a 22-frame cache and abort the preflight with a geometry disagreement naming a
     #     number that appears nowhere in the YAML.
-    # tests/test_h3_config_reads.py pins BOTH: every config chain read here resolves against the
-    # real Pydantic models, and this argument is derived from the same source as the pre-encode.
+    # tests/test_h3_config_reads.py pins both halves: every config chain read here resolves against
+    # the real Pydantic models, and this argument is derived from the same declared-bucket source as
+    # the pre-encode's own ``frame_buckets``.
     position_ids_fn = make_h3_position_ids_fn(
         target_frames=_h3_frame_buckets(config),
         target_aspect=tuple(config.h3.target_aspect),
@@ -5425,12 +5439,15 @@ def h3_sample(config_yaml: str) -> None:
         deps=h3_step_deps_from_model(
             adapted.base_model.model if hasattr(adapted, "base_model") else adapted
         ),
-        # ⛔ ``training_dims[2]``, NOT ``validation.frame_count``. This strategy is built for
-        # ``_h3_fixed_delta_batch``, which reads sample 0 out of the PRECOMPUTED TRAINING cache —
-        # so the geometry it must agree with is the pre-encode's, not the render's. The render
-        # count is a separate decision and is read separately, at ``_render``'s ``num_frames=``
-        # below. ``config.data.frame_count`` (D-10-DEF-1) was an AttributeError that fired only
-        # AFTER load_components + enable_auto_cpu_offload + inject_lora had been paid for.
+        # ⛔ ``_h3_frame_buckets(config)`` — the DECLARED BUCKET SET — NOT ``validation.frame_count``
+        # and NOT a single ``training_dims[2]`` scalar. This strategy is built for
+        # ``_h3_fixed_delta_batch``, which reads sample 0 out of the PRECOMPUTED TRAINING cache — so
+        # the geometry it must agree with is the pre-encode's declared buckets, not the render's, and
+        # under FRAME-COUNT BUCKETING sample 0 may belong to any declared bucket, proven per-sample
+        # by ``resolve_bucket``. The render count is a separate decision and is read separately, at
+        # ``_render``'s ``num_frames=`` below. ``config.data.frame_count`` (D-10-DEF-1) was an
+        # AttributeError that fired only AFTER load_components + enable_auto_cpu_offload +
+        # inject_lora had been paid for.
         position_ids_fn=make_h3_position_ids_fn(
             target_frames=_h3_frame_buckets(config),
             target_aspect=tuple(config.h3.target_aspect),

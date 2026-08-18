@@ -290,7 +290,7 @@ def _h3_encode_params(cfg: object) -> dict[str, object] | None:
     the wrong block raises ``AttributeError`` AFTER the approval pause; a named abort at this point
     still costs $0 (``.spawn()`` never fires) but it tells the operator what to fix.
 
-    ``h3_preprocess`` deliberately declares ALL 17 parameters REQUIRED with no defaults (10-10), so a
+    ``h3_preprocess`` deliberately declares ALL 18 parameters REQUIRED with no defaults (10-10), so a
     threading gap is a ``TypeError`` at dispatch rather than a silent wrong default. That contract is
     only worth anything if the supply side actually keeps up with it, which is why
     ``tests/test_h3_entrypoint_gate.py`` re-derives BOTH sides from the real signatures and diffs
@@ -329,8 +329,10 @@ def _h3_encode_params(cfg: object) -> dict[str, object] | None:
         # geometry: training_dims is [W, H, F], so F is the H3 target frame count (17n+5).
         "target_frames": cfg.training_dims[2],
         # FRAME-COUNT BUCKETING. The declared buckets' F values, so a manifest row may name its
-        # own `target_frames` and be refused if it is not one of them. training_dims F remains the
-        # DEFAULT for a row that names none, and SigneConfig guarantees it is in this set.
+        # own `target_frames` and be refused if it is not one of them. training_dims F is the
+        # DEFAULT only in SINGLE-bucket mode (`fns.py::_row_frames`) — under >1 bucket a row that
+        # names none is refused outright, no silent default. SignetConfig guarantees training_dims
+        # F is a member of this set either way, so it is always a legal explicit choice too.
         "frame_buckets": tuple(
             sorted({validate_h3_resolution_bucket(b)[2] for b in cfg.data.resolution_buckets})
         ),

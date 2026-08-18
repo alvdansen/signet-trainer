@@ -2878,8 +2878,12 @@ class SignetConfig(_Base):
             if self.training_dims[2] not in frame_buckets:
                 raise ValueError(
                     f"training_dims F={self.training_dims[2]} is not among the declared frame "
-                    f"buckets {frame_buckets}. training_dims F is the DEFAULT bucket for a "
-                    f"manifest row that does not name its own, so it must be declared."
+                    f"buckets {frame_buckets}. training_dims F is the DEFAULT bucket in "
+                    f"SINGLE-bucket mode, and it must be a declared bucket even under >1 bucket "
+                    f"(``modal/fns.py::_row_frames`` refuses a row that names no bucket of its own "
+                    f"once more than one is declared, so under >1 bucket every row must be "
+                    f"explicit — this guard is what keeps training_dims F a legal choice for those "
+                    f"that do)."
                 )
             max_rows = max_packed_rows_for_budget(
                 self.h3.gpu_usable_gib, self.h3.resident_gib, self.h3.mib_per_packed_row
