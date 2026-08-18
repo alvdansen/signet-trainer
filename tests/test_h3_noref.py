@@ -162,6 +162,9 @@ def _noref_config_payload(**over) -> dict:
         "model": {"family": "h3"},
         "training": {"max_steps": 100},
         "h3": {"references_per_sample": 0},
+        # #20 (checklist item 1): the render triple is now family-validated at load — the shared
+        # default frame_count=49 is an LTX clip length and is OUTSIDE the H3 renderable band.
+        "validation": {"frame_count": 124},
     }
     payload.update(over)
     return payload

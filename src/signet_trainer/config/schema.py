@@ -19,6 +19,7 @@ CRITICAL — Anti-Pattern 6 / Pitfall 1/4:
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import ClassVar, Literal
 
@@ -50,9 +51,13 @@ from signet_trainer.config.validators import (
     QWEN_EDIT_LORA_TARGET_REGEX,
     QWEN_EDIT_MAX_CONTROL_SLOTS,
     QWEN_EDIT_VAE_IMAGE_SIZE,
+    assert_h3_frame_count_is_renderable,
+    h3_aligned_num_frames,
     h3_packed_seq_len,
+    h3_renderable_frame_bounds,
     max_packed_rows_for_budget,
     qwen_edit_packed_layout,
+    resolve_canvas_size,
     validate_a2v_lora_targets,
     validate_batch_size,
     validate_conditioning_items,
@@ -211,9 +216,18 @@ class DataConfig(_Base):
     # Phase-2 fresh set (matching fns.preprocess's own default) so existing train/sample configs that
     # never set it still load unchanged.
     metadata_path: str = Field(
-        default="dataset/fresh/metadata.jsonl",
+        # #20: the prior default here was "dataset/fresh/metadata.jsonl" — RELATIVE — while the
+        # comment claimed it matched fns.preprocess's own default, which is
+        # str(DATASET_DIR / "fresh" / "metadata.jsonl") == "/dataset/fresh/metadata.jsonl" —
+        # ABSOLUTE (DATASET_DIR = Path("/dataset")). The LTX arm forwards this string RAW
+        # (modal/entrypoint.py -> fns.py dataset_file=metadata_path); the H3 arm explicitly
+        # NORMALIZES a relative value under DATASET_DIR (modal/fns.py:4548) precisely because a
+        # bare relative string is ambiguous. Spelling the default absolute here removes that
+        # ambiguity on the LTX leg too, and now genuinely matches fns.preprocess byte-for-byte.
+        default="/dataset/fresh/metadata.jsonl",
         description="metadata.jsonl to encode via `--mode preprocess`; read Modal-side, not "
-        "FS-checked here (Pitfall 1). Matches the fns.preprocess fresh default (backward-compat).",
+        "FS-checked here (Pitfall 1). Matches fns.preprocess's OWN default exactly "
+        "(str(DATASET_DIR / 'fresh' / 'metadata.jsonl'); backward-compat, unchanged behaviour).",
     )
     num_dataloader_workers: int = Field(default=2, ge=0)
     batch_size: int = Field(
@@ -2338,7 +2352,26 @@ class SignetConfig(_Base):
 
     # top-level scalars mirrored from native config.
     seed: int = Field(default=42)
-    output_dir: str = Field(default="outputs")
+    # #20: the only operator-authored path in this schema that was EXEMPT from
+    # validate_volume_relative_path (WR-09). It is the most-joined path in the codebase
+    # (CHECKPOINTS_DIR / output_dir, e.g. modal/fns.py:787,:4144; local/runner.py:127) and the
+    # WR-09 pathlib-join contract (render_checkpoint_name's own validator states it as universal)
+    # means an absolute value REPLACES the CHECKPOINTS_DIR prefix rather than erroring: the run
+    # would write checkpoints into the container's ephemeral filesystem,
+    # `checkpoints_vol.commit()` would commit an empty subtree, and a multi-hour round's
+    # checkpoints would vanish with the container — silently, at the end.
+    output_dir: str = Field(
+        default="outputs",
+        description="Checkpoint/render subdirectory, joined as CHECKPOINTS_DIR / output_dir "
+        "(modal/fns.py) or <local output root> / output_dir (local/runner.py:127). "
+        "Volume-relative — routed through validate_volume_relative_path (WR-09): an absolute "
+        "value would REPLACE that prefix and a '..' segment would escape it.",
+    )
+
+    @field_validator("output_dir")
+    @classmethod
+    def _check_output_dir(cls, v: str) -> str:
+        return validate_volume_relative_path(v, field="output_dir")
 
     @field_validator("training_dims")
     @classmethod
@@ -2643,6 +2676,56 @@ class SignetConfig(_Base):
                     f"slots for it to select, and no-reference `--mode sample` is refused outright "
                     f"(lean field-split — no silently-ignored config block). Remove it."
                 )
+            # #20 (training_dims[0:2] validated-but-unconsumed under h3) — training_dims W/H pass
+            # the %32 pre-screen but are NEVER what h3_train dispatches: the trained canvas comes
+            # from h3.target_aspect ALONE (modal/fns.py, resolve_canvas_size(*target_aspect));
+            # h3_train threads training_dims[2] (frames) only. A declared W/H that disagrees with
+            # what target_aspect actually resolves to would load clean and the training card would
+            # record a resolution the run never trained at — the twin of #1's resolution_buckets
+            # finding on the same geometry field (do NOT thread training_dims[0:2] into the encode
+            # here; that is #1's design work — this is the cross-check that catches the divergence
+            # either way, and becomes the regression test once #1 lands).
+            _canvas_h, _canvas_w = resolve_canvas_size(*self.h3.target_aspect)
+            _declared_w, _declared_h = self.training_dims[0], self.training_dims[1]
+            if (_declared_w, _declared_h) != (_canvas_w, _canvas_h):
+                raise ValueError(
+                    f"training_dims declares a {_declared_w}x{_declared_h} canvas, but "
+                    f"h3.target_aspect {tuple(self.h3.target_aspect)} resolves (via "
+                    f"resolve_canvas_size) to {_canvas_w}x{_canvas_h} — h3_train threads "
+                    f"training_dims[2] (frames) only, so these two validated fields can silently "
+                    f"diverge and the training card would record a resolution this run never "
+                    f"actually trained at (#20). Set training_dims to "
+                    f"({_canvas_w}, {_canvas_h}, {self.training_dims[2]}) to match target_aspect, "
+                    f"or set h3.target_aspect so it resolves to {_declared_w}x{_declared_h} (try "
+                    f"target_aspect: [{_declared_w}, {_declared_h}] if that ratio is what you "
+                    f"intend)."
+                )
+            # #4 — training_dims[2] (the TRAINED frame count) and MiniMax-H3's RENDERABLE band are
+            # DISJOINT laws: 17n+5 (training) vs the 5-15s @ 24fps generation band
+            # (inference/h3_pipeline_source.py, D-10-DEF-15). A legal training bucket — this
+            # campaign's 22, or a still-frame campaign's 5 — can be UNRENDERABLE, and today that is
+            # discovered only at `--mode sample`, after training has already been paid for. This is
+            # a NOTICE, not a refusal: training short and rendering longer is a legitimate design
+            # (a still-trained adapter evaluated on a longer clip is a real experiment).
+            _low, _high = h3_renderable_frame_bounds()
+            _aligned = h3_aligned_num_frames(self.training_dims[2])
+            if not _low <= _aligned <= _high:
+                _waiver = (
+                    "validation.allow_offband_frame_count is already set, so the render-time "
+                    "band refusal is waived for this config."
+                    if self.validation.allow_offband_frame_count
+                    else "validation.allow_offband_frame_count can waive the render-time band "
+                    "refusal if you deliberately want to render at the trained length."
+                )
+                print(
+                    f"[signet] NOTE: training_dims F={self.training_dims[2]} (aligns to "
+                    f"{_aligned} frames) is outside MiniMax-H3's renderable band ({_low}-{_high} "
+                    "frames, inference/h3_pipeline_source.h3_renderable_frame_bounds()). This run "
+                    "is trainable but its trained length cannot be sampled directly; `--mode "
+                    "sample` will need validation.frame_count inside that band. Choosing that "
+                    f"length is an eval-design decision (D-10-DEF-15). {_waiver}",
+                    file=sys.stderr,
+                )
         elif self.model.family == "qwen_edit":
             # Family #3 FAMILY-EXACT geometry. Note what is NOT here: no pre-screen was widened for
             # qwen_edit, and none needed to be. Its frame law (F == 1 exactly) is a strict SUBSET of
@@ -2890,6 +2973,49 @@ class SignetConfig(_Base):
             validate_inpaint_dims(
                 (self.validation.width, self.validation.height, self.validation.frame_count)
             )
+        else:
+            # #20 (the only `major` in the bundle) — the RENDER triple (validation.width/height/
+            # frame_count) previously carried only `ge=` bounds outside inpaint mode (see the
+            # field definitions above): a render triple invalid under every family's law loaded
+            # clean and only died raw inside inference/sampler.py:88-92 on a metered GPU. It gets
+            # the SAME family-appropriate law training_dims already gets, applied HERE rather than
+            # on ValidationConfig because the correct law depends on model.family, which a
+            # sub-model cannot see. `validate_training_dims` is deliberately NOT reused for h3 (its
+            # (F-1)%8 frame law is the WRONG one — H3's render frame law is the renderability band,
+            # not 17n+5).
+            _render_triple = (
+                self.validation.width,
+                self.validation.height,
+                self.validation.frame_count,
+            )
+            if self.model.family == "h3":
+                validate_width(_render_triple[0])
+                validate_height(_render_triple[1])
+                # Aligns internally and honours the SAME allow_offband_frame_count waiver
+                # h3_sample reads at render time (modal/fns.py), so a config that would die inside
+                # `MiniMaxH3Ref2VASetupStep` — AFTER both 61.7 GiB loads — now dies here instead,
+                # at zero spend, with the identical verdict and the identical waiver.
+                #
+                # ``assert_h3_frame_count_is_renderable`` raises ``RuntimeError`` (it also runs
+                # OUTSIDE pydantic, at render time) — pydantic validators only special-case
+                # ValueError/AssertionError, so re-raise as ValueError with the identical message
+                # or `load_config`'s documented "raises pydantic.ValidationError" contract breaks.
+                try:
+                    assert_h3_frame_count_is_renderable(
+                        _render_triple[2],
+                        where="validation.frame_count",
+                        allow_offband=self.validation.allow_offband_frame_count,
+                    )
+                except RuntimeError as exc:
+                    raise ValueError(str(exc)) from exc
+            elif self.model.family == "qwen_edit":
+                # frame_count is already forced to exactly 1 above (qwen_edit is an image model);
+                # the spatial rule is LTX's %32 verbatim — qwen_edit has no render-geometry law of
+                # its own beyond that.
+                validate_width(_render_triple[0])
+                validate_height(_render_triple[1])
+            else:
+                validate_training_dims(_render_triple)
         # Phase 9 lean field-split, cross-block: each validation-sample condition KIND is tied to a
         # conditioning.mode ('mask' -> inpaint held-out masked render; 'audio' -> a2v driving-audio
         # render). Under any other mode the sample path has no machinery for that kind, so the
@@ -2952,8 +3078,27 @@ class SignetConfig(_Base):
                     "requested via validation.samples[].conditions (type: audio) instead (lean "
                     "field-split). Remove it."
                 )
+            # (d) audio_latents_dir is DEAD: it documents a consumer (A2VStrategy.get_data_sources)
+            #     that does not read it — conditioning/a2v.py:118 hardcodes the literal
+            #     ["latents", "conditions", "audio_latents"] rather than this field. Its reverse
+            #     guard below fires only OUTSIDE a2v — the one mode where the field is meaningful —
+            #     so a non-default value here loads clean and is silently ignored (#20). Refuse it
+            #     in-mode too, mirroring the reference_latents_dir ic_lora rule-6b guard, until
+            #     A2VStrategy.get_data_sources() takes the configured name.
+            if self.audio.audio_latents_dir != "audio_latents":
+                raise ValueError(
+                    f"audio.audio_latents_dir is non-default "
+                    f"({self.audio.audio_latents_dir!r}) while mode == 'audio_to_video': "
+                    "conditioning/a2v.py:118's get_data_sources hardcodes the literal source list "
+                    "and never reads this field, so a non-default value would be silently "
+                    "ignored — the run would train on whatever audio_latents/ happens to sit on "
+                    "the Volume rather than the directory this config declares (lean "
+                    "field-split — no silently-ignored config block). Remove it (keep the "
+                    "default 'audio_latents'), or land A2VStrategy.get_data_sources() reading the "
+                    "configured name first."
+                )
         else:
-            # (d) REVERSE guard: a non-default audio-block field under any non-a2v mode would be
+            # (e) REVERSE guard: a non-default audio-block field under any non-a2v mode would be
             #     silently ignored — reject at config load.
             nondefault_audio = [
                 name

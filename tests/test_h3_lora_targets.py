@@ -393,3 +393,28 @@ def test_inject_lora_prefers_the_ltx_gc_methods_when_present() -> None:
     inject_lora(model, build_lora_config(rank=2, alpha=2, targets=H3_LORA_TARGET_REGEX))
     assert model.ltx_gc is True
     assert model.gc_enabled is False  # the H3 branch did NOT fire
+
+
+def test_inject_lora_honors_gradient_checkpointing_false() -> None:
+    """#20 (Tier-1 knob): ``training.gradient_checkpointing: false`` must actually disable GC.
+
+    Previously ``inject_lora`` enabled GC UNCONDITIONALLY — ``training.gradient_checkpointing``
+    (schema.py, Tier-1 in TIER-TAXONOMY.yaml) had zero consumers. A config that declared it off
+    trained with GC on anyway, and the DECISION-LOG recorded a lever that was never pulled.
+    """
+    model = _FakeH3()
+    wrapped = inject_lora(
+        model,
+        build_lora_config(rank=2, alpha=2, targets=H3_LORA_TARGET_REGEX),
+        gradient_checkpointing=False,
+    )
+    assert model.gc_enabled is False
+    assert wrapped.training is True
+
+
+def test_inject_lora_gradient_checkpointing_defaults_true() -> None:
+    """Every shipped config sets ``gradient_checkpointing: true`` — the default must match, so an
+    existing caller that does not pass the new parameter sees byte-identical behaviour."""
+    model = _FakeH3()
+    inject_lora(model, build_lora_config(rank=2, alpha=2, targets=H3_LORA_TARGET_REGEX))
+    assert model.gc_enabled is True
