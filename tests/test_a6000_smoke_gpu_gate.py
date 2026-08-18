@@ -50,10 +50,13 @@ def _fake_inventory(gpus, holders=()):
 def test_gate_judges_the_gpu_with_most_free_vram_not_a_hardcoded_one(monkeypatch):
     """Two cards, GPU0 saturated / GPU1 idle: the gate must choose GPU1 and pass on ITS headroom."""
     inv = _fake_inventory([
-        {"index": 0, "name": "RTX 6000 Ada", "total_mib": 49140, "used_mib": 48740, "free_mib": 400},
-        {"index": 1, "name": "RTX 6000 Ada", "total_mib": 49140, "used_mib": 2140, "free_mib": 47000},
+        {"index": 0, "uuid": "GPU-aaaaaaaa-0000-0000-0000-000000000000", "name": "RTX 6000 Ada",
+         "total_mib": 49140, "used_mib": 48740, "free_mib": 400},
+        {"index": 1, "uuid": "GPU-bbbbbbbb-1111-1111-1111-111111111111", "name": "RTX 6000 Ada",
+         "total_mib": 49140, "used_mib": 2140, "free_mib": 47000},
     ])
     monkeypatch.setattr(smoke, "gpu_inventory", lambda: inv)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
     captured_env = {}
 
@@ -68,11 +71,78 @@ def test_gate_judges_the_gpu_with_most_free_vram_not_a_hardcoded_one(monkeypatch
 
     assert result.status == "PASS", f"expected PASS on GPU1's 47000 MiB free, got: {result}"
     assert "gpu1" in result.detail, f"PASS detail must name the chosen card: {result.detail!r}"
-    assert captured_env.get("CUDA_VISIBLE_DEVICES") == "1", (
-        f"the probe subprocess must be pinned to the GPU the gate actually cleared "
-        f"(CUDA_VISIBLE_DEVICES=1), got env={captured_env!r}. Without this, the child's "
-        f"torch.device('cuda') sees whatever device 0 defaults to, not the card the gate judged."
+    # Pin by UUID (not the nvidia-smi PCI-order integer index) — CUDA's default enumeration is
+    # FASTEST_FIRST, so an integer index can silently resolve to a different physical card.
+    assert captured_env.get("CUDA_VISIBLE_DEVICES") == "GPU-bbbbbbbb-1111-1111-1111-111111111111", (
+        f"the probe subprocess must be pinned by UUID to the GPU the gate actually cleared "
+        f"(CUDA_VISIBLE_DEVICES=GPU-<uuid>, the exact string nvidia-smi's own uuid column "
+        f"reports), got env={captured_env!r}. A bare integer index is interpreted in "
+        f"CUDA_DEVICE_ORDER=FASTEST_FIRST order by default and can name a different physical "
+        f"card than nvidia-smi's PCI-order index."
     )
+    assert captured_env.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID", (
+        f"CUDA_DEVICE_ORDER=PCI_BUS_ID must be set alongside the UUID pin, got env={captured_env!r}"
+    )
+
+
+def test_gate_respects_an_operator_exported_cuda_visible_devices(monkeypatch):
+    """Operator has already exported CUDA_VISIBLE_DEVICES=1 on a shared box (masking GPU0 out).
+
+    nvidia-smi is CVD-blind and still reports both cards, with GPU0 showing the most free VRAM.
+    The gate must NOT choose GPU0 — that would silently override the operator's own export and
+    probe a card they deliberately excluded (`sh()` merges {**os.environ, **env}, so a hardcoded
+    CVD in the env dict would otherwise trample the operator's value). It must intersect the
+    candidate set with what the operator made visible and choose only among those.
+    """
+    inv = _fake_inventory([
+        {"index": 0, "uuid": "GPU-aaaaaaaa-0000-0000-0000-000000000000", "name": "RTX 6000 Ada",
+         "total_mib": 49140, "used_mib": 2140, "free_mib": 47000},
+        {"index": 1, "uuid": "GPU-bbbbbbbb-1111-1111-1111-111111111111", "name": "RTX 6000 Ada",
+         "total_mib": 49140, "used_mib": 20140, "free_mib": 29000},
+    ])
+    monkeypatch.setattr(smoke, "gpu_inventory", lambda: inv)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")  # operator masked GPU0 out
+
+    captured_env = {}
+
+    def fake_sh(cmd, cwd=None, env=None, timeout=3600):
+        captured_env.update(env or {})
+        return 0, "OK — bf16 matmul, h3 row/mask ops, toy backward on fake; peak 100 MiB"
+
+    monkeypatch.setattr(smoke, "sh", fake_sh)
+    monkeypatch.setattr(smoke, "_stage_python", lambda args, repo: Path("python"))
+
+    result = smoke.stage_gpu(_Args(), REPO_ROOT)
+
+    assert result.status == "PASS", f"expected PASS on the operator-visible GPU1, got: {result}"
+    assert "gpu1" in result.detail, (
+        f"the gate must choose GPU1 (the only operator-visible card), not GPU0's larger free "
+        f"headroom: {result.detail!r}"
+    )
+    assert captured_env.get("CUDA_VISIBLE_DEVICES") == "GPU-bbbbbbbb-1111-1111-1111-111111111111", (
+        f"must pin the child to the operator-visible card (GPU1's uuid), not override the "
+        f"operator's export with GPU0: got env={captured_env!r}"
+    )
+
+
+def test_gate_skips_when_operator_cvd_excludes_every_reported_card(monkeypatch):
+    """Operator's CVD names a device nvidia-smi never reports (e.g. stale export) — SKIP, don't
+    fall back to probing an unlisted card."""
+    inv = _fake_inventory([
+        {"index": 0, "uuid": "GPU-aaaaaaaa-0000-0000-0000-000000000000", "name": "RTX 6000 Ada",
+         "total_mib": 49140, "used_mib": 2140, "free_mib": 47000},
+    ])
+    monkeypatch.setattr(smoke, "gpu_inventory", lambda: inv)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5")
+
+    called = {"sh": False}
+    monkeypatch.setattr(smoke, "sh", lambda *a, **k: called.update(sh=True) or (0, ""))
+
+    result = smoke.stage_gpu(_Args(), REPO_ROOT)
+
+    assert result.status == "SKIP"
+    assert "CUDA_VISIBLE_DEVICES" in result.detail
+    assert not called["sh"], "must never probe when the operator's CVD excludes every card"
 
 
 def test_gate_skips_when_the_best_card_alone_is_still_under_the_floor(monkeypatch):
@@ -85,6 +155,7 @@ def test_gate_skips_when_the_best_card_alone_is_still_under_the_floor(monkeypatc
         holders=[{"pid": 4242, "name": "python", "used_mib": 47140, "gpu_index": 1}],
     )
     monkeypatch.setattr(smoke, "gpu_inventory", lambda: inv)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     called = {"sh": False}
     monkeypatch.setattr(smoke, "sh", lambda *a, **k: called.update(sh=True) or (0, ""))
 

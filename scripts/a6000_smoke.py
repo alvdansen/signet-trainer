@@ -109,7 +109,7 @@ def gpu_inventory() -> dict:
     uuid_to_index = {}
     for line in out.strip().splitlines():
         idx, uuid, name, total, used = [x.strip() for x in line.split(",")]
-        gpus.append({"index": int(idx), "name": name, "total_mib": int(total),
+        gpus.append({"index": int(idx), "uuid": uuid, "name": name, "total_mib": int(total),
                      "used_mib": int(used), "free_mib": int(total) - int(used)})
         uuid_to_index[uuid] = int(idx)
     # gpu_uuid lets a holder be attributed to the card it is actually sitting on (issue #40
@@ -370,18 +370,49 @@ print(f"OK — bf16 matmul, h3 row/mask ops, toy backward on {torch.cuda.get_dev
 """
 
 
+def _operator_visible_gpus(gpus: list[dict], cvd_value: str) -> list[dict]:
+    """Intersect `gpus` with an operator-exported CUDA_VISIBLE_DEVICES.
+
+    nvidia-smi is CVD-blind (it always enumerates every physical card), but the CUDA runtime
+    inside any child process enforces the operator's export — so if we ignore it here, the gate
+    can choose and pin a card the operator deliberately excluded on a shared box. `cvd_value` may
+    list either integer indices or UUIDs (with or without the "GPU-" prefix); match on either.
+    """
+    tokens = [t.strip() for t in cvd_value.split(",") if t.strip()]
+    if not tokens:
+        return gpus
+    ids = set(tokens)
+
+    def _visible(g: dict) -> bool:
+        uuid = g.get("uuid") or ""
+        bare_uuid = uuid[len("GPU-"):] if uuid.startswith("GPU-") else uuid
+        return str(g["index"]) in ids or uuid in ids or bare_uuid in ids
+
+    return [g for g in gpus if _visible(g)]
+
+
 def stage_gpu(args, repo: Path) -> StageResult:
     inv = gpu_inventory()
     if not inv.get("gpus"):
         return StageResult("gpu", "SKIP", "no nvidia-smi / no GPU")
+    candidates = inv["gpus"]
+    operator_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if operator_cvd is not None:
+        candidates = _operator_visible_gpus(candidates, operator_cvd)
+        if not candidates:
+            return StageResult("gpu", "SKIP",
+                               f"CUDA_VISIBLE_DEVICES={operator_cvd!r} (operator-exported) "
+                               f"excludes every card nvidia-smi reports; shared box, respecting "
+                               f"the operator's pin rather than overriding it")
     # Issue #40 finding 3: the "shared-GPU polite" gate must judge the SAME card the probe runs
     # on. `_GPU_PROG` always opens `torch.device("cuda")`, i.e. whichever index the child process
     # sees as device 0 — so the gate picks the card with the MOST free VRAM, compares THAT card's
     # free against `need`, and (on PASS) pins the child to it with CUDA_VISIBLE_DEVICES so the
     # child's "cuda:0" really is the card the gate just cleared. Taking max() across all cards
     # while probing an unrelated, hardcoded device let the stage PASS on an idle card's headroom
-    # while allocating on a saturated one.
-    chosen = max(inv["gpus"], key=lambda g: g["free_mib"])
+    # while allocating on a saturated one. Candidates are first restricted to what the operator
+    # already made visible (see _operator_visible_gpus), so the gate never picks a masked card.
+    chosen = max(candidates, key=lambda g: g["free_mib"])
     free = chosen["free_mib"]
     need = int(args.min_free_vram_gib * 1024)
     if free < need:
@@ -395,9 +426,16 @@ def stage_gpu(args, repo: Path) -> StageResult:
                            f"required — GPU busy ({holders or 'holder unknown'}); shared box, "
                            f"not killing anything")
     py = _stage_python(args, repo)
+    # Pin by UUID, not the nvidia-smi PCI-order index: CUDA's default enumeration order is
+    # FASTEST_FIRST, so an integer index can resolve to a different physical card than the one
+    # nvidia-smi (and this gate) numbered — recreating the finding-3 bug on a heterogeneous box.
+    # nvidia-smi's own uuid column already comes back "GPU-<hex-uuid>" (that IS the accepted
+    # CUDA_VISIBLE_DEVICES form) — do not re-prefix it. CUDA_DEVICE_ORDER=PCI_BUS_ID is set too,
+    # belt-and-suspenders, in case anything downstream ever falls back to an integer form.
     rc, out = sh([str(py), "-c", _GPU_PROG], cwd=repo,
                  env={"PYTHONPATH": "src", "PYTHONUTF8": "1",
-                      "CUDA_VISIBLE_DEVICES": str(chosen["index"])}, timeout=600)
+                      "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                      "CUDA_VISIBLE_DEVICES": chosen["uuid"]}, timeout=600)
     if rc != 0:
         return StageResult("gpu", "FAIL", out.strip()[-800:])
     return StageResult("gpu", "PASS", f"gpu{chosen['index']}: " + out.strip().splitlines()[-1])
