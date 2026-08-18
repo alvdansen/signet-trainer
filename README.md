@@ -318,7 +318,7 @@ tracked in issue #45):
 `python -m pytest` is **not** green out of the box, for reasons that are known rather than
 mysterious. Expect roughly **51 failed, 2345 passed, 49 skipped**, in three groups:
 
-- **~31 — the H3 parity suites.** They deliberately refuse to skip: they must execute against
+- **~33 — the H3 parity suites.** They deliberately refuse to skip: they must execute against
   `transformers`/`diffusers` at the exact pinned version, in a separate overlay interpreter, or the
   check would pass while the real dispatch failed. Bootstrap it once with the two commands the
   failure message prints, or leave them red. A few in this group are regression checks pinned to
