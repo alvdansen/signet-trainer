@@ -15,6 +15,14 @@ ONLY in ``validation.frame_count``. A key missing either axis lets one config's 
 config's clips, and the gallery comes out labelled for a reference condition it does not contain —
 silent, at a valid shape, on the exact axis the phase exists to measure.
 
+⚠ **``width`` / ``height`` / ``num_inference_steps`` joined the key (#22 finding 5).** The ``pipe(...)``
+call in ``h3_sample`` passes all three (``fns.py``'s ``_render``), so they are exactly as load-bearing
+to WHAT GETS RENDERED as ``frame_count`` — a mid-campaign validation-geometry change (a resolution or
+step-count probe) that landed in a directory keyed on ``(checkpoint, seed, frame_count)`` alone would
+silently resume the PREVIOUS geometry's clips under the new banner, the same silent-at-a-valid-shape
+class the reference axis exists to prevent. An adversarial audit of a ``(probe, seed, frame_count)``
+key explicitly refuted it for this reason; do not narrow the key back to it.
+
 Import tier: **stdlib only, and no package side effects**. It lives here rather than in
 ``modal/fns.py`` for the same reason ``train/loop.checkpoint_watchdog_exceeded`` does — a test that
 had to ``import signet_trainer.modal.fns`` to reach it would drag ``modal`` into ``sys.modules`` and
@@ -25,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["h3_render_key", "qwen_edit_render_key"]
+__all__ = ["h3_base_render_key", "h3_render_key", "qwen_edit_render_key"]
 
 #: Characters allowed through into a directory name. Everything else becomes ``_`` — a checkpoint
 #: name is derived from a Volume path, and a separator or a ``..`` in it would escape the samples
@@ -34,32 +42,97 @@ _SAFE_EXTRA = "-_."
 
 
 def h3_render_key(
-    *, checkpoint: str, seed: int, frame_count: int, subject_ids: Any
+    *,
+    checkpoint: str,
+    seed: int,
+    frame_count: int,
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    subject_ids: Any,
 ) -> str:
-    """The render's identity as ONE directory name: ``<checkpoint>_s<seed>_f<frames>_<ids>``.
+    """The render's identity as ONE directory name:
+    ``<checkpoint>_s<seed>_f<frames>_w<width>_h<height>_n<steps>_<ids>``.
 
     Every axis the sibling sample configs differ on appears here. That is the whole contract; see
-    the module docstring for what a missing axis costs.
+    the module docstring for what a missing axis costs — including ``width`` / ``height`` /
+    ``num_inference_steps``, which the ``pipe(...)`` call reads exactly as literally as
+    ``frame_count`` (#22 finding 5).
 
     ``subject_ids`` ORDER is preserved, never sorted: D-10-REFORDER makes a reordered reference set
     a genuinely different request (it fixes the ``<Picture i>`` labels AND advances the shared
     rotary clock), so ``A-029`` and ``029-A`` must not collapse into one directory.
 
     Deliberately human-readable rather than a hash — this name is what an operator reads off a
-    ``modal volume ls``, and ``checkpoint-step-3000_s42_f22_A-029`` says what the grid is without
-    opening it.
+    ``modal volume ls``, and ``checkpoint-step-3000_s42_f22_w1344_h768_n25_A-029`` says what the grid
+    is without opening it.
 
     Args:
         checkpoint: The resolved checkpoint directory NAME (``find_latest``'s per-step dir).
         seed: The render seed — both columns use it, so it identifies the pair.
         frame_count: ``validation.frame_count``; the LENGTH axis of the eval matrix.
+        width: ``validation.width`` fed to the ``pipe(...)`` call — a GEOMETRY axis.
+        height: ``validation.height`` fed to the ``pipe(...)`` call — a GEOMETRY axis.
+        num_inference_steps: ``validation.num_inference_steps`` fed to the ``pipe(...)`` call — the
+            SAMPLING axis.
         subject_ids: The reference condition in D-10-REFORDER order; the REFERENCE axis.
 
     Returns:
         A filesystem-safe directory name containing no path separator.
     """
     ids = "-".join(_sanitize(str(s)) for s in subject_ids) or "noref"
-    return f"{_sanitize(str(checkpoint))}_s{int(seed)}_f{int(frame_count)}_{ids}"
+    return (
+        f"{_sanitize(str(checkpoint))}_s{int(seed)}_f{int(frame_count)}_w{int(width)}_"
+        f"h{int(height)}_n{int(num_inference_steps)}_{ids}"
+    )
+
+
+def h3_base_render_key(
+    *,
+    seed: int,
+    frame_count: int,
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    subject_ids: Any,
+) -> str:
+    """The BASE render's identity — every axis ``h3_render_key`` carries EXCEPT the checkpoint.
+
+    #12: the base column depends only on the pipe parameters the ``disable_adapter()`` forward
+    actually receives — ``seed``, ``frame_count``, ``width``, ``height``, ``num_inference_steps`` and
+    the reference condition — never on which checkpoint is being compared against it. Keying it on
+    ``h3_render_key`` (checkpoint included) makes a byte-identical base clip re-render at every
+    sampled checkpoint: at the keyframe campaign's cadence that was ~50% of all H3 sampling spend on
+    a file already sitting on the Volume, and it once starved a training phase of GPU slots for over
+    two hours. Dropping the checkpoint from the key is what lets every checkpoint's render reuse ONE
+    base clip via the ordinary "already rendered, skip" check ``h3_sample`` already applies.
+
+    ⛔ An adversarial audit specifically refuted keying this on ``(probe, seed, frame_count)`` alone:
+    the pipe call also receives ``width`` / ``height`` / ``num_inference_steps``, and a mid-campaign
+    validation-geometry change (a resolution or step-count probe) would then silently resume a base
+    clip rendered at the OLD geometry under the new banner — the exact silent-at-a-valid-shape
+    failure ``h3_render_key``'s reference axis exists to prevent, just relocated to the base column.
+    Every axis here must match ``h3_render_key``'s except ``checkpoint``, or the two keys could
+    describe requests that are not actually the same pipe call.
+
+    Lives in a directory of its own (``samples_h3/base/<this key>/``, sibling to the checkpoint-keyed
+    render dirs, never nested under one) so the key does not need a synthetic prefix to stay
+    unambiguous against ``h3_render_key``'s output — see ``inference.samples_layout`` for the layout
+    this composes into.
+
+    Args:
+        seed: The render seed — both the base and adapter columns use it.
+        frame_count: ``validation.frame_count``; the LENGTH axis.
+        width: ``validation.width`` fed to the ``pipe(...)`` call.
+        height: ``validation.height`` fed to the ``pipe(...)`` call.
+        num_inference_steps: ``validation.num_inference_steps`` fed to the ``pipe(...)`` call.
+        subject_ids: The reference condition in D-10-REFORDER order; the REFERENCE axis.
+
+    Returns:
+        A filesystem-safe directory name containing no path separator and no checkpoint segment.
+    """
+    ids = "-".join(_sanitize(str(s)) for s in subject_ids) or "noref"
+    return f"s{int(seed)}_f{int(frame_count)}_w{int(width)}_h{int(height)}_n{int(num_inference_steps)}_{ids}"
 
 
 def qwen_edit_render_key(*, checkpoint: str, seed: int, control_ids: Any) -> str:

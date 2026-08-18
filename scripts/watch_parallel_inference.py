@@ -35,6 +35,7 @@ sys.path.insert(0, str(REPO / "src"))
 from signet_trainer.config.load import load_config  # noqa: E402
 from signet_trainer.inference.samples_layout import (  # noqa: E402
     committed_clip_names,
+    expected_h3_base_render_key,
     expected_h3_render_key,
     landed_render_ids,
     samples_root,
@@ -197,22 +198,38 @@ def render_landed(step: int, checkpoint: str | None) -> bool:
         checkpoint=checkpoint,
         seed=int(_cfg.validation.seed),
         frame_count=int(_cfg.validation.frame_count),
+        # #22 finding 5 / #12: the key now carries the geometry axes too — a resolution or
+        # step-count change is a genuinely different render, not a resume of the old one.
+        width=int(_cfg.validation.width),
+        height=int(_cfg.validation.height),
+        num_inference_steps=int(_cfg.validation.num_inference_steps),
         subject_ids=list(_cfg.validation.reference_subject_ids or []),
     )
     return want in ids
 
 
 def render_progress_artifacts(checkpoint: str | None) -> frozenset[str]:
-    """Every artifact committed so far under the PENDING render's own directory — the fine-grained
-    PROGRESS signal the stall clock needs (issue #45 PR-1 must-fix #1).
+    """Every artifact committed so far for the PENDING render — the fine-grained PROGRESS signal the
+    stall clock needs (issue #45 PR-1 must-fix #1).
 
     `render_landed` answers one coarse question — "has this render's identity directory appeared at
     all?" — which saturates the moment the FIRST clip commits and stays true for the rest of an
-    up-to-6h render; it is useless as a freshness signal on its own. This reads one level deeper: the
-    render's own `base/`/`lora/` columns (the SAME convention `refresh_grid()` already reads), via
+    up-to-6h render; it is useless as a freshness signal on its own. This reads one level deeper via
     `committed_clip_names` (`inference/samples_layout.py`) — so a newly-committed clip shows up here
     long before the whole render is judged landed, and a live render can be told apart from a hung
     one.
+
+    ⚠ RESTACK RECONCILIATION (#12 base-render dedup, verify_c.json MAJOR finding): the two columns no
+    longer share one directory. The lora half stays under the checkpoint-scoped render dir (the
+    per-checkpoint adapter half); the base half lives under SAMPLES_ROOT's own base subdirectory,
+    keyed by `expected_h3_base_render_key` and shared across every checkpoint that renders the same
+    (seed, frame_count, geometry, references) request — a SIBLING of every checkpoint-scoped render
+    dir, never nested back under one. Descending into the checkpoint-scoped render dir for the base
+    half (the pre-dedup layout) would silently see zero progress for the ENTIRE base phase of a
+    fresh-geometry render (h3_sample renders the base column first), which is exactly the
+    false-stall risk this probe exists to prevent. Both key calls carry the SAME widened geometry
+    axes (#22 finding 5) as `render_landed`'s — a probe keyed on the old, narrower signature would
+    watch the wrong directory.
 
     On LTX, and while the checkpoint identity is not yet known, there is no per-render directory to
     descend into ahead of time — falls back to the same top-level `committed_render_stamps()` set
@@ -220,17 +237,31 @@ def render_progress_artifacts(checkpoint: str | None) -> frozenset[str]:
     """
     if FAMILY != "h3" or checkpoint is None:
         return frozenset(committed_render_stamps())
-    key = expected_h3_render_key(
+    lora_key = expected_h3_render_key(
         checkpoint=checkpoint,
         seed=int(_cfg.validation.seed),
         frame_count=int(_cfg.validation.frame_count),
+        width=int(_cfg.validation.width),
+        height=int(_cfg.validation.height),
+        num_inference_steps=int(_cfg.validation.num_inference_steps),
         subject_ids=list(_cfg.validation.reference_subject_ids or []),
     )
-    render_dir = f"{SAMPLES_ROOT}/{key}"
+    base_key = expected_h3_base_render_key(
+        seed=int(_cfg.validation.seed),
+        frame_count=int(_cfg.validation.frame_count),
+        width=int(_cfg.validation.width),
+        height=int(_cfg.validation.height),
+        num_inference_steps=int(_cfg.validation.num_inference_steps),
+        subject_ids=list(_cfg.validation.reference_subject_ids or []),
+    )
+    render_dir = f"{SAMPLES_ROOT}/{lora_key}"
+    # "lora" stays checkpoint-scoped (under render_dir); "base" is the dedup's shared sibling
+    # directory under SAMPLES_ROOT — never nested back under render_dir (#12).
     found: set[str] = set()
-    for col in ("base", "lora"):
-        r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", f"{render_dir}/{col}"])
-        found.update(f"{col}/{name}" for name in committed_clip_names(r.stdout or ""))
+    r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", f"{render_dir}/lora"])
+    found.update(f"lora/{name}" for name in committed_clip_names(r.stdout or ""))
+    r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", f"{SAMPLES_ROOT}/base/{base_key}"])
+    found.update(f"base/{name}" for name in committed_clip_names(r.stdout or ""))
     return frozenset(found)
 
 
