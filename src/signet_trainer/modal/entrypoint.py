@@ -1304,10 +1304,24 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             est_hours=cfg.modal.est_hours,
             cost_guardrail_usd=cfg.modal.cost_guardrail_usd,
         )
-        print(
-            f"[signet-entrypoint] CPU-only mode {mode!r} (no A100) — ~near-zero cost, estimated from "
-            f"cpu_hourly_rate_usd=${cfg.modal.cpu_hourly_rate_usd:.2f}/hr (NOT the A100 rate)."
-        )
+        if mode == "fuse":
+            # Issue #24: "~near-zero cost" is honest for restore/backup (default Modal resources) but
+            # not for fuse, which reserves 128 GiB RAM for up to 4h (fns.py apply_loras — [precedent]
+            # prior-project: materializes a ~2x 44GB dict) — Modal bills reserved memory, and the
+            # cpu_hourly_rate_usd*est_hours estimate below never sees that reservation. This print
+            # names it so the operator isn't told "near-zero" over a 128 GiB / 4h hold; the estimate
+            # and guardrail math above are UNCHANGED.
+            print(
+                f"[signet-entrypoint] CPU-only mode {mode!r} (no A100) — estimated from "
+                f"cpu_hourly_rate_usd=${cfg.modal.cpu_hourly_rate_usd:.2f}/hr (NOT the A100 rate); "
+                "note this estimate does NOT reflect fuse's 128 GiB RAM reservation (up to 4h), "
+                "which Modal bills separately from the hourly rate above."
+            )
+        else:
+            print(
+                f"[signet-entrypoint] CPU-only mode {mode!r} (no A100) — ~near-zero cost, estimated "
+                f"from cpu_hourly_rate_usd=${cfg.modal.cpu_hourly_rate_usd:.2f}/hr (NOT the A100 rate)."
+            )
     else:
         decision = guardrail_check(
             hourly_rate_usd=cfg.modal.hourly_rate_usd,

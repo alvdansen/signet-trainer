@@ -107,3 +107,26 @@ def test_approved_run_dispatches_exactly_once(tmp_path, monkeypatch) -> None:
     raw_main(config=_write_config(tmp_path), approve=True, mode="train")
 
     assert len(rec.calls) == 1, "an approved run must dispatch train.spawn() exactly once"
+
+
+def test_fuse_cost_print_names_the_128gib_reservation(tmp_path, monkeypatch, capsys) -> None:
+    """Issue #24 finding 3: fuse reserves 128 GiB RAM for up to 4h (fns.py apply_loras), so the
+    CPU-mode cost print may not say "~near-zero cost" for fuse the way it honestly does for
+    restore/backup (default resources). This is a print-format assertion only — it does not touch
+    the guardrail_check rate/estimate math, which test_approved_run_dispatches_exactly_once above
+    already exercises unchanged."""
+    from signet_trainer.modal import fns
+
+    entrypoint, raw_main = _raw_main()
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    rec = _RecordingFn()
+    monkeypatch.setattr(fns, "fuse", rec)
+
+    raw_main(config=_write_config(tmp_path), approve=True, mode="fuse")
+
+    assert len(rec.calls) == 1, "an approved fuse run must dispatch fuse.spawn() exactly once"
+    out = capsys.readouterr().out
+    assert "~near-zero cost" not in out, "fuse must not claim near-zero cost over a 128 GiB hold"
+    assert "128 GiB" in out and "reserv" in out, (
+        "the fuse CPU-mode cost print must name the 128 GiB reservation Modal separately bills"
+    )

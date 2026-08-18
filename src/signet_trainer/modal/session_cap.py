@@ -248,6 +248,12 @@ def read_ledger(ledger_path: str | Path) -> float:
     WR-06 fail-closed posture for a PRESENT-but-corrupt ledger (distinct from the missing-file case):
       * unparseable JSON -> raises ``ValueError`` LOUDLY. The cumulative cap cannot be computed, so
         the harness must NOT authorize spend against an unknown baseline — repair/delete the file.
+      * a non-object ROOT, or a ``spend`` field that is not a list -> also raises ``ValueError``. Both
+        are corrupt-shape cases exactly like the unparseable-JSON case above, and MUST fail the same
+        way — the container being wrong is not a narrower defect than an entry inside it being wrong
+        (:275 below already raises for a malformed entry). Returning ``0.0`` here used to make a
+        corrupt ledger indistinguishable from a fresh session's missing file (``:257``), silently
+        re-authorizing the full ``session_cap_usd`` against an unknown baseline (issue #24).
       * a non-object ``spend`` entry -> raises ``ValueError`` (malformed ledger, fail closed).
       * a NEGATIVE ``est_usd`` in an entry -> clamped to ``0.0`` in the sum so it can never REDUCE the
         counted cumulative spend (a negative would fail open against the cap).
@@ -264,10 +270,18 @@ def read_ledger(ledger_path: str | Path) -> float:
             "resets to a fresh 0.0-spent session) before dispatching."
         ) from exc
     if not isinstance(data, dict):
-        return 0.0
+        raise ValueError(
+            f"corrupted spend ledger {path}: root is not an object ({type(data).__name__}). The "
+            "cumulative session cap CANNOT be computed, so the harness fails CLOSED — repair or "
+            "delete the file (deleting resets to a fresh 0.0-spent session) before dispatching."
+        )
     spend = data.get("spend", [])
     if not isinstance(spend, list):
-        return 0.0
+        raise ValueError(
+            f"corrupted spend ledger {path}: spend is not a list ({type(spend).__name__}). The "
+            "cumulative session cap CANNOT be computed, so the harness fails CLOSED — repair or "
+            "delete the file (deleting resets to a fresh 0.0-spent session) before dispatching."
+        )
     total = 0.0
     for i, entry in enumerate(spend):
         if not isinstance(entry, dict):
@@ -293,6 +307,11 @@ def append_spend(ledger_path: str | Path, est_usd: float, run_ref: str | None = 
 
     WR-06: a negative or NaN ``est_usd`` is REJECTED — a negative append would silently reduce the
     counted cumulative spend (fail open against the cap), and NaN would poison every later sum.
+
+    A non-object ROOT is REFUSED (``ValueError``), never silently replaced with ``{}`` — halting the
+    harness beats resetting the counter (issue #24): substituting an empty dict would discard
+    whatever the hand/agent-authored SESSION-STATE.json actually held (``blankets``, ``session_cap_usd``)
+    and then ``_atomic_write_json`` would faithfully persist the wipe.
     """
     if est_usd < 0 or est_usd != est_usd:  # negative OR NaN (NaN != NaN)
         raise ValueError(
@@ -304,7 +323,11 @@ def append_spend(ledger_path: str | Path, est_usd: float, run_ref: str | None = 
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
-                data = {}
+                raise ValueError(
+                    f"append_spend: {path} root is not an object ({type(data).__name__}) — "
+                    "refusing to overwrite it with an empty ledger; repair or delete the file "
+                    "before dispatching (deleting resets to a fresh 0.0-spent session)."
+                )
         else:
             data = {}
         data.setdefault("spend", [])
@@ -341,6 +364,10 @@ def consume_blanket(
     ``blanket_index``. This operates on the SAME SESSION-STATE.json ``append_spend`` uses; both are
     pure-stdlib (no modal), and both hold ``_ledger_lock`` across the whole read-modify-write
     (CR-02 — same lost-update exposure as ``append_spend``, same lock, same TimeoutError posture).
+
+    A non-object ROOT is REFUSED (``ValueError``), never silently replaced with ``{}`` — same
+    rationale as ``append_spend`` (issue #24): halting beats resetting the blanket + cumulative
+    counters against a discarded file.
     """
     if est_usd < 0 or est_usd != est_usd:  # negative OR NaN (NaN != NaN) fails closed.
         raise ValueError(
@@ -352,7 +379,11 @@ def consume_blanket(
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
-                data = {}
+                raise ValueError(
+                    f"consume_blanket: {path} root is not an object ({type(data).__name__}) — "
+                    "refusing to overwrite it with an empty ledger; repair or delete the file "
+                    "before dispatching (deleting resets to a fresh 0.0-spent session)."
+                )
         else:
             data = {}
         blankets = data.get("blankets", [])
