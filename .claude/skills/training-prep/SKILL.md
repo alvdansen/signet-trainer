@@ -125,9 +125,13 @@ bespoke encode script — the old `scripts/_encode_*.py` are the **retired anti-
 `HOURLY_RATE_USD`; the gate reads rates from `cfg.modal` instead, config-first).
 
 ```
-PYTHONPATH=src PYTHONUTF8=1 modal run -m signet_trainer.modal.entrypoint \
+PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoint \
     --config <yaml> --mode preprocess [--approve]
 ```
+
+**`--detach` is REQUIRED** — a multi-hour encode is a metered dispatch, and without it Modal tears
+the app shell down with the local client, killing the encode partway with nothing committed to the
+dataset Volume (README "The three things about this command that are not optional").
 
 - The gate runs **load → dry-run → cost print → BLOCKING approval → dispatch**, identical to train.
   The **cost print + approval precede dispatch** — a metered encode can never auto-launch. Under an
@@ -152,7 +156,7 @@ There is **no new mode**. `--mode preprocess` on a config carrying `family: h3` 
 existing arm. Same command, same gate, same cost line, same spend ledger:
 
 ```
-PYTHONPATH=src PYTHONUTF8=1 modal run -m signet_trainer.modal.entrypoint \
+PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoint \
     --config configs/<your-h3-run>.yaml --mode preprocess [--approve]
 ```
 

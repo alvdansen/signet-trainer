@@ -142,7 +142,22 @@ def test_reference_params_gated_on_ic_lora_mode() -> None:
 
     # 1. The dispatch itself must consume the helper, not cfg.conditioning.* inline.
     code = _strip_comments_and_docstrings(src)
-    dispatch = re.search(r"preprocess(?:\.with_options\([^)]*\))?\.spawn\((?:.|\n)*?\)", code)
+    # issue #19 item 2 — the naive pattern (no lookbehind, non-greedy tail stopping at the FIRST
+    # inner `)`) matched the plain APPROVED print's own string literal — "Dispatching
+    # preprocess.spawn() (gated); ..." — instead of the real call, and proved it by mutation: with
+    # `reference_column=cfg.conditioning.reference_column` inlined into the real `.spawn(...)`, the
+    # assertion below still passed. Two fixes, both load-bearing:
+    #   * `(?<![\w.])` before `preprocess` — blocks matching `h3_preprocess.spawn(...)` (the H3 arm's
+    #     own APPROVED print, `preprocess` as a substring of `h3_preprocess`) and
+    #     `cfg.data.preprocessed_data_root` (`preprocess` as a substring after a literal `.`).
+    #   * `\.spawn\s*\(\s*(?!\))` (test_no_warm_gpu.py's existing convention) — requires a
+    #     NON-EMPTY arg list, which the print's literal `preprocess.spawn()` (empty parens) fails.
+    # The tail `(?:.|\n)*?\n\s*\)` anchors the close on a `)` alone on its own line, so a real
+    # multi-line kwarg call is captured whole rather than truncated at the first inner `)`.
+    dispatch = re.search(
+        r"(?<![\w.])preprocess(?:\.with_options\([^)]*\))?\.spawn\s*\(\s*(?!\))(?:.|\n)*?\n\s*\)",
+        code,
+    )
     assert dispatch is not None, "entrypoint.py must dispatch preprocess.spawn(...)"
     assert "cfg.conditioning.reference_column" not in dispatch.group(0), (
         "preprocess.spawn must not read cfg.conditioning.reference_column inline — "
@@ -170,3 +185,60 @@ def test_reference_params_gated_on_ic_lora_mode() -> None:
         conditioning=SimpleNamespace(mode="ic_lora", reference_column="reference_path", reference_downscale_factor=2)
     )
     assert helper(ic) == ("reference_path", 2)
+
+
+# ---- issue #19 item 2 — the dispatch-guard regex must match the CALL, never a print's string ----
+
+_H3_PRINT_SNIPPET = '''
+        print(
+            "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
+            "Dispatching h3_preprocess.spawn() (gated, family: h3); the two-phase encode writes "
+        )
+        fc = h3_preprocess.with_options(timeout=h3_preprocess_timeout_s).spawn(**h3_params)
+'''
+
+_PLAIN_PRINT_SNIPPET = '''
+        print(
+            "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
+            "Dispatching preprocess.spawn() (gated); the canonical process_dataset.py "
+            "encode writes {latents,conditions}/ to cfg.data.preprocessed_data_root."
+        )
+        fc = preprocess.with_options(timeout=preprocess_timeout_s).spawn(
+            metadata_path=cfg.data.metadata_path,
+            reference_column=reference_column,
+        )
+'''
+
+_DISPATCH_GUARD_RE = (
+    r"(?<![\w.])preprocess(?:\.with_options\([^)]*\))?\.spawn\s*\(\s*(?!\))(?:.|\n)*?\n\s*\)"
+)
+
+
+def test_dispatch_guard_regex_skips_h3_print_and_preprocessed_data_root() -> None:
+    """The regex must not match `h3_preprocess.spawn()` (a print literal) nor treat the `.` before
+    `preprocessed_data_root` as a word boundary — both are substrings of `preprocess`, not the
+    dispatch call, and the OLD (no-lookbehind) pattern could not tell them apart from the real one.
+    """
+    match = re.search(_DISPATCH_GUARD_RE, _H3_PRINT_SNIPPET)
+    assert match is None, (
+        f"regex must not match the H3 print's own string literal, matched: {match.group(0)!r}"
+    )
+
+
+def test_dispatch_guard_regex_catches_inlined_reference_column_mutation() -> None:
+    """Mutation proof (the exact regression the issue reports): with
+    `reference_column=cfg.conditioning.reference_column` inlined into the REAL `.spawn(...)` call,
+    the fixed regex's match must be the call itself — not the plain-preprocess print's empty-parens
+    `preprocess.spawn()` — so the forbidden-inline assertion actually sees the mutation instead of
+    silently passing against a vacuous match.
+    """
+    mutated = _PLAIN_PRINT_SNIPPET.replace(
+        "reference_column=reference_column,",
+        "reference_column=cfg.conditioning.reference_column,",
+    )
+    match = re.search(_DISPATCH_GUARD_RE, mutated)
+    assert match is not None, "regex must still find the real .spawn(...) call"
+    assert "cfg.conditioning.reference_column" in match.group(0), (
+        "the match must be the real dispatch call (which now carries the inlined mutation), not "
+        f"the print's vacuous 'preprocess.spawn()' literal — got: {match.group(0)!r}"
+    )

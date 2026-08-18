@@ -27,6 +27,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -58,6 +59,15 @@ RENDER_EVERY = int(sys.argv[2]) if len(sys.argv) > 2 else 500
 _cfg = load_config(SAMPLE_CONFIG)
 OUTPUT_DIR = _cfg.output_dir
 MAX_STEPS = _cfg.training.max_steps
+# issue #19 item 3 (D-NOHARDCODE) — every Volume read in this file used to restate the literal
+# "signe-trainer-checkpoints" directly, bypassing cfg.modal.checkpoints_volume_name (added
+# specifically because the audit found this name hardcoded across ~15 scripts, making the trainer
+# unusable against any other Modal account). Against an overridden name this watcher would render
+# nothing, then report a clean success: checkpoint discovery reads the same wrong Volume as the
+# dispatch, so zero steps means zero dispatches — a silent no-op, not a money leak, but still a
+# false "run-complete". Bound ONCE here, next to OUTPUT_DIR/SAMPLES_ROOT, and threaded through
+# every `sh(["modal", "volume", ...])` call below.
+CKPT_VOL = _cfg.modal.checkpoints_volume_name
 # ⛔ FAMILY-AWARE RENDER ROOT — the fix for the blocker that made this watcher unusable on H3.
 # `h3_sample` commits to `<output_dir>/samples_h3/<render key>/`; the LTX `sample` commits to
 # `<output_dir>/samples/<UTC stamp>/`. This watcher previously hardcoded the LTX answer, so against
@@ -101,6 +111,26 @@ VOLUME_OP_TIMEOUT_S = _cfg.modal.volume_op_timeout_s
 # OBS-01 exit-code PROTOCOL (contract, not a tunable): DISTINCT cap-stop code the supervisor treats
 # as "session cap reached — do NOT relaunch"; a clean complete exits 0 (+ sentinel).
 CAP_STOP_EXIT = 3
+# ⛔ issue #19 item 5 — THE HEARTBEAT MUST REFLECT THE PROCESS, NOT THE POLL BOUNDARY.
+# `HEARTBEAT_FILE.touch()` used to fire ONCE per poll iteration (still does, below), but the H3
+# `refresh_grid()` leg calls `_h3_grid_serve.py` with `timeout=None` — a Volume fetch of a dozen
+# clips plus a grid rebuild that can legitimately run past `watcher_heartbeat_stall_minutes`
+# (default 15 min) on a slow uplink. `watcher_supervisor.ps1` force-kills on heartbeat AGE while the
+# process is alive (D-OBS-3) — the same "doing the long thing the loop exists to do" read as
+# "wedged" that issue #45 PR-1 must-fix #1 (see RENDER_STALL_MIN above) already fixed for the render
+# leg by refreshing on PROGRESS instead of only at dispatch. There is no per-poll progress signal to
+# read here (grid rebuild is one blocking subprocess call), so the analogous fix is a background
+# thread that keeps touching the SAME heartbeat file for the life of the process — a heartbeat that
+# reflects "still alive", not "reached a poll boundary since the last long call returned".
+HEARTBEAT_TOUCH_INTERVAL_S = 60.0
+
+
+def _heartbeat_loop(stop: threading.Event, heartbeat_file: Path, interval_s: float) -> None:
+    """Touch ``heartbeat_file`` every ``interval_s`` until ``stop`` is set. Runs as a daemon thread
+    (issue #19 item 5) so a long blocking call in the main thread (``refresh_grid()``'s
+    ``timeout=None`` subprocess) can never starve the heartbeat the supervisor reads."""
+    while not stop.wait(interval_s):
+        heartbeat_file.touch()
 
 
 def _resolve_cap(ledger_path: str, default_cap: float) -> float:
@@ -152,14 +182,14 @@ def committed_render_stamps() -> list[str]:
     # `rendered` on startup. FAMILY-AWARE: LTX renders are UTC stamps under `samples/`, H3 renders
     # are identity keys under `samples_h3/`. Both the directory AND the naming scheme differ, so
     # re-pointing only the directory would still mis-verify every H3 render.
-    r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", SAMPLES_ROOT],
+    r = sh(["modal", "volume", "ls", CKPT_VOL, SAMPLES_ROOT],
            timeout=VOLUME_OP_TIMEOUT_S)
     return landed_render_ids(r.stdout or "", FAMILY)
 
 
 def latest_checkpoint_name() -> str | None:
     """The newest checkpoint DIR NAME (not just its step) — H3 render keys embed it verbatim."""
-    r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", OUTPUT_DIR])
+    r = sh(["modal", "volume", "ls", CKPT_VOL, OUTPUT_DIR])
     names = re.findall(r"(checkpoint-step-\d+-loss-[\d.]+)", r.stdout or "")
     return max(names, key=lambda n: int(re.search(r"step-(\d+)", n).group(1))) if names else None
 
@@ -258,15 +288,15 @@ def render_progress_artifacts(checkpoint: str | None) -> frozenset[str]:
     # "lora" stays checkpoint-scoped (under render_dir); "base" is the dedup's shared sibling
     # directory under SAMPLES_ROOT — never nested back under render_dir (#12).
     found: set[str] = set()
-    r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", f"{render_dir}/lora"])
+    r = sh(["modal", "volume", "ls", CKPT_VOL, f"{render_dir}/lora"])
     found.update(f"lora/{name}" for name in committed_clip_names(r.stdout or ""))
-    r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", f"{SAMPLES_ROOT}/base/{base_key}"])
+    r = sh(["modal", "volume", "ls", CKPT_VOL, f"{SAMPLES_ROOT}/base/{base_key}"])
     found.update(f"base/{name}" for name in committed_clip_names(r.stdout or ""))
     return frozenset(found)
 
 
 def list_checkpoint_steps() -> list[int]:
-    r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", OUTPUT_DIR])
+    r = sh(["modal", "volume", "ls", CKPT_VOL, OUTPUT_DIR])
     return sorted({int(m.group(1)) for m in
                    re.finditer(r"checkpoint-step-(\d+)-loss-", r.stdout or "")})
 
@@ -306,11 +336,15 @@ def refresh_grid() -> None:
     # `--rows step` makes the CHECKPOINT STEP the row axis, which is the axis that varies during
     # training. Never hand-rolled: finetune-gridwatch is the only sanctioned grid builder.
     if FAMILY == "h3":
+        # issue #19 item 3 — pass CKPT_VOL through explicitly rather than letting the grid driver
+        # fall back to its own default; without --volume here, an overridden checkpoints_volume_name
+        # would make THIS watcher and the grid it drives read two different Volumes.
         r = sh([sys.executable, str(REPO / "scripts" / "_h3_grid_serve.py"),
-                "--config", SAMPLE_CONFIG, "--rows", "step", "--checkpoint", "all"], timeout=None)
+                "--config", SAMPLE_CONFIG, "--rows", "step", "--checkpoint", "all",
+                "--volume", CKPT_VOL], timeout=None)
         print((r.stdout or "")[-1500:], flush=True)
         return
-    r = sh(["modal", "volume", "ls", "signe-trainer-checkpoints", f"{OUTPUT_DIR}/samples"])
+    r = sh(["modal", "volume", "ls", CKPT_VOL, f"{OUTPUT_DIR}/samples"])
     stamps = sorted(re.findall(r"samples/(\d{8}T\d{6}Z)", r.stdout or ""))
     if not stamps:
         return
@@ -318,7 +352,7 @@ def refresh_grid() -> None:
     dest = LOCAL_SAMPLES / latest
     if not list(dest.rglob("*.mp4")):
         dest.mkdir(parents=True, exist_ok=True)  # PRE-CREATE (Windows modal-get quirk: target must exist)
-        sh(["modal", "volume", "get", "signe-trainer-checkpoints",
+        sh(["modal", "volume", "get", CKPT_VOL,
             f"{OUTPUT_DIR}/samples/{latest}/", str(dest) + "/", "--force"])
     # modal volume get nests the remote dir NAME under the target -> descend if present.
     inner = dest / latest
@@ -367,6 +401,14 @@ def main() -> None:
     if rendered:
         print(f"[watcher] reseed from Volume: treating steps {sorted(rendered)} as already rendered "
               f"(latest={_seed_latest} still renders)", flush=True)
+    # issue #19 item 5 — start the background heartbeat toucher BEFORE the poll loop so the FIRST
+    # long refresh_grid() call is already covered; a daemon thread dies with the process, so no
+    # explicit stop is needed on any of main()'s several sys.exit() paths.
+    _heartbeat_stop = threading.Event()
+    threading.Thread(
+        target=_heartbeat_loop, args=(_heartbeat_stop, HEARTBEAT_FILE, HEARTBEAT_TOUCH_INTERVAL_S),
+        daemon=True,
+    ).start()
     deadline = time.time() + DEADLINE_HOURS * 3600
     # Wave 2 #6 single-flight state: at most ONE render in flight. `pending_step` is the step whose
     # detached render has been dispatched (and ledgered) but whose artifact has not yet committed;

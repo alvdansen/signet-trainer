@@ -253,6 +253,7 @@ def load_eval_matrix(config_paths: list[Path]) -> dict:
     prompts: list[str] = []
     variants: list[dict] = []
     output_dirs, seeds = set(), set()
+    volume_names: list[str] = []  # ORDER-PRESERVING (first-encountered wins; see the warning below)
     for path in config_paths:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         validation = data.get("validation", {}) or {}
@@ -267,6 +268,12 @@ def load_eval_matrix(config_paths: list[Path]) -> dict:
         if data.get("output_dir"):
             output_dirs.add(str(data["output_dir"]))
         seeds.add(validation.get("seed", data.get("seed")))
+        # issue #19 item 3 (D-NOHARDCODE) — read the checkpoints Volume name from each config's
+        # modal.checkpoints_volume_name, the same field --volume's own default is meant to mirror,
+        # rather than leaving --volume's hardcoded literal the only source of truth.
+        modal_section = data.get("modal", {}) or {}
+        if modal_section.get("checkpoints_volume_name"):
+            volume_names.append(str(modal_section["checkpoints_volume_name"]))
         variants.append(
             {
                 "config": path.name,
@@ -306,6 +313,11 @@ def load_eval_matrix(config_paths: list[Path]) -> dict:
         print("[grid]    Fix belongs in the eval configs (differentiate the prompts inside the "
               "first 60 characters), not here — this grid cannot invent a clip that was skipped.")
 
+    unique_volume_names = list(dict.fromkeys(volume_names))  # de-dup, ORDER PRESERVED
+    if len(unique_volume_names) > 1:
+        print(f"[grid] WARNING: configs disagree on modal.checkpoints_volume_name "
+              f"{unique_volume_names} — using the first ({unique_volume_names[0]!r}).")
+
     return {
         "prompts": prompts,
         "slug_to_index": slug_to_index,
@@ -313,6 +325,7 @@ def load_eval_matrix(config_paths: list[Path]) -> dict:
         "variants": variants,
         "output_dir": next(iter(output_dirs), None) if output_dirs else None,
         "seeds": sorted(str(s) for s in seeds),
+        "checkpoints_volume_name": unique_volume_names[0] if unique_volume_names else None,
     }
 
 
@@ -741,8 +754,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="A --mode sample config. Repeatable. Default: the glob below.")
     parser.add_argument("--config-glob", default="configs/<your-h3-run>_sample*.yaml",
                         help="Glob used when no --config is given.")
-    parser.add_argument("--volume", default="signe-trainer-checkpoints",
-                        help="Modal Volume holding <output_dir>/samples_h3.")
+    parser.add_argument("--volume", default=None,
+                        help="Modal Volume holding <output_dir>/samples_h3. Default: the loaded "
+                             "sample config(s)' modal.checkpoints_volume_name (D-NOHARDCODE) — "
+                             "falls back to the schema default only when no config sets it.")
     parser.add_argument("--samples-subdir", default="samples_h3",
                         help="Render root under output_dir (h3_sample writes samples_h3, NOT samples).")
     parser.add_argument("--local", default="_samples_h3",
@@ -785,6 +800,14 @@ def main(argv: list[str] | None = None) -> int:
     if not output_dir:
         print("[grid] the sample configs carry no output_dir", file=sys.stderr)
         return 2
+    if args.volume is None:
+        # issue #19 item 3 (D-NOHARDCODE) — config-first, in the same priority order as CKPT_VOL in
+        # scripts/watch_parallel_inference.py: an explicit --volume wins outright (checked above);
+        # otherwise prefer what the loaded sample config(s) actually set; only a config that never
+        # set the field at all falls through to the schema's own default (never a literal repeated
+        # here, so the two can't drift).
+        from signet_trainer.config.schema import ModalConfig  # noqa: PLC0415
+        args.volume = matrix["checkpoints_volume_name"] or ModalConfig().checkpoints_volume_name
     samples_root = f"{output_dir}/{args.samples_subdir}"
     print(f"[grid] eval matrix: {len(config_paths)} config(s), {len(matrix['prompts'])} prompt(s), "
           f"{len(matrix['variants'])} variant(s) -> {args.volume}:{samples_root}")

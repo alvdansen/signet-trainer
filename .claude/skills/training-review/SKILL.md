@@ -75,7 +75,7 @@ Every session, before rendering anything:
 through the **same gate** as every metered run:
 
 ```
-PYTHONPATH=src PYTHONUTF8=1 modal run -m signet_trainer.modal.entrypoint \
+PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoint \
     --config <yaml> --mode sample [--approve]
 ```
 
@@ -134,7 +134,7 @@ A config carrying `family: h3` makes `--mode sample` dispatch `h3_sample` instea
 `sample`. No new mode, no new command, same gate:
 
 ```
-PYTHONPATH=src PYTHONUTF8=1 modal run -m signet_trainer.modal.entrypoint \
+PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoint \
     --config configs/<your-h3-run>_sample.yaml --mode sample [--approve]
 ```
 

@@ -220,7 +220,7 @@ PYTHONPATH=src PYTHONUTF8=1 python scripts/prep_inpaint_stage.py \
 entrypoint — there is NO bespoke encode path (the retired `scripts/_encode_*.py` are the anti-pattern):
 
 ```
-PYTHONPATH=src PYTHONUTF8=1 modal run -m signet_trainer.modal.entrypoint \
+PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoint \
     --config <yaml> --mode preprocess [--approve]
 ```
 

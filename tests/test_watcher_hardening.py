@@ -113,7 +113,16 @@ def test_fork_stall_message_is_artifact_freshness():
 
 # ---- AUDIT #2 (Task 2) — success-gated bookkeeping (BOTH watchers) ----
 
-_WATCHERS = (FORK, GENERALIZED)
+# issue #19 item 1 — FORK is not published in this repo. A hard `(FORK, GENERALIZED)` tuple meant
+# every `for path in _WATCHERS: _main_body(path)` loop below raised FileNotFoundError on iteration
+# 1 (FORK) and never reached iteration 2 — so not one test_both_* assertion about the money-safety
+# invariants was ever evaluated against scripts/watch_parallel_inference.py, the ONLY watcher this
+# repo actually ships. Filter to files that exist: a missing fork degrades to "fork not checked"
+# instead of "nothing checked", and the shipped watcher's own compliance is asserted regardless of
+# whether the fork ever lands. The generalized watcher itself must never be the one that goes
+# missing — that would silently zero out this entire suite the same way the fork's absence did.
+assert GENERALIZED.is_file(), "the shipped generalized watcher must always be present"
+_WATCHERS = tuple(p for p in (FORK, GENERALIZED) if p.is_file())
 
 
 def _first(body: str, needle: str) -> int:
@@ -297,6 +306,59 @@ def test_both_touch_heartbeat_in_loop():
         assert "HEARTBEAT_FILE.touch()" in body, f"{path.name}: must touch the heartbeat in the loop"
 
 
+# ---- issue #19 item 5 — the heartbeat must reflect the PROCESS, not the poll boundary -----------
+# (GENERALIZED only: the FORK's own long call, if it has one, is out of this fix's scope.)
+
+
+def test_generalized_starts_a_background_heartbeat_thread_before_the_poll_loop():
+    # The regression: HEARTBEAT_FILE.touch() fired only once per poll ITERATION, so a single
+    # blocking refresh_grid() call (timeout=None — a Volume fetch + grid rebuild) past
+    # watcher_heartbeat_stall_minutes reads as "wedged" to the supervisor while the watcher is
+    # healthy. A daemon thread touching the SAME file independently of the poll loop closes the gap
+    # for the FIRST long call too — it must start BEFORE the `while time.time() < deadline:` loop.
+    body = _main_body(GENERALIZED)
+    assert "threading.Thread(" in body, "GENERALIZED must start a background heartbeat thread"
+    assert "target=_heartbeat_loop" in body
+    assert "daemon=True" in body, "the heartbeat thread must be a daemon (no explicit stop needed)"
+    thread_start_i = _first(body, "threading.Thread(")
+    loop_i = _first(body, "while time.time() < deadline:")
+    assert thread_start_i < loop_i, (
+        "the heartbeat thread must start BEFORE the poll loop, so the FIRST refresh_grid() call is "
+        "already covered"
+    )
+
+
+def test_heartbeat_loop_touches_repeatedly_and_stops_on_signal(tmp_path):
+    """Runtime behavioral proof (AST-extracted, no modal import — mirrors
+    test_entrypoint_preprocess_mode.py's convention for a small pure helper): ``_heartbeat_loop``
+    actually touches the file more than once at a short interval, and returns promptly once its
+    ``stop`` Event is set — it does not busy-loop or leak past shutdown.
+    """
+    import threading
+    import time as _time
+
+    src = _src(GENERALIZED)
+    tree = ast.parse(src)
+    fn = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_heartbeat_loop"
+    )
+    module = ast.Module(body=[fn], type_ignores=[])
+    namespace: dict = {}
+    exec(compile(module, "<extracted>", "exec"), namespace)  # noqa: S102 — test-local exec
+    heartbeat_loop = namespace["_heartbeat_loop"]
+
+    hb_file = tmp_path / "_watcher_heartbeat_test"
+    stop = threading.Event()
+    t = threading.Thread(target=heartbeat_loop, args=(stop, hb_file, 0.02), daemon=True)
+    t.start()
+    _time.sleep(0.09)
+    stop.set()
+    t.join(timeout=1.0)
+    assert not t.is_alive(), "_heartbeat_loop must return promptly once `stop` is set"
+    assert hb_file.exists(), "_heartbeat_loop must have touched the heartbeat file at least once"
+
+
 # ---- OBS-01 Task 2 (D-OBS-1) — Volume-derived `rendered` seed (crash-resumable) ----
 
 
@@ -398,3 +460,20 @@ def test_supervisor_is_ascii_only():
     # quote and breaks string parsing. Keep the supervisor pure-ASCII (matches serve_gridwatch.ps1).
     raw = SUPERVISOR.read_bytes()
     assert all(b < 128 for b in raw), "watcher_supervisor.ps1 must be pure ASCII (no em-dashes/curly quotes)"
+
+
+# ---- issue #19 item 3 (D-NOHARDCODE) — no script under scripts/ restates the checkpoints Volume
+# name as a literal; every read must route through cfg.modal.checkpoints_volume_name ----------
+
+
+def test_no_hardcoded_checkpoints_volume_literal_under_scripts():
+    # Anti-regression, pinned exactly as the issue's Proposed Direction #3 asks: this suite already
+    # source-scans these files, so a future edit that reintroduces the literal (instead of routing
+    # through cfg.modal.checkpoints_volume_name / CKPT_VOL) is caught here. Scoped to CODE, not the
+    # comment on watch_parallel_inference.py that documents the historical bug by name.
+    for path in sorted(REPO.glob("scripts/*.py")):
+        code = _strip_comments(path.read_text(encoding="utf-8"))
+        assert "signe-trainer-" not in code, (
+            f"{path.name}: must not hardcode a \"signe-trainer-*\" Volume/App literal — read "
+            "cfg.modal.checkpoints_volume_name (or .app_name) instead (D-NOHARDCODE)"
+        )

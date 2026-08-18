@@ -193,7 +193,7 @@ Finally the staged dataset is pre-encoded to latents through the **same single g
 uses** — there is no bespoke inpaint encoder:
 
 ```
-PYTHONPATH=src PYTHONUTF8=1 modal run -m signet_trainer.modal.entrypoint \
+PYTHONPATH=src PYTHONUTF8=1 modal run --detach -m signet_trainer.modal.entrypoint \
     --config <yaml> --mode preprocess [--approve]
 ```
 
