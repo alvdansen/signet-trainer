@@ -49,6 +49,12 @@ ladder view once more than one checkpoint has been rendered.
 PROPERTY HYGIENE. Reference conditions are named by SUBJECT ID only (``A+029``), never by reference
 filename, and no staging path reaches a label. The prompts are the operator's own eval set, read
 from tracked configs.
+
+⛔ THE BASE COLUMN IS FETCHED FROM A SHARED, CHECKPOINT-INDEPENDENT DIRECTORY (#12). ``h3_sample``
+keys the base clips on ``(seed, frames, width, height, steps, refs)`` alone — never the checkpoint —
+so every checkpoint sampled at the same geometry resolves ONE base directory, not one each.
+``fetch_renders`` fetches that shared directory once and joins it onto every checkpoint-keyed render
+via ``base_key_for``; staging never assumes a ``base/`` subdirectory nested under a checkpoint key.
 """
 from __future__ import annotations
 
@@ -78,10 +84,25 @@ for _stream in (sys.stdout, sys.stderr):
         except Exception:  # noqa: BLE001 — never fail on import
             pass
 
-# ``h3_render_key``: ``<checkpoint>_s<seed>_f<frames>_<ids>``. The checkpoint segment is a sanitized
-# Volume dir name (``checkpoint-step-03000-loss-0.1933``) that keeps ``-`` and ``.`` but has no
-# underscore, so a greedy head plus the anchored ``_s<d>_f<d>_`` tail cannot mis-split.
-_KEY_RE = re.compile(r"^(?P<ckpt>.+)_s(?P<seed>\d+)_f(?P<frames>\d+)_(?P<ids>.+)$")
+# ``h3_render_key``: ``<checkpoint>_s<seed>_f<frames>_w<width>_h<height>_n<steps>_<ids>``. The
+# checkpoint segment is a sanitized Volume dir name (``checkpoint-step-03000-loss-0.1933``) that
+# keeps ``-`` and ``.`` but has no underscore, so a greedy head plus the anchored
+# ``_s<d>_f<d>_w<d>_h<d>_n<d>_`` tail cannot mis-split. Widened by #22 finding 5 to carry the
+# geometry axes the ``pipe(...)`` call reads exactly as literally as ``frame_count`` — a resolution
+# or step-count probe used to resume the PREVIOUS geometry's clips under the old, narrower key.
+_KEY_RE = re.compile(
+    r"^(?P<ckpt>.+)_s(?P<seed>\d+)_f(?P<frames>\d+)_w(?P<width>\d+)_h(?P<height>\d+)_"
+    r"n(?P<steps>\d+)_(?P<ids>.+)$"
+)
+# ``h3_base_render_key``: every axis above MINUS the checkpoint (#12) — no ``<checkpoint>_`` head,
+# so this never collides with ``_KEY_RE``. Lives one level down, under the fixed ``base/`` dir name
+# (``inference.samples_layout``'s layout), never mixed into the same listing as the checkpoint-keyed
+# dirs, so the two regexes need not disambiguate a shared parent directory's rows against each other.
+_BASE_KEY_RE = re.compile(
+    r"^s(?P<seed>\d+)_f(?P<frames>\d+)_w(?P<width>\d+)_h(?P<height>\d+)_n(?P<steps>\d+)_(?P<ids>.+)$"
+)
+#: The fixed subdirectory name the shared base column lives under — never a render-key match itself.
+_BASE_DIRNAME = "base"
 _STEP_RE = re.compile(r"checkpoint-step-(\d+)")
 
 # Windows-illegal filename characters + anything that would break the gridwatch template's
@@ -205,6 +226,19 @@ def _slugger():
     return slug
 
 
+def _base_render_key_fn():
+    """The REAL `h3_base_render_key()` — the same never-re-implement rule as `_slugger`.
+
+    A checkpoint-keyed render's shared base directory NAME must be computed by the exact function
+    the render itself used, or a drift between this script's join logic and `h3_sample`'s would
+    silently show the wrong base clips (or none) next to the right adapter clips.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from signet_trainer.inference.render_key import h3_base_render_key  # noqa: PLC0415
+
+    return h3_base_render_key
+
+
 def load_eval_matrix(config_paths: list[Path]) -> dict:
     """Read the sibling `--mode sample` configs into one prompt/axis map.
 
@@ -293,13 +327,73 @@ def parse_render_key(name: str) -> dict | None:
         "step": int(step_match.group(1)) if step_match else None,
         "seed": int(match.group("seed")),
         "frames": int(match.group("frames")),
+        "width": int(match.group("width")),
+        "height": int(match.group("height")),
+        "steps": int(match.group("steps")),
         "subject_ids": match.group("ids").split("-"),
     }
+
+
+def parse_base_render_key(name: str) -> dict | None:
+    """Parse a shared BASE render-dir name (#12) — the same five axes minus the checkpoint."""
+    match = _BASE_KEY_RE.match(name)
+    if not match:
+        return None
+    return {
+        "key": name,
+        "seed": int(match.group("seed")),
+        "frames": int(match.group("frames")),
+        "width": int(match.group("width")),
+        "height": int(match.group("height")),
+        "steps": int(match.group("steps")),
+        "subject_ids": match.group("ids").split("-"),
+    }
+
+
+def base_key_for(meta: dict) -> str:
+    """The shared base-column key a checkpoint-keyed render (`parse_render_key`'s dict) resolves to.
+
+    Delegates to `h3_base_render_key` — never a re-implementation (see `_base_render_key_fn`).
+    """
+    return _base_render_key_fn()(
+        seed=meta["seed"],
+        frame_count=meta["frames"],
+        width=meta["width"],
+        height=meta["height"],
+        num_inference_steps=meta["steps"],
+        subject_ids=meta["subject_ids"],
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
 # fetch
 # ──────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def _fetch_column(
+    volume: str, remote_dir: str, local_dir: Path, refetch: bool
+) -> tuple[list[str], int, int, list[str]]:
+    """Fetch every clip in ONE remote dir. Returns `(filenames, fetched, skipped, failed)`."""
+    files, _why = _modal_ls(volume, remote_dir)
+    names, fetched, skipped, failed = [], 0, 0, []
+    for entry in files:
+        if entry.get("type") != "file":
+            continue
+        filename = Path(str(entry.get("filename", ""))).name
+        if not filename.lower().endswith((".mp4", ".webm", ".mov")):
+            continue
+        target = local_dir / filename
+        if not refetch and target.exists() and target.stat().st_size > 0:
+            skipped += 1
+            names.append(filename)
+            continue
+        ok, why = _modal_get(volume, f"{remote_dir}/{filename}", target)
+        if ok:
+            fetched += 1
+            names.append(filename)
+        else:
+            failed.append(f"{remote_dir}/{filename}: {why}")
+    return names, fetched, skipped, failed
 
 
 def fetch_renders(volume: str, samples_root: str, local_root: Path, refetch: bool) -> dict:
@@ -309,41 +403,59 @@ def fetch_renders(volume: str, samples_root: str, local_root: Path, refetch: boo
     would re-download every finished clip on every refresh. The skip rule is `h3_sample`'s own —
     non-empty, not merely present — because a container killed mid-encode leaves a 0-byte file and
     skipping THAT would put a corrupt clip in the grid rather than re-fetch it.
+
+    ⛔ #12 — THE BASE COLUMN IS FETCHED ONCE PER GEOMETRY, NOT ONCE PER CHECKPOINT. `h3_sample` no
+    longer nests a `base/` dir under each checkpoint-keyed render; it writes ONE shared `base/<base
+    key>/` per (seed, frames, width, height, steps, refs) and every checkpoint's render resolves the
+    same key (`base_key_for`). Fetching it under the checkpoint-keyed dir the way the `lora/` column
+    is fetched would just silently show an empty base column on every row — the directory nesting
+    this function used to assume no longer exists on the Volume.
     """
     rows, reason = _modal_ls(volume, samples_root)
     if not rows:
         return {"available": False, "reason": reason, "renders": []}
 
-    renders, fetched, skipped, failed = [], 0, 0, []
+    # ── the shared base column: one fetch pass, keyed by base_key, reused across every checkpoint ──
+    base_local_by_key: dict[str, Path] = {}
+    base_clips_by_key: dict[str, list[str]] = {}
+    base_fetched = base_skipped = 0
+    base_failed: list[str] = []
+    base_rows, _why = _modal_ls(volume, f"{samples_root}/{_BASE_DIRNAME}")
+    for row in base_rows:
+        if row.get("type") != "dir":
+            continue
+        base_key = Path(str(row.get("filename", ""))).name
+        if parse_base_render_key(base_key) is None:
+            print(f"[grid] skipping unrecognised base dir {base_key!r} (not an h3_base_render_key name)")
+            continue
+        local_base_dir = local_root / _BASE_DIRNAME / base_key
+        names, f, s, failed = _fetch_column(
+            volume, f"{samples_root}/{_BASE_DIRNAME}/{base_key}", local_base_dir, refetch
+        )
+        base_local_by_key[base_key] = local_base_dir
+        base_clips_by_key[base_key] = names
+        base_fetched += f
+        base_skipped += s
+        base_failed.extend(failed)
+
+    renders, fetched, skipped, failed = [], base_fetched, base_skipped, list(base_failed)
     for row in rows:
         if row.get("type") != "dir":
             continue
         key = Path(str(row.get("filename", ""))).name
+        if key == _BASE_DIRNAME:
+            continue  # handled above — the shared base column, not a checkpoint-keyed render
         meta = parse_render_key(key)
         if meta is None:
             print(f"[grid] skipping unrecognised render dir {key!r} (not an h3_render_key name)")
             continue
         local_key = local_root / key
-        clips: dict[str, list[str]] = {"base": [], "lora": []}
-        for column in ("base", "lora"):
-            files, _why = _modal_ls(volume, f"{samples_root}/{key}/{column}")
-            for entry in files:
-                if entry.get("type") != "file":
-                    continue
-                filename = Path(str(entry.get("filename", ""))).name
-                if not filename.lower().endswith((".mp4", ".webm", ".mov")):
-                    continue
-                target = local_key / column / filename
-                if not refetch and target.exists() and target.stat().st_size > 0:
-                    skipped += 1
-                    clips[column].append(filename)
-                    continue
-                ok, why = _modal_get(volume, f"{samples_root}/{key}/{column}/{filename}", target)
-                if ok:
-                    fetched += 1
-                    clips[column].append(filename)
-                else:
-                    failed.append(f"{key}/{column}/{filename}: {why}")
+        lora_names, f, s, lora_failed = _fetch_column(
+            volume, f"{samples_root}/{key}/lora", local_key / "lora", refetch
+        )
+        fetched += f
+        skipped += s
+        failed.extend(lora_failed)
         # delta.json is the render's own provenance record — the measured base-vs-adapter delta, the
         # find_latest-resolved checkpoint, and the reference subject_ids. It is a few hundred bytes
         # and it is AUTHORITATIVE where the directory name is merely descriptive.
@@ -358,8 +470,16 @@ def fetch_renders(volume: str, samples_root: str, local_root: Path, refetch: boo
                     meta["subject_ids"] = [str(s) for s in declared]
             except Exception:  # noqa: BLE001 — provenance is a bonus, never a blocker
                 pass
-        meta["clips"] = clips
-        meta["local"] = local_key
+        # The shared base column this render joins against — resolved from THIS render's own axes
+        # (post delta.json override, so an authoritative subject_ids correction is honoured), never
+        # from a nested `base/` dir that no longer exists.
+        this_base_key = base_key_for(meta)
+        meta["base_key"] = this_base_key
+        meta["clips"] = {"base": base_clips_by_key.get(this_base_key, []), "lora": lora_names}
+        meta["local_by_column"] = {
+            "base": base_local_by_key.get(this_base_key, local_root / _BASE_DIRNAME / this_base_key),
+            "lora": local_key / "lora",
+        }
         renders.append(meta)
 
     renders.sort(key=lambda r: (r["step"] or 0, r["frames"], "-".join(r["subject_ids"])))
@@ -483,7 +603,12 @@ def stage_grid(
                     label = f"{refs} · {index + 1:02d} {column} · {prompt_snippet}"
 
                 label = _safe_label(label)
-                src = render["local"] / column / filename
+                # ⛔ #12: `base` and `lora` no longer share one local root — the base column is
+                # fetched once per geometry and joined onto every checkpoint's render (`fetch_renders`
+                # / `--skip-fetch`'s local-mirror mirror of it), so its local dir lives OUTSIDE this
+                # render's own `local_key`. `local_by_column` carries the per-column root explicitly
+                # rather than this staging loop re-deriving it.
+                src = render["local_by_column"][column] / filename
                 if not src.exists():
                     continue
                 _link_or_copy(src, grid_dir / label / f"step_{row_value}{src.suffix}")
@@ -671,15 +796,31 @@ def main(argv: list[str] | None = None) -> int:
     local_root = Path(args.local) if Path(args.local).is_absolute() else REPO_ROOT / args.local
     local_root.mkdir(parents=True, exist_ok=True)
     if args.skip_fetch:
+        # #12: the shared base column lives under `local_root/base/<base key>/`, a SIBLING of the
+        # checkpoint-keyed dirs, not nested inside each one — read it once, the same way
+        # `fetch_renders` does, rather than re-deriving base clips per checkpoint dir.
+        base_local_dir = local_root / _BASE_DIRNAME
+        base_clips_by_key = {
+            d.name: sorted(f.name for f in d.glob("*.mp4"))
+            for d in (base_local_dir.iterdir() if base_local_dir.is_dir() else [])
+            if d.is_dir() and parse_base_render_key(d.name) is not None
+        }
         renders = []
         for key_dir in sorted(p for p in local_root.iterdir() if p.is_dir()):
+            if key_dir.name == _BASE_DIRNAME:
+                continue
             meta = parse_render_key(key_dir.name)
             if meta is None:
                 continue
-            meta["local"] = key_dir
+            this_base_key = base_key_for(meta)
+            meta["base_key"] = this_base_key
             meta["clips"] = {
-                column: sorted(f.name for f in (key_dir / column).glob("*.mp4"))
-                for column in ("base", "lora")
+                "base": base_clips_by_key.get(this_base_key, []),
+                "lora": sorted(f.name for f in (key_dir / "lora").glob("*.mp4")),
+            }
+            meta["local_by_column"] = {
+                "base": base_local_dir / this_base_key,
+                "lora": key_dir / "lora",
             }
             renders.append(meta)
         fetch = {"available": bool(renders), "reason": "local mirror only (--skip-fetch)",

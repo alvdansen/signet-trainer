@@ -66,10 +66,13 @@ _LTX_LISTING = (
     "outputs/embe_r1/samples/20260805T154357Z\n"
     "outputs/embe_r1/samples/20260805T184725Z\n"
 )
+#: #22 finding 5 widened h3_render_key with width/height/num_inference_steps; every listing/key
+#: literal below carries them so the fixtures stay valid render-dir names under the current regex.
+_GEOM = dict(width=1344, height=768, num_inference_steps=25)
 _H3_LISTING = (
-    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f22_A-029\n"
-    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f22_B-029\n"
-    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f124_A-029\n"
+    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f22_w1344_h768_n25_A-029\n"
+    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f22_w1344_h768_n25_B-029\n"
+    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f124_w1344_h768_n25_A-029\n"
 )
 
 
@@ -80,7 +83,7 @@ def test_ltx_landed_ids_are_the_utc_stamps():
 def test_h3_landed_ids_are_identity_keys_not_stamps():
     ids = landed_render_ids(_H3_LISTING, "h3")
     assert len(ids) == 3
-    assert "checkpoint-step-00250-loss-0.1016_s42_f22_A-029" in ids
+    assert "checkpoint-step-00250-loss-0.1016_s42_f22_w1344_h768_n25_A-029" in ids
     # An H3 listing carries NO wall-clock stamp; the old regex would have returned [] here, which is
     # exactly the "render never landed" mis-read that caused the re-dispatch loop.
     assert not re.search(r"\d{8}T\d{6}Z", _H3_LISTING)
@@ -92,11 +95,11 @@ def test_h3_configs_differing_only_in_reference_are_distinct_renders():
     # watcher keyed on anything coarser, the A+029 render would be accepted as proof that the B+029
     # render landed, and the grid would be labelled for a reference condition it does not contain.
     a = expected_h3_render_key(checkpoint="checkpoint-step-00250-loss-0.1016", seed=42,
-                               frame_count=22, subject_ids=["A", "029"])
+                               frame_count=22, **_GEOM, subject_ids=["A", "029"])
     b = expected_h3_render_key(checkpoint="checkpoint-step-00250-loss-0.1016", seed=42,
-                               frame_count=22, subject_ids=["B", "029"])
+                               frame_count=22, **_GEOM, subject_ids=["B", "029"])
     long_a = expected_h3_render_key(checkpoint="checkpoint-step-00250-loss-0.1016", seed=42,
-                                    frame_count=124, subject_ids=["A", "029"])
+                                    frame_count=124, **_GEOM, subject_ids=["A", "029"])
     assert a != b, "reference condition must be part of the render identity"
     assert a != long_a, "frame count must be part of the render identity"
     ids = landed_render_ids(_H3_LISTING, "h3")
@@ -107,15 +110,17 @@ def test_expected_key_delegates_to_the_renders_own_function():
     # Never a re-implementation: the watcher's expectation and the render's directory name must be
     # produced by the SAME function or they drift silently.
     kwargs = dict(checkpoint="checkpoint-step-03000-loss-0.1933", seed=42, frame_count=56,
-                  subject_ids=["C", "018"])
+                  **_GEOM, subject_ids=["C", "018"])
     assert expected_h3_render_key(**kwargs) == h3_render_key(**kwargs)
 
 
 def test_h3_reference_order_is_not_collapsed():
     # D-10-REFORDER: a reordered reference set is a genuinely different request (it fixes the
     # <Picture i> labels AND advances the shared rotary clock), so it must not collapse to one dir.
-    fwd = expected_h3_render_key(checkpoint="c", seed=42, frame_count=22, subject_ids=["A", "029"])
-    rev = expected_h3_render_key(checkpoint="c", seed=42, frame_count=22, subject_ids=["029", "A"])
+    fwd = expected_h3_render_key(checkpoint="c", seed=42, frame_count=22, **_GEOM,
+                                 subject_ids=["A", "029"])
+    rev = expected_h3_render_key(checkpoint="c", seed=42, frame_count=22, **_GEOM,
+                                 subject_ids=["029", "A"])
     assert fwd != rev
 
 
@@ -203,6 +208,15 @@ def test_watcher_render_landed_requires_explicit_checkpoint():
     )
     assert "checkpoint is None" in body
     assert "raise ValueError" in body
+
+
+def test_watcher_landed_check_carries_the_widened_geometry_axes():
+    # #22 finding 5: the landed-check must pass the SAME axes h3_sample now keys on, or a
+    # resolution/step-count probe would never be recognised as landed (it would key on the old,
+    # narrower identity and poll forever against a directory the render never writes).
+    body = _watcher_src().split("def render_landed")[1].split("\ndef ")[0]
+    for axis in ("width=", "height=", "num_inference_steps="):
+        assert axis in body, f"render_landed's expected_h3_render_key call is missing {axis!r}"
 
 
 def test_watcher_progress_probe_exists_and_is_finer_than_landed():

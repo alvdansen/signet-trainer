@@ -197,6 +197,11 @@ def render_landed(step: int, checkpoint: str | None) -> bool:
         checkpoint=checkpoint,
         seed=int(_cfg.validation.seed),
         frame_count=int(_cfg.validation.frame_count),
+        # #22 finding 5 / #12: the key now carries the geometry axes too — a resolution or
+        # step-count change is a genuinely different render, not a resume of the old one.
+        width=int(_cfg.validation.width),
+        height=int(_cfg.validation.height),
+        num_inference_steps=int(_cfg.validation.num_inference_steps),
         subject_ids=list(_cfg.validation.reference_subject_ids or []),
     )
     return want in ids

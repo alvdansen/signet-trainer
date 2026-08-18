@@ -4736,7 +4736,10 @@ def h3_sample(config_yaml: str) -> None:
     # only, for the same reason `train/loop.checkpoint_watchdog_exceeded` lives outside this module:
     # a test that had to import `modal.fns` to reach it would drag `modal` into sys.modules and
     # break the dry-run gate's Anti-Pattern-6 assertion for the whole session.
-    from signet_trainer.inference.render_key import h3_render_key  # noqa: PLC0415
+    from signet_trainer.inference.render_key import (  # noqa: PLC0415
+        h3_base_render_key,
+        h3_render_key,
+    )
 
     declared = Path(config.data.metadata_path)
     # The manifest path is Volume-relative by convention but the LTX configs carry it absolute;
@@ -5092,23 +5095,46 @@ def h3_sample(config_yaml: str) -> None:
     # keyed on checkpoint+seed alone would make the `B+029` run skip every clip because the `A+029`
     # run had already written that name — producing a grid LABELLED "reference only: B" containing
     # A's pixels. That is a silent mislabel on the precise axis this phase exists to measure.
-    # So the key carries the checkpoint, the seed, the frame count AND the ordered reference
-    # condition. `tests/test_h3_sample_resume.py` pins that the five configs land in five dirs.
-    samples_root = (
-        CHECKPOINTS_DIR
-        / config.output_dir
-        / "samples_h3"
-        / h3_render_key(
-            checkpoint=latest_ckpt.name,
-            seed=seed,
-            frame_count=config.validation.frame_count,
-            subject_ids=[r["subject_id"] for r in reference_descriptors],
-        )
+    # So the key carries the checkpoint, the seed, the frame count, the geometry (`width` / `height`
+    # / `num_inference_steps` — #22 finding 5: the render passes all three to `pipe(...)` exactly as
+    # literally as `frame_count`) AND the ordered reference condition. `tests/test_h3_sample_resume.py`
+    # pins that the five configs land in five dirs.
+    subject_ids = [r["subject_id"] for r in reference_descriptors]
+    samples_h3_root = CHECKPOINTS_DIR / config.output_dir / "samples_h3"
+    samples_root = samples_h3_root / h3_render_key(
+        checkpoint=latest_ckpt.name,
+        seed=seed,
+        frame_count=config.validation.frame_count,
+        width=config.validation.width,
+        height=config.validation.height,
+        num_inference_steps=config.validation.num_inference_steps,
+        subject_ids=subject_ids,
     )
-    base_dir, lora_dir = samples_root / "base", samples_root / "lora"
+    # ⛔ #12 — THE BASE COLUMN IS KEYED SEPARATELY, OUTSIDE THE CHECKPOINT SCOPE. `disable_adapter()`
+    # makes the base column depend on nothing but the pipe parameters above; the checkpoint being
+    # compared against it is not one of them. Nesting it under `samples_root` (checkpoint-keyed) made
+    # a byte-identical base clip re-render at every sampled checkpoint — ~50% of H3 sampling spend at
+    # the keyframe campaign's cadence, and the render backlog it produced once starved a `full`
+    # training phase of GPU slots for over two hours. `base_key` carries every axis `h3_render_key`
+    # does EXCEPT the checkpoint, so every checkpoint's render resolves the SAME base directory and
+    # reuses the ordinary "already rendered, skip" check `_render` already applies — no new skip
+    # logic, just a key the checkpoint no longer poisons.
+    base_key = h3_base_render_key(
+        seed=seed,
+        frame_count=config.validation.frame_count,
+        width=config.validation.width,
+        height=config.validation.height,
+        num_inference_steps=config.validation.num_inference_steps,
+        subject_ids=subject_ids,
+    )
+    base_dir = samples_h3_root / "base" / base_key
+    lora_dir = samples_root / "lora"
     base_dir.mkdir(parents=True, exist_ok=True)
     lora_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[h3_sample] render dir {samples_root.name} (identity-keyed, so a re-dispatch RESUMES).")
+    print(
+        f"[h3_sample] render dir {samples_root.name} (identity-keyed, so a re-dispatch RESUMES); "
+        f"base column shared at base/{base_key} (checkpoint-independent, #12)."
+    )
 
     def _render(prompt: str, out_path: Any) -> str:
         """One single-pass H3 render. NO guidance scale and NO negative prompt — H3 is distilled.
@@ -5172,7 +5198,12 @@ def h3_sample(config_yaml: str) -> None:
     with adapted.disable_adapter():
         for prompt in prompts:
             name = _render(prompt, base_dir / f"{slug(prompt)}_s{seed}.mp4")
-            base_mp4s[prompt] = f"base/{name}"
+            # Relative to `samples_root` (where `index.html` lands below, (8)) — `base_dir` is now a
+            # SIBLING of `samples_root`, not a child of it (#12), so the old bare `base/{name}` would
+            # 404 in the montage. `write_comparison_gallery`'s contract is "relative to out_path's
+            # parent"; `samples_h3_root/"base"/base_key` from `samples_h3_root/<render key>/` is
+            # `../base/<base_key>`.
+            base_mp4s[prompt] = f"../base/{base_key}/{name}"
     print(
         f"[h3_sample] BASE column: {len(base_mp4s)} clip(s) at seed {seed}; peak allocated "
         f"{_peak_gib():.2f} GiB of {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} "
@@ -5290,6 +5321,11 @@ def h3_sample(config_yaml: str) -> None:
                 # Which manifest row supplied them, so two sibling renders that differ ONLY in
                 # their reference condition can be told apart from the artifact alone.
                 "reference_row": reference_row,
+                # #12: the base clip this render's `base_mp4` paths point at lives OUTSIDE this
+                # directory (`samples_h3/base/<base_key>/`, shared across every checkpoint at this
+                # geometry). Recording the key here is what lets a consumer resolve `base_mp4`
+                # without re-deriving it from the render's own params.
+                "base_key": base_key,
             },
             indent=2,
         ),

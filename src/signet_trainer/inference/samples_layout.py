@@ -13,9 +13,16 @@ never marks the step rendered, and re-dispatches on the next poll — booking th
 estimate each time. On the H3 config that is $3.28 every 240 s (~$49/hr) against renders that may
 have succeeded, which would trip ``session_cap_usd`` and halt a healthy campaign.
 
-``h3_sample`` writes to ``<output_dir>/samples_h3/<render key>/`` while the LTX ``sample`` writes to
-``<output_dir>/samples/<UTC stamp>/``. BOTH axes differ — the subdirectory AND the naming scheme —
-so a fix that only re-pointed the subdirectory would still mis-verify every H3 render.
+``h3_sample`` writes to ``<output_dir>/samples_h3/<render key>/lora/`` while the LTX ``sample``
+writes to ``<output_dir>/samples/<UTC stamp>/``. BOTH axes differ — the subdirectory AND the naming
+scheme — so a fix that only re-pointed the subdirectory would still mis-verify every H3 render.
+
+⚠ THE BASE COLUMN IS NOT UNDER THE CHECKPOINT-KEYED DIR (#12). It depends only on the pipe
+parameters — never the checkpoint — so it lives as a SIBLING, ``<output_dir>/samples_h3/base/<base
+render key>/``, shared across every checkpoint that renders the same request. A watcher's landed-
+check still only asks about the checkpoint-keyed ``lora`` half (that IS the per-checkpoint signal);
+the grid assembler is what joins the shared base column back onto each checkpoint's row — see
+``expected_h3_base_render_key`` and ``scripts/_h3_grid_serve.py``.
 
 ⛔ FAMILY-AWARE, NEVER H3-HARDCODED. ``samples_subdir`` RAISES on an unknown family rather than
 falling back to ``"samples"``: a silent default is exactly how the LTX value would be re-applied to
@@ -32,11 +39,12 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
-from signet_trainer.inference.render_key import h3_render_key, qwen_edit_render_key
+from signet_trainer.inference.render_key import h3_base_render_key, h3_render_key, qwen_edit_render_key
 
 __all__ = [
     "SAMPLES_SUBDIR_BY_FAMILY",
     "committed_clip_names",
+    "expected_h3_base_render_key",
     "expected_h3_render_key",
     "expected_qwen_edit_band_keys",
     "expected_qwen_edit_render_key",
@@ -64,10 +72,21 @@ SAMPLES_SUBDIR_BY_FAMILY = {
 #: A LTX render dir is a UTC wall-clock stamp: ``samples/20260805T154357Z/``.
 _LTX_STAMP_RE = re.compile(r"(\d{8}T\d{6}Z)")
 
-#: An H3 render dir is an IDENTITY key: ``<checkpoint>_s<seed>_f<frames>_<ids>``. Anchored on the
-#: ``_s<d>_f<d>_`` tail so a greedy checkpoint head cannot mis-split (checkpoint dir names keep
-#: ``-`` and ``.`` but carry no underscore). Mirrors ``scripts/_h3_grid_serve.py::_KEY_RE``.
-_H3_KEY_RE = re.compile(r"^(?P<ckpt>.+)_s(?P<seed>\d+)_f(?P<frames>\d+)_(?P<ids>.+)$")
+#: An H3 render dir is an IDENTITY key:
+#: ``<checkpoint>_s<seed>_f<frames>_w<width>_h<height>_n<steps>_<ids>``. Anchored on the
+#: ``_s<d>_f<d>_w<d>_h<d>_n<d>_`` tail so a greedy checkpoint head cannot mis-split (checkpoint dir
+#: names keep ``-`` and ``.`` but carry no underscore). Mirrors ``scripts/_h3_grid_serve.py::_KEY_RE``.
+#: #22 finding 5 widened this from ``_s<d>_f<d>_`` alone — a resolution or step-count probe that
+#: differed ONLY on an axis outside the OLD key would have resumed the previous geometry's clips
+#: under the new banner.
+#:
+#: ⛔ The BASE key (``inference.render_key.h3_base_render_key``, no checkpoint segment) never matches
+#: this pattern — it has no ``<checkpoint>_`` head, so ``landed_render_ids`` and ``parse_render_key``
+#: (``scripts/_h3_grid_serve.py``) both skip it automatically rather than needing a special case.
+_H3_KEY_RE = re.compile(
+    r"^(?P<ckpt>.+)_s(?P<seed>\d+)_f(?P<frames>\d+)_w(?P<width>\d+)_h(?P<height>\d+)_"
+    r"n(?P<steps>\d+)_(?P<ids>.+)$"
+)
 
 
 def samples_subdir(family: str) -> str:
@@ -96,21 +115,64 @@ def samples_root(output_dir: str, family: str) -> str:
 
 
 def expected_h3_render_key(
-    *, checkpoint: str, seed: int, frame_count: int, subject_ids: Any
+    *,
+    checkpoint: str,
+    seed: int,
+    frame_count: int,
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    subject_ids: Any,
 ) -> str:
-    """The directory ``h3_sample`` WILL write for this (checkpoint, seed, frames, refs) request.
+    """The directory ``h3_sample`` WILL write for this (checkpoint, seed, frames, geometry, refs)
+    request.
 
     The watcher's "did this render land?" check must key on exactly what the render keys on, or it
     mis-attributes one sample config's output to another. All five H3 sample configs share
     ``output_dir``, ``seed`` and their prompt set, so they write identical clip FILENAMES; only the
-    render-dir identity separates them. A watcher checking a coarser key (checkpoint alone) would
-    accept the ``A+029`` render as proof the ``B+029`` render landed.
+    render-dir identity separates them. A watcher checking a coarser key (checkpoint alone, or the
+    pre-#22-finding-5 key that omitted ``width`` / ``height`` / ``num_inference_steps``) would accept
+    the ``A+029`` render — or a render at a stale resolution — as proof the requested render landed.
 
     Delegates to ``inference.render_key.h3_render_key`` — the render's own function, never a
     re-implementation, so the two cannot drift.
     """
     return h3_render_key(
-        checkpoint=checkpoint, seed=seed, frame_count=frame_count, subject_ids=subject_ids
+        checkpoint=checkpoint,
+        seed=seed,
+        frame_count=frame_count,
+        width=width,
+        height=height,
+        num_inference_steps=num_inference_steps,
+        subject_ids=subject_ids,
+    )
+
+
+def expected_h3_base_render_key(
+    *,
+    seed: int,
+    frame_count: int,
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    subject_ids: Any,
+) -> str:
+    """The directory ``h3_sample`` WILL write the BASE column to — the same request MINUS the
+    checkpoint (#12).
+
+    Delegates to ``inference.render_key.h3_base_render_key`` for the identical never-drift reason
+    ``expected_h3_render_key`` delegates to ``h3_render_key``. A caller resolving "did the base clip
+    for THIS request already land" (the grid assembler, merging one shared base column across every
+    checkpoint that shares these five axes) reads this key, never ``expected_h3_render_key`` with the
+    checkpoint segment discarded by hand.
+    """
+    return h3_base_render_key(
+        seed=seed,
+        frame_count=frame_count,
+        width=width,
+        height=height,
+        num_inference_steps=num_inference_steps,
+        subject_ids=subject_ids,
     )
 
 

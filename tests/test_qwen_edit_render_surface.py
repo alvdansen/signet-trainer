@@ -178,8 +178,8 @@ _QWEN_LISTING = (
     "outputs/qwen_edit_r1/samples_qwen_edit/checkpoint-step-05000-loss-0.0899_s42_ctrain_icon\n"
 )
 _H3_LISTING = (
-    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f22_A-029\n"
-    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f124_A-029\n"
+    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f22_w1344_h768_n25_A-029\n"
+    "outputs/h3_embe_r1/samples_h3/checkpoint-step-00250-loss-0.1016_s42_f124_w1344_h768_n25_A-029\n"
 )
 
 
@@ -211,7 +211,10 @@ def test_generated_keys_are_mutually_exclusive_across_families() -> None:
     for ckpt in ckpts:
         for id_set in ids:
             q = qwen_edit_render_key(checkpoint=ckpt, seed=42, control_ids=id_set)
-            h = h3_render_key(checkpoint=ckpt, seed=42, frame_count=22, subject_ids=id_set)
+            h = h3_render_key(
+                checkpoint=ckpt, seed=42, frame_count=22, width=1344, height=768,
+                num_inference_steps=25, subject_ids=id_set,
+            )
             assert _QWEN_EDIT_KEY_RE.match(q), f"qwen recogniser missed its own key {q}"
             assert _H3_KEY_RE.match(h), f"h3 recogniser missed its own key {h}"
             assert not _H3_KEY_RE.match(q), f"h3 pattern matched qwen key {q}"

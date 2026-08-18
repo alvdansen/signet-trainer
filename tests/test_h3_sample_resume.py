@@ -49,6 +49,9 @@ def _key_for(path: Path) -> str:
         checkpoint="checkpoint-step-3000",
         seed=config.seed,
         frame_count=config.validation.frame_count,
+        width=config.validation.width,
+        height=config.validation.height,
+        num_inference_steps=config.validation.num_inference_steps,
         subject_ids=list(config.validation.reference_subject_ids) or ["A", "029"],
     )
 
@@ -94,9 +97,15 @@ def test_every_sample_config_gets_its_OWN_render_directory() -> None:
     )
 
 
+#: Fixed geometry for the tests below that aren't exercising the geometry axes themselves — the
+#: values do not matter for those tests, only that every call supplies them (the whole point of
+#: #22 finding 5 is that there is no longer a default to omit).
+_GEOM = dict(width=1344, height=768, num_inference_steps=25)
+
+
 def test_the_key_separates_the_two_axes_the_matrix_isolates() -> None:
     """Named directly, because these are the two comparisons the whole eval rests on."""
-    base = {"checkpoint": "checkpoint-step-3000", "seed": 42}
+    base = {"checkpoint": "checkpoint-step-3000", "seed": 42, **_GEOM}
     length_a = h3_render_key(**base, frame_count=22, subject_ids=["A", "029"])
     length_b = h3_render_key(**base, frame_count=56, subject_ids=["A", "029"])
     assert length_a != length_b, "frame_count is not in the key — the LENGTH axis would collide"
@@ -109,30 +118,45 @@ def test_the_key_separates_the_two_axes_the_matrix_isolates() -> None:
     )
 
 
+def test_the_key_separates_every_geometry_axis() -> None:
+    """#22 finding 5: width / height / num_inference_steps are pipe(...) inputs, not banner-only.
+
+    A resolution or step-count probe dispatched mid-campaign must land in its OWN directory, or its
+    render silently resumes the previous geometry's clips under the new banner — the render key's
+    entire job is to make exactly this collision impossible.
+    """
+    base = dict(checkpoint="checkpoint-step-3000", seed=42, frame_count=22, subject_ids=["A", "029"])
+    reference = h3_render_key(**base, **_GEOM)
+    width_changed = h3_render_key(**{**base, **_GEOM, "width": _GEOM["width"] + 32})
+    height_changed = h3_render_key(**{**base, **_GEOM, "height": _GEOM["height"] + 32})
+    steps_changed = h3_render_key(**{**base, **_GEOM, "num_inference_steps": _GEOM["num_inference_steps"] + 1})
+    assert reference != width_changed, "width is not in the key — a resolution probe would collide"
+    assert reference != height_changed, "height is not in the key — a resolution probe would collide"
+    assert reference != steps_changed, (
+        "num_inference_steps is not in the key — a step-count probe would collide"
+    )
+
+
 def test_the_key_is_order_sensitive_because_D_10_REFORDER_is() -> None:
     """A reordered reference set is a genuinely DIFFERENT request, not a permutation of one.
 
     Order fixes the ``<Picture i>`` labels AND advances the shared rotary clock, so sorting the
     subject ids into the key would merge two renders that are not the same render.
     """
-    forward = h3_render_key(
-        checkpoint="c", seed=42, frame_count=22, subject_ids=["A", "029"]
-    )
-    reversed_ = h3_render_key(
-        checkpoint="c", seed=42, frame_count=22, subject_ids=["029", "A"]
-    )
+    forward = h3_render_key(checkpoint="c", seed=42, frame_count=22, **_GEOM, subject_ids=["A", "029"])
+    reversed_ = h3_render_key(checkpoint="c", seed=42, frame_count=22, **_GEOM, subject_ids=["029", "A"])
     assert forward != reversed_, "the render key sorts or otherwise loses reference ORDER"
 
 
 def test_the_key_is_a_safe_and_readable_directory_name() -> None:
     """It is read off a Volume listing by a human, and it becomes a path — both matter."""
     key = h3_render_key(
-        checkpoint="checkpoint-step-3000", seed=42, frame_count=22, subject_ids=["A", "029"]
+        checkpoint="checkpoint-step-3000", seed=42, frame_count=22, **_GEOM, subject_ids=["A", "029"]
     )
-    assert key == "checkpoint-step-3000_s42_f22_A-029", key
+    assert key == "checkpoint-step-3000_s42_f22_w1344_h768_n25_A-029", key
     assert "/" not in key and "\\" not in key and ".." not in key
     nasty = h3_render_key(
-        checkpoint="../../etc/passwd", seed=1, frame_count=1, subject_ids=["A"]
+        checkpoint="../../etc/passwd", seed=1, frame_count=1, **_GEOM, subject_ids=["A"]
     )
     assert "/" not in nasty and "\\" not in nasty, (
         f"a checkpoint name containing path separators produced {nasty!r}, which would escape the "
