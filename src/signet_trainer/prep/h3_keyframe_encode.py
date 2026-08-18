@@ -33,8 +33,9 @@ several pixel frames under a different posterior draw. A keyframe is a single-fr
 spatial encode (``encoders.py:361-366``), exactly as a reference image is. This module never
 touches the video payload.
 
-CONFINED-ADJACENT: ``torch`` + stdlib + ``conditioning/h3_geometry`` + the shared encode primitives.
-The pure-geometry half is unit-testable on Windows with no VAE and no GPU.
+CONFINED-ADJACENT: ``torch`` + stdlib + ``conditioning/h3_geometry`` + ``conditioning/h3_fl2va``
+(for the shared anchor-set contract) + the shared encode primitives. The pure-geometry half is
+unit-testable on Windows with no VAE and no GPU.
 """
 
 from __future__ import annotations
@@ -46,8 +47,11 @@ from typing import Any
 import torch
 
 from signet_trainer.conditioning.h3_geometry import H3_CANVAS_MULTIPLE, rows_of
+from signet_trainer.conditioning.h3_fl2va import validate_keyframe_anchors
 from signet_trainer.prep.h3_encode import (
     H3_KEYFRAME_ENCODE_SEED,
+    _grid_vision_tokens,
+    _vision_merge_length,
     encode_video_latents,
     imagenet_normalize,
 )
@@ -116,10 +120,19 @@ def prepare_h3_keyframe_images(
     refused here rather than silently squashed — teaching "the answer is a squashed reference" is a
     documented failure of this project.
 
-    Idempotent: an already-prepared keyframe passes through after its canvas is checked.
+    Idempotent: an already-prepared keyframe passes through after its canvas AND its anchor are
+    checked — the anchor is the field the whole fl2va contract rests on, and re-checking only the
+    canvas would let a re-prepare call silently flip ``("first", "last")`` to ``("last", "first")``
+    on an already-resized pair (order is meaning, exactly as ``validate_keyframe_anchors`` enforces
+    below).
+
+    The anchor SET (count, membership, order, no duplicates) is validated up front via
+    ``conditioning.h3_fl2va.validate_keyframe_anchors`` — the single definition of that contract,
+    shared with the packing layer — so an illegal request is refused HERE, before any resize is
+    paid for, rather than surviving the entire pre-encode to be caught only at training time.
     """
     images = list(images)
-    anchors = list(anchors)
+    anchors = validate_keyframe_anchors(anchors)
     if len(images) != len(anchors):
         raise ValueError(
             f"got {len(images)} keyframe image(s) and {len(anchors)} anchor(s); they are paired "
@@ -138,6 +151,14 @@ def prepare_h3_keyframe_images(
                     f"{canvas_width}x{canvas_height}. The canvas is written into the cached payload; "
                     f"a payload whose declared canvas is not the one its pixels were resized at is "
                     f"a cache nobody can re-derive."
+                )
+            if image.anchor != anchor:
+                raise ValueError(
+                    f"keyframe {index} was prepared at anchor {image.anchor!r} but this call "
+                    f"declares {anchor!r}. The anchor binds the `<Picture i>` block the caption "
+                    f"describes; re-preparing an already-resized keyframe under a different anchor "
+                    f"would silently flip which end of the clip it is pinned to while its pixels — "
+                    f"and every downstream row count — stay unchanged. ORDER IS MEANING."
                 )
             prepared.append(image)
             continue
@@ -186,13 +207,23 @@ def prepare_h3_keyframe_images(
 
 
 def validate_keyframe_vision_grid(
-    prepared: Sequence[H3PreparedKeyframe], vision_grid_thw: Any
+    prepared: Sequence[H3PreparedKeyframe], vision_grid_thw: Any, processor: Any
 ) -> None:
     """Assert Qwen3-VL's vision grid equals the keyframe's latent-row count. THE F3 GUARD.
 
     ``image_grid_thw`` comes back from ``processor.image_processor`` as ``[n_images, 3]`` of
-    ``(t, h, w)`` in MERGED patch units, which is the same /32 grid ``rows_of`` computes. If the
-    processor re-snapped the image — because it was handed a raw file, or one sized at
+    ``(t, h, w)`` in UNMERGED patch units (``patch_size`` 16) — **not** the merged /32 grid
+    ``rows_of`` computes. Qwen3-VL's own realized vision-token count is
+    ``image_grid_thw.prod() // merge_size**2`` (``encoders.py:509``; ``Qwen3VLProcessor.__call__``
+    computes it the identical way), so this guard reuses ``prep/h3_encode.py``'s existing
+    primitives — ``_vision_merge_length`` (merge size READ off the mounted processor, never a
+    literal) and ``_grid_vision_tokens`` (the divide) — instead of restating the arithmetic as a
+    bare ``t * h * w``. Omitting the ``// merge_size**2`` divide is exactly the D-10-DEF-4 class of
+    defect this guard exists to catch, only turned inward: a bare product is 4x (``merge_size**2``)
+    too large at ``merge_size=2``, so it REJECTS every correctly-prepared keyframe and would ACCEPT
+    one mistakenly sized at half the canvas.
+
+    If the processor re-snapped the image — because it was handed a raw file, or one sized at
     ``reference_image_short_edge`` instead of the canvas — the counts diverge and the packed
     sequence silently violates the base model's contract.
 
@@ -209,19 +240,21 @@ def validate_keyframe_vision_grid(
         raise ValueError(
             f"processor returned {len(grids)} vision grid(s) for {len(prepared)} keyframe(s)."
         )
+    merge_length = _vision_merge_length(processor)
     for index, (keyframe, grid) in enumerate(zip(prepared, grids, strict=True)):
         t, h, w = (int(v) for v in grid)
-        vision_tokens = t * h * w
+        vision_tokens = _grid_vision_tokens((t, h, w), merge_length)
         expected = keyframe.latent_rows
         if vision_tokens != expected:
             raise ValueError(
                 f"keyframe {index} ({keyframe.label!r}) breaks the vision-token/latent-row "
                 f"identity: Qwen3-VL produced {vision_tokens} vision token(s) "
-                f"(grid t={t} h={h} w={w}) but the VAE will emit {expected} latent row(s) for a "
-                f"{keyframe.canvas_width}x{keyframe.canvas_height} canvas. MiniMax-H3 was trained "
-                f"with these EQUAL (encoders.py:285). The usual cause is the keyframe being sized "
-                f"at reference_image_short_edge instead of the target canvas — which assembles "
-                f"cleanly, passes every row-count guard, and is wrong on every sample."
+                f"(unmerged grid t={t} h={h} w={w}, merge_length={merge_length}) but the VAE will "
+                f"emit {expected} latent row(s) for a {keyframe.canvas_width}x{keyframe.canvas_height} "
+                f"canvas. MiniMax-H3 was trained with these EQUAL (encoders.py:285). The usual cause "
+                f"is the keyframe being sized at reference_image_short_edge instead of the target "
+                f"canvas — which assembles cleanly, passes every row-count guard, and is wrong on "
+                f"every sample."
             )
 
 
