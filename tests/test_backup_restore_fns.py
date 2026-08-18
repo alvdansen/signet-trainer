@@ -191,11 +191,13 @@ def test_neither_fn_names_an_hf_token_env_var():
 
 def test_both_fns_reject_cloud_as_not_implemented_backstop():
     # Defense-in-depth (T-09.1-08-D2): the primary rejection is 09.1-07's load-time validator; each fn
-    # ALSO carries a NotImplementedError backstop with the honest "only 'hf' and 'local'" message.
+    # ALSO carries a NotImplementedError backstop with the honest "only 'hf' is wired" message.
+    # ('local' is ALSO refused at config load when enabled — issue #23 finding 1 — so it is no
+    # longer counted among the wired destinations here.)
     for name in ("backup_sync", "restore"):
         body = _function_segment(FNS, name)
         assert "NotImplementedError" in body
-        assert "only 'hf' and 'local'" in body
+        assert "only 'hf' is wired" in body
 
 
 # ---- CR-01: HF backup verifies the destination repo is PRIVATE before any upload ----

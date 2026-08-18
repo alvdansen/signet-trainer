@@ -138,12 +138,13 @@ you are running under or every command fails immediately:
 | --- | --- | --- |
 | `my-huggingface-secret` | `HF_TOKEN` | Downloading base weights and the text encoder |
 | `my-wandb-secret` | `WANDB_API_KEY` | Run logging (only if you enable `wandb`) |
-| `hf-gated-secret` | `HF_TOKEN` for an account that accepted the *gated* adapter's terms | `--mode fuse` only |
+| `hf-gated-secret` | `HF_TOKEN` for an account that accepted the *gated* adapter's terms | Consumed by `--mode fuse` only, but **required for every mode's dispatch** — Modal resolves the whole app graph's secrets at import time (see below), so a missing/wrong name fails `train`/`sample`/`preprocess`/`backup`/`restore` too, not just `fuse` |
 
-The names are configurable — set `modal.huggingface_secret_name` / `modal.wandb_secret_name` in
-your YAML, or export `SIGNET_HUGGINGFACE_SECRET_NAME` / `SIGNET_WANDB_SECRET_NAME` /
-`SIGNET_HF_GATED_SECRET_NAME`. Configs carry secret **names** only; token values are injected into
-the container at run time and are never logged or baked into the image.
+The names are configurable — set `modal.huggingface_secret_name` / `modal.wandb_secret_name` /
+`modal.hf_gated_secret_name` in your YAML, or export `SIGNET_HUGGINGFACE_SECRET_NAME` /
+`SIGNET_WANDB_SECRET_NAME` / `SIGNET_HF_GATED_SECRET_NAME`. Configs carry secret **names** only;
+token values are injected into the container at run time and are never logged or baked into the
+image.
 
 ### Modal Volumes
 

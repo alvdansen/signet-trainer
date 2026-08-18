@@ -1283,6 +1283,19 @@ class ModalConfig(_Base):
         default="my-wandb-secret",
         description="Name of the Modal secret carrying the wandb API key (run logging).",
     )
+    # Issue #33 finding 3: hf_gated_secret_name is the coherence-asymmetry fix for the THIRD secret
+    # (fns.py's HF_GATED_SECRET_NAME) — it was env-overridable (SIGNET_HF_GATED_SECRET_NAME) but had
+    # NO config field, so unlike its two siblings above it could not be compared against the
+    # entrypoint's step-1b pre-approval name guard. Modal resolves EVERY Secret.from_name(...) in the
+    # app graph at import time for ANY mode's dispatch (app.py:86) — this secret is NOT "--mode fuse
+    # only" as the README previously stated; a wrong/missing name fails every mode, not just fuse.
+    hf_gated_secret_name: str = Field(
+        default="hf-gated-secret",
+        description="Name of the Modal secret carrying an HF_TOKEN for an account that accepted a "
+        "GATED adapter's license terms (currently consumed by fuse only, but resolved by Modal for "
+        "EVERY mode's dispatch — see app.py's app-graph-wide secret resolution). Matches fns.py's "
+        "HF_GATED_SECRET_NAME env-override default so an unconfigured account is unaffected.",
+    )
 
     # ------------------------------------------------------------------------------------------
     # Modal RESOURCE NAMES — the App name + the three Volume names (D-NOHARDCODE / AUDIT #1).
@@ -1987,9 +2000,14 @@ class BackupConfig(_Base):
     NEVER the house default. Destination defaults to a PRIVATE HF repo (D-BK-5) — the durable
     off-Volume default.
 
-    Scope note on destinations: ``hf`` and ``local`` are functionally wired this phase; ``cloud`` is
-    schema-ready (enum + creds seam kept for forward-compat) but NOT implemented — an ENABLED cloud
-    block FAILS FAST at config load (never deep in a Modal function).
+    Scope note on destinations: ``hf`` is the only destination WIRED (and durable) this phase.
+    ``local`` and ``cloud`` are both schema-ready (enum + seam kept for forward-compat) but NOT
+    durable here — an ENABLED ``local`` OR ``cloud`` block FAILS FAST at config load (never deep in
+    a Modal function). ``local`` fails because ``backup_sync`` runs in a Modal container with an
+    EPHEMERAL filesystem (issue #23 finding 1): a "local" copy is never committed to a Volume and is
+    destroyed when the container exits, so it would report success and then vanish. The enum value
+    is kept for a future local-runner backup path OUTSIDE Modal (a long-lived process where "local"
+    really is durable).
     """
 
     enabled: bool = Field(
@@ -2000,10 +2018,12 @@ class BackupConfig(_Base):
     destination: Literal["hf", "local", "cloud"] = Field(
         default="hf",
         description="[D-BK-5] Where completeness-checked checkpoints are mirrored. Default 'hf' = a "
-        "PRIVATE HF repo (the durable off-Volume default). 'hf' and 'local' are WIRED this phase; "
-        "'cloud' is a RESERVED forward-compat value (enum kept) that FAILS FAST at config load when "
-        "enabled=True with a 'not yet implemented' error — never discovered deep in a Modal function. "
-        "HF auth reuses the EXISTING modal.huggingface_secret_name (no second HF secret field here).",
+        "PRIVATE HF repo (the durable off-Volume default) — the only destination WIRED this phase. "
+        "'local' and 'cloud' are both RESERVED forward-compat values (enum kept) that FAIL FAST at "
+        "config load when enabled=True — never discovered deep in a Modal function. 'local' fails "
+        "because a Modal container's filesystem is not durable (issue #23 finding 1: no Volume ever "
+        "commits it); 'cloud' fails as 'not yet implemented'. HF auth reuses the EXISTING "
+        "modal.huggingface_secret_name (no second HF secret field here).",
     )
     repo_id: str | None = Field(
         default=None,
@@ -2012,8 +2032,10 @@ class BackupConfig(_Base):
     )
     path: str | None = Field(
         default=None,
-        description="Local backup directory for destination='local' (required when enabled + "
-        "destination='local'). None for other destinations.",
+        description="Reserved for a future local-runner backup path OUTSIDE Modal (destination='local' "
+        "always fails fast at config load when enabled=True — a Modal container's filesystem is not "
+        "durable, so this field is not currently consumed by any Modal function). None for other "
+        "destinations.",
     )
     cloud_secret_name: str | None = Field(
         default=None,
@@ -2042,8 +2064,8 @@ class BackupConfig(_Base):
 
     @model_validator(mode="after")
     def _check_backup_fields(self) -> "BackupConfig":
-        # Off block with defaults (incl. a disabled cloud block) loads clean — the whole block is
-        # inert until enabled=True. Only fire the destination/field checks when enabled.
+        # Off block with defaults (incl. a disabled local or cloud block) loads clean — the whole
+        # block is inert until enabled=True. Only fire the destination/field checks when enabled.
         if self.enabled:
             if self.destination == "hf":
                 # hf consumes repo_id; a stray path / cloud_secret_name would be silently ignored.
@@ -2065,12 +2087,14 @@ class BackupConfig(_Base):
                         "(symmetric stray-field rejection). Remove it."
                     )
             elif self.destination == "local":
-                # local consumes path; a stray repo_id / cloud_secret_name would be silently ignored.
-                if self.path is None:
-                    raise ValueError(
-                        "backup.destination='local' requires backup.path (the local backup dir) when "
-                        "enabled=True — a backup with no target dir would silently no-op durability."
-                    )
+                # local is schema-ready but NOT durable on Modal (issue #23 finding 1): backup_sync
+                # runs in a Modal container with an EPHEMERAL filesystem, so a "local" copy is never
+                # committed to a Volume and is destroyed when the container exits — the copy would
+                # report success and then vanish. FIRST reject any stray hf/cloud field (the
+                # symmetric stray-field message, mirroring the cloud branch below), THEN fail fast
+                # even for an otherwise-clean local block, so a non-durable destination can never
+                # reach the CPU Modal function. The enum value is KEPT for a future local-runner
+                # backup path OUTSIDE Modal — a long-lived process where "local" really is durable.
                 if self.repo_id is not None:
                     raise ValueError(
                         "backup.repo_id is set while destination='local': repo_id is only consumed by "
@@ -2083,6 +2107,15 @@ class BackupConfig(_Base):
                         "forward-compat field for destination='cloud' and would be silently ignored "
                         "(symmetric stray-field rejection). Remove it."
                     )
+                raise ValueError(
+                    "backup.destination='local' is not durable on Modal: backup_sync runs in a Modal "
+                    "container with an ephemeral filesystem, so a 'local' copy is never committed to "
+                    "a Volume and is destroyed when the container exits — the copy would report "
+                    "success and then vanish (issue #23). 'local' is schema-ready for a future "
+                    "local-runner backup path OUTSIDE Modal (the enum value is KEPT for forward-"
+                    "compat); this load-time error is the fail-fast so a non-durable destination "
+                    "never reaches the CPU Modal function. Use destination='hf' instead."
+                )
             elif self.destination == "cloud":
                 # cloud is schema-ready but NOT implemented. FIRST reject any stray hf/local field
                 # (the symmetric stray-field message), THEN fail fast even for an otherwise-clean
@@ -2096,13 +2129,13 @@ class BackupConfig(_Base):
                 if self.path is not None:
                     raise ValueError(
                         "backup.path is set while destination='cloud': path is only consumed by "
-                        "destination='local' and would be silently ignored (symmetric stray-field "
-                        "rejection). Remove it."
+                        "a future local-runner backup path (not this Modal fn) and would be silently "
+                        "ignored (symmetric stray-field rejection). Remove it."
                     )
                 raise ValueError(
                     "backup.destination='cloud' is schema-ready but not yet implemented — only 'hf' "
-                    "and 'local' are wired this phase (the enum value is KEPT for forward-compat; this "
-                    "load-time error is the fail-fast so a cloud misconfig never reaches the CPU Modal "
+                    "is wired this phase (the enum value is KEPT for forward-compat; this load-time "
+                    "error is the fail-fast so a cloud misconfig never reaches the CPU Modal "
                     "function)."
                 )
         # interval is only consumed by what='final+intervals'; a value under any other scope (even
