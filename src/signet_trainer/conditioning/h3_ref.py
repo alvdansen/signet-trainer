@@ -657,6 +657,59 @@ def _parse_reference_pool(
     return pool
 
 
+def _h3_payload_is_explicit_manifest(payload: Any) -> bool:
+    """Read the issue #52 provenance flag off a cached ``h3_reference_latents`` payload.
+
+    ⛔ BINDING (operator adversarial-audit ruling): a payload carrying NO such key at all — every
+    cache on the Volume written before this field existed, and any hand-built pool a test or a
+    caller constructs as a bare list rather than a dict — reads as ``False`` (pool-derived),
+    byte-identically to the pre-fix behaviour that never checked this at all. This is the ONLY
+    place that default is decided; it must never be re-derived with a different fallback anywhere
+    else in this module.
+    """
+    return isinstance(payload, dict) and bool(payload.get("explicit_manifest", False))
+
+
+def _h3_check_explicit_pool_size(
+    payload: Any,
+    pool_size: int,
+    references_per_sample: int,
+    *,
+    segment_index: int,
+) -> None:
+    """Refuse ONLY when the payload is positively marked explicit-manifest AND the pool disagrees.
+
+    This is the train-time half of issue #52. Preprocess already refuses an explicit-manifest row
+    whose resolved reference count differs from ``references_per_sample``
+    (``modal/fns.py::_h3_resolve_references``); nothing checked the CACHED pool against the
+    CONFIGURED slot count at train time, so a cache written for one ``references_per_sample`` and
+    then pointed at by a config naming a different one sailed through and silently rotated a subset
+    of the cached pool — while the cached text payload still describes every picture in it.
+
+    A ``character_references``-pool row is UNCHECKED here on purpose: that pool is deliberately
+    allowed to outnumber ``references_per_sample`` (the Embe corpus regime, which rotates a larger
+    candidate set across segments), and the two cases are indistinguishable from the cached pool
+    alone — which is exactly why the provenance flag has to travel with the payload rather than
+    being inferred from its size.
+    """
+    if not _h3_payload_is_explicit_manifest(payload):
+        return
+    if pool_size == references_per_sample:
+        return
+    raise ValueError(
+        f"segment {segment_index}: this row is marked explicit-manifest (its references came from "
+        f"a 'reference_paths' list, the exact set) but its cached reference pool holds {pool_size} "
+        f"entr{'y' if pool_size == 1 else 'ies'} while references_per_sample={references_per_sample}. "
+        f"An explicit-manifest cache was written for a specific slot count; pointing a different "
+        f"references_per_sample at it (e.g. a VRAM retreat from 3 references to 2 against an "
+        f"already-encoded 3-reference cache) would otherwise silently rotate a SUBSET of the "
+        f"cached pool while the cached text payload still describes every picture in it (issue "
+        f"#52). Re-encode this cache at the configured slot count, or point the config at a cache "
+        f"encoded for it. A pool-derived row (no 'reference_paths') is never refused here — that "
+        f"pool is deliberately allowed to outnumber references_per_sample."
+    )
+
+
 def _split_model_output(model_output: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
     """The H3 forward returns ``(video_out, audio_out)`` with ``return_dict=False``; accept both."""
     if isinstance(model_output, torch.Tensor):
@@ -799,14 +852,16 @@ class H3RefStrategy(TrainingStrategy):
         self.patch_size = None if patch_size is None else tuple(int(p) for p in patch_size)
         self.max_packed_rows = max_packed_rows
         self.expected_layout = expected_layout
-        # #52 interim mitigation: the cache records no provenance for HOW its pool was chosen
-        # (explicit-manifest vs rotating pool), so a pool larger than `references_per_sample` is
-        # indistinguishable, from the cache alone, from a genuine mismatch — a 3-reference cache
-        # pointed at by a `references_per_sample: 2` config sails through and silently rotates
-        # 2-of-3 while the cached text payload still describes three pictures. The real fix is
-        # provenance-tagging the payload (tracked separately); this is the cheap interim half —
-        # surface the mismatch ONCE in the run log rather than nowhere. `False` until the first
-        # resolved segment so it fires at most once per strategy instance, not once per step.
+        # #52 interim mitigation (already on main; DUPLICATE dropped here — see note above the
+        # explicit-manifest size-mismatch refusal): the cache records no provenance for HOW its
+        # pool was chosen (explicit-manifest vs rotating pool), so a pool larger than
+        # `references_per_sample` is indistinguishable, from the cache alone, from a genuine
+        # mismatch — a 3-reference cache pointed at by a `references_per_sample: 2` config sails
+        # through and silently rotates 2-of-3 while the cached text payload still describes three
+        # pictures. The real fix (this bundle) is provenance-tagging the payload + the hard
+        # refusal below; this interim half surfaces the mismatch ONCE in the run log, independent
+        # of whether the row is positively marked explicit. `False` until the first resolved
+        # segment so it fires at most once per strategy instance, not once per step.
         self._logged_pool_size = False
 
     def get_data_sources(self) -> Sequence[Any]:
@@ -874,9 +929,11 @@ class H3RefStrategy(TrainingStrategy):
         environments = [reference for reference, _ in pool if reference.kind == "environment"]
 
         if not self._logged_pool_size:
-            # #52 interim mitigation — see __init__. Once, at the first resolved segment: the
-            # cached pool size next to the configured slot count, so a stale-cache/re-configured-
-            # slot-count mismatch is at least VISIBLE in the run log instead of nowhere.
+            # #52 interim mitigation — see __init__ (already on main; kept, not duplicated). Once,
+            # at the first resolved segment: the cached pool size next to the configured slot
+            # count, so a stale-cache/re-configured-slot-count mismatch is at least VISIBLE in the
+            # run log instead of nowhere — independent of whether the row is positively marked
+            # explicit (that half is the hard refusal below, this bundle's own new addition).
             logger.info(
                 "H3RefStrategy: cached reference pool holds %d entr%s "
                 "(%d character, %d environment) against references_per_sample=%d.",
@@ -1014,8 +1071,17 @@ class H3RefStrategy(TrainingStrategy):
         elif dropped:
             # The pool is still PARSED on a dropped step (the cache contract is validated every
             # step, exactly as before) — only its rows go unused this step.
-            _parse_reference_pool(
-                _lookup(batch, H3_REFERENCE_BATCH_KEYS, "reference latent"), self.patch_size
+            dropped_ref_payload = _lookup(batch, H3_REFERENCE_BATCH_KEYS, "reference latent")
+            dropped_pool = _parse_reference_pool(dropped_ref_payload, self.patch_size)
+            # issue #52: the pool-size-vs-slot-count refusal runs on EVERY step that touches the
+            # cache, dropped or not — a dropped step still validates the contract (the comment
+            # above), and a mismatch is exactly as real whether or not this particular step uses
+            # the rows.
+            _h3_check_explicit_pool_size(
+                dropped_ref_payload,
+                len(dropped_pool),
+                self.references_per_sample,
+                segment_index=segment_index,
             )
             # A genuine conditioning-REGIME variation, which is the point (D-10-ASYM): varying the
             # number and kind of references across the corpus stops the adapter binding to a fixed
@@ -1025,8 +1091,14 @@ class H3RefStrategy(TrainingStrategy):
                 (1, 0, deps.patch_dim), dtype=target.dtype, device=target.device
             )
         else:
-            pool = _parse_reference_pool(
-                _lookup(batch, H3_REFERENCE_BATCH_KEYS, "reference latent"), self.patch_size
+            ref_payload = _lookup(batch, H3_REFERENCE_BATCH_KEYS, "reference latent")
+            pool = _parse_reference_pool(ref_payload, self.patch_size)
+            # issue #52 — see docstring on `_h3_check_explicit_pool_size`: refuses ONLY a row
+            # positively marked explicit-manifest whose cached pool disagrees with the configured
+            # slot count. A pool-derived row (no flag, or the flag False) is UNAFFECTED and keeps
+            # rotating exactly as it does today — that is the binding adversarial-audit constraint.
+            _h3_check_explicit_pool_size(
+                ref_payload, len(pool), self.references_per_sample, segment_index=segment_index
             )
             references = self._resolve_slots(segment_index, pool)
             by_path = {reference.path: rows for reference, rows in pool}
