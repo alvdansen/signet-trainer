@@ -359,6 +359,26 @@ def test_get_data_sources_declares_video_masks() -> None:
     assert strat.get_data_sources() == ["latents", "conditions", "video_masks"]
 
 
+def test_get_data_sources_honors_configured_mask_dir() -> None:
+    """#21 finding 3: a non-default inpaint_mask_dir must be READ here, not just written on the
+    Modal preprocess side (modal/entrypoint.py::_mask_encode_params). Before this fix,
+    ``get_data_sources()`` returned the bare literal ``"video_masks"`` unconditionally, so a
+    config-driven ``inpaint_mask_dir: "custom_masks"`` validated clean at load and was then
+    silently ignored on the read side.
+    """
+    strat = InpaintStrategy(deps=None, schedule=None, mask_dir="custom_masks")
+    assert strat.get_data_sources() == ["latents", "conditions", "custom_masks"]
+
+
+def test_get_data_sources_mask_dir_defaults_to_video_masks() -> None:
+    """The default matches the schema default (``ConditioningConfig.inpaint_mask_dir``) exactly —
+    every caller that never sets ``inpaint_mask_dir`` (or constructs the strategy directly, as
+    ``train/step.py`` does) is unaffected by #21 finding 3's fix.
+    """
+    strat = InpaintStrategy(deps=None, schedule=None)
+    assert strat.get_data_sources() == ["latents", "conditions", "video_masks"]
+
+
 def test_compute_loss_scalar_and_invariant_to_keep_predictions() -> None:
     torch.manual_seed(0)
     strat = _make_inpaint(schedule=_FixedSchedule(0.5))

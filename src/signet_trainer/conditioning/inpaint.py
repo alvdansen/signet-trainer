@@ -95,6 +95,14 @@ class InpaintStrategy(TrainingStrategy):
             all zeros = everything generated, all tokens in the loss).
         device / dtype: compute placement (cuda / bf16 on Modal; cpu / float32 in unit tests).
         fps: fallback frame-rate for the temporal RoPE coord (overridden by sample metadata).
+        mask_dir: sub-dir name under ``preprocessed_data_root`` holding the encoded mask tensors —
+            mirrors ``config.conditioning.inpaint_mask_dir`` (schema.py). Defaulted to the schema's
+            own default ``"video_masks"`` so every existing caller (train/step.py's per-step
+            construction, which never needs ``get_data_sources()``) is unaffected. #21 finding 3:
+            this was previously a bare literal here while ``inpaint_mask_dir`` was honored on the
+            WRITE side (modal/entrypoint.py) — a non-default value validated clean and was then
+            silently ignored on read. Threading it here closes that gap; the caller
+            (``modal/fns.py``) is responsible for passing ``config.conditioning.inpaint_mask_dir``.
     """
 
     def __init__(
@@ -106,6 +114,7 @@ class InpaintStrategy(TrainingStrategy):
         device: Any = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         fps: float = DEFAULT_FPS,
+        mask_dir: str = "video_masks",
     ) -> None:
         self.deps = deps
         self.schedule = schedule
@@ -113,17 +122,21 @@ class InpaintStrategy(TrainingStrategy):
         self.device = device
         self.dtype = dtype
         self.fps = fps
+        self.mask_dir = mask_dir
 
     def get_data_sources(self) -> Sequence[Any]:
         """The signet nested-sample sources this strategy reads.
 
-        Adds a third ``video_masks`` source (one ``.pt`` per sample, same rel path as latents,
-        float32 ``[F_lat, H_lat, W_lat]`` in {0., 1.}) — mirrors how ``ICLoraStrategy`` declares
-        its third ``reference_latents`` source. ``"video_masks"`` deliberately does NOT contain
-        the substring ``"latent"``, so ``PrecomputedDataset.__getitem__``'s legacy
-        ``_normalize_video_latents`` branch cannot misfire on it.
+        Adds a third mask source (one ``.pt`` per sample, same rel path as latents, float32
+        ``[F_lat, H_lat, W_lat]`` in {0., 1.}) under ``self.mask_dir`` — mirrors how
+        ``ICLoraStrategy`` declares its third ``reference_latents`` source. #21 finding 3:
+        ``self.mask_dir`` (config-driven, default ``"video_masks"``) replaces the old bare
+        ``"video_masks"`` literal so a configured ``inpaint_mask_dir`` is actually read, not just
+        written. The default itself deliberately does NOT contain the substring ``"latent"``, so
+        ``PrecomputedDataset.__getitem__``'s legacy ``_normalize_video_latents`` branch cannot
+        misfire on it — an operator-chosen ``mask_dir`` should follow the same convention.
         """
-        return ["latents", "conditions", "video_masks"]
+        return ["latents", "conditions", self.mask_dir]
 
     @staticmethod
     def _extract_mask(batch: Any) -> torch.Tensor:

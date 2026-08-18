@@ -183,7 +183,12 @@ def test_train_dataset_uses_config_preprocessed_root_not_hardcoded() -> None:
     """
     body = _function_body(_strip_comments_and_docstrings(_FNS.read_text(encoding="utf-8")), "train")
 
-    assert "PrecomputedDataset(config.data.preprocessed_data_root)" in body, (
+    # #21 finding 1 (strict_precomputed_pairing) added a second kwarg to this call, so the match is
+    # now whitespace-tolerant rather than an exact one-line substring — the assertion's INTENT
+    # (config.data.preprocessed_data_root, never a hardcoded path) is unchanged.
+    import re  # noqa: PLC0415
+
+    assert re.search(r"PrecomputedDataset\(\s*config\.data\.preprocessed_data_root\b", body), (
         "train() must build PrecomputedDataset from config.data.preprocessed_data_root"
     )
     assert 'PrecomputedDataset(str(DATASET_DIR / ".precomputed"))' not in body, (

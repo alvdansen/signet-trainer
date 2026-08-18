@@ -147,6 +147,7 @@ def preprocess(
     mask_column: str | None = None,
     mask_output_dir_name: str = "video_masks",
     with_audio: bool = False,
+    overwrite: bool = False,
 ) -> str:
     """Stage 1 — run the CANONICAL ``process_dataset.py`` encode, write the precomputed dir to the Volume.
 
@@ -208,6 +209,15 @@ def preprocess(
           from ``cfg.audio.with_audio`` (D-NOHARDCODE). Default False keeps every non-a2v encode
           byte-identical. The a2v ``A2VStrategy`` reads that ``audio_latents/`` source; the entrypoint
           fail-fasts an a2v config that leaves ``with_audio`` False (no silent audio-skip).
+
+    #35 step 3 — ``overwrite`` (config-driven from ``cfg.data.preprocess_overwrite``,
+    D-NOHARDCODE): the ONE operator-visible re-encode knob, threaded into BOTH the canonical
+    ``preprocess_dataset(..., overwrite=)`` call AND the signet-native
+    ``encode_mask_dataset(..., overwrite=)`` call below. Before this, both were pinned literal
+    ``overwrite=False`` with no config field and no CLI flag — the ordinary repaint-and-retry r1
+    loop (repaint a mask, re-render the polarity mp4, re-run the gated preprocess against the SAME
+    ``preprocessed_data_root``) could never re-encode; a stale mask (or stale reference/latents)
+    silently rode along. Default False keeps every existing config's encode byte-identical.
     """
     import sys
 
@@ -238,7 +248,10 @@ def preprocess(
         # flag EXISTS at signet's pinned SHA d6053703 — verified via gh; it predates the mask epoch).
         # False keeps every non-a2v encode byte-identical (audio out of scope).
         with_audio=with_audio,
-        overwrite=False,
+        # #35 step 3: config-driven (cfg.data.preprocess_overwrite), default False — the SAME
+        # literal this call pinned before the knob existed. True forces a re-encode of every
+        # already-encoded sample instead of skipping it.
+        overwrite=overwrite,
         # IC-LoRA paired reference-latent encode (07-09 / REF-03) — threaded into the CANONICAL
         # encoder, the only change (RESEARCH line 78). None => no reference encode (fresh/demo
         # default, backward-compat); "reference_path" => encode the paired seg-map clips to
@@ -283,6 +296,10 @@ def preprocess(
             # The main-media column names each sample's outputs so masks mirror the latents/ layout
             # (must match the canonical encoder's video_column above — write_manifest's schema).
             media_column="media_path",
+            # #35 step 3: the SAME overwrite knob as the canonical encode above — before this, this
+            # call never passed `overwrite` at all, so `encode_mask_dataset`'s own default (False)
+            # was UNREACHABLE from config or CLI (the #35 finding-1 hardcoded no-op).
+            overwrite=overwrite,
         )
         print(
             f"[preprocess] signet-native mask encode wrote {n_masks} latent-grid mask(s) -> "
@@ -680,7 +697,9 @@ def train(config_yaml: str) -> None:
             for name in _ic_strategy.get_data_sources()
         }
         dataset = PrecomputedDataset(
-            config.data.preprocessed_data_root, data_sources=data_sources
+            config.data.preprocessed_data_root,
+            data_sources=data_sources,
+            strict=config.data.strict_precomputed_pairing,
         )
 
         # PREFLIGHT (SC#2 / T-07-09-01): assert the paired (reference, target) latents are
@@ -704,18 +723,35 @@ def train(config_yaml: str) -> None:
         )
     elif config.conditioning.mode == "inpaint":
         # INPAINT (Phase 9, GATE-SPEC rev 2): build the 3-source PrecomputedDataset so the
-        # signet-native ``video_masks/`` load ALONGSIDE the target latents + text conditions —
-        # the same strategy-declared single-source-of-truth pattern as the ic_lora branch above
-        # (InpaintStrategy.get_data_sources() == ["latents", "conditions", "video_masks"]).
+        # signet-native mask source loads ALONGSIDE the target latents + text conditions — the
+        # same strategy-declared single-source-of-truth pattern as the ic_lora branch above
+        # (InpaintStrategy.get_data_sources() == ["latents", "conditions", inpaint_mask_dir]).
+        #
+        # #21 finding 3: ``inpaint_mask_dir`` is honored on the WRITE side (modal/entrypoint.py ->
+        # fns.preprocess) and was previously hardcoded "video_masks" here on the READ side — a
+        # non-default value validated clean at config load and was then silently ignored, so a
+        # `--mode preprocess` that wrote `.precomputed/<custom>/` either died at `--mode train` with
+        # a FileNotFoundError naming "video_masks", or (worse) silently trained on a STALE
+        # `video_masks/` left over from an earlier encode at the same geometry. Threading the
+        # configured dir name into the strategy (and keying
+        # ``_PRECOMPUTED_SOURCE_OUTPUT_KEYS`` by the fixed ROLE name "video_masks" rather than the
+        # dir name) closes the gap: write and read now agree on the same directory.
         from signet_trainer.conditioning.inpaint import InpaintStrategy  # noqa: PLC0415
 
-        _inp_strategy = InpaintStrategy(deps=None, schedule=None)
+        _mask_dir = config.conditioning.inpaint_mask_dir
+        _inp_strategy = InpaintStrategy(deps=None, schedule=None, mask_dir=_mask_dir)
         data_sources = {
-            name: _PRECOMPUTED_SOURCE_OUTPUT_KEYS[name]
-            for name in _inp_strategy.get_data_sources()
+            name: _PRECOMPUTED_SOURCE_OUTPUT_KEYS[name] for name in ("latents", "conditions")
         }
+        data_sources[_mask_dir] = _PRECOMPUTED_SOURCE_OUTPUT_KEYS["video_masks"]
+        assert list(data_sources) == list(_inp_strategy.get_data_sources()), (
+            "InpaintStrategy.get_data_sources() and the fns.py data_sources map have diverged — "
+            f"{list(_inp_strategy.get_data_sources())} vs {list(data_sources)}."
+        )
         dataset = PrecomputedDataset(
-            config.data.preprocessed_data_root, data_sources=data_sources
+            config.data.preprocessed_data_root,
+            data_sources=data_sources,
+            strict=config.data.strict_precomputed_pairing,
         )
 
         # PREFLIGHT (mirrors the ic_lora paired-reference probe): the encoded mask's latent grid
@@ -731,7 +767,7 @@ def train(config_yaml: str) -> None:
         if tuple(_mask.shape[-3:]) != _lat_grid:
             raise RuntimeError(
                 f"[train][inpaint] mask/latent grid mismatch on sample 0: mask "
-                f"{tuple(_mask.shape)} vs latent grid {_lat_grid} — the video_masks/ encode does "
+                f"{tuple(_mask.shape)} vs latent grid {_lat_grid} — the {_mask_dir}/ encode does "
                 "not match these latents (stale masks after a re-encode, or a wrong bucket). "
                 "Re-run the gated preprocess so masks + latents encode together."
             )
@@ -756,7 +792,9 @@ def train(config_yaml: str) -> None:
             for name in _a2v_strategy.get_data_sources()
         }
         dataset = PrecomputedDataset(
-            config.data.preprocessed_data_root, data_sources=data_sources
+            config.data.preprocessed_data_root,
+            data_sources=data_sources,
+            strict=config.data.strict_precomputed_pairing,
         )
 
         # PREFLIGHT (mirrors the ic_lora / inpaint probes): the audio-latent source must exist and
@@ -775,7 +813,10 @@ def train(config_yaml: str) -> None:
             "audio tokens at timestep 0, excluded from the loss)."
         )
     else:
-        dataset = PrecomputedDataset(config.data.preprocessed_data_root)
+        dataset = PrecomputedDataset(
+            config.data.preprocessed_data_root,
+            strict=config.data.strict_precomputed_pairing,
+        )
 
     # ── (7b) IC-LoRA frozen-adapter stacking (D-7-FREEZE) — stack + freeze BEFORE the optimizer ──
     # If a frozen adapter is configured, load it alongside the trainable "default" adapter, activate
@@ -4054,7 +4095,15 @@ def h3_preprocess(
                 if waveform is None
                 # D-10-DEF-12: placement is the encode helper's job, off the audio VAE's own
                 # device — not a literal written at a call site that has never executed.
-                else encode_h3_audio_latents(audio_vae, waveform, is_reference=False)
+                # #21 finding 2: pixel_frames threads the SAME target_frames the video leg uses
+                # (":3741" above) so the row-count cross-check runs against this sample's real
+                # bucket, mirroring encode_h3_video_latents's own pixel_frames cross-check.
+                else encode_h3_audio_latents(
+                    audio_vae,
+                    waveform,
+                    is_reference=False,
+                    pixel_frames=int(target_frames),
+                )
             )
             if latents is None:
                 audio_payload = h3_absent_audio_payload()
@@ -4455,7 +4504,11 @@ def h3_train(config_yaml: str) -> None:
             references_per_sample=config.h3.references_per_sample
         ).get_data_sources()
     }
-    dataset = PrecomputedDataset(config.data.preprocessed_data_root, data_sources=data_sources)
+    dataset = PrecomputedDataset(
+        config.data.preprocessed_data_root,
+        data_sources=data_sources,
+        strict=config.data.strict_precomputed_pairing,
+    )
 
     # ── (3) CPU PREFLIGHT — one real batch build BEFORE the 61.7 GiB load ───────────────────────
     # The arch widths come from models/h3_loader, which MEASURED them on live weights; the gate at
@@ -5145,6 +5198,7 @@ def h3_sample(config_yaml: str) -> None:
             name: _PRECOMPUTED_SOURCE_OUTPUT_KEYS[name]
             for name in strategy.get_data_sources()
         },
+        strict=config.data.strict_precomputed_pairing,
     )
     fixed = _h3_fixed_delta_batch(config, dataset, strategy, device, dtype)
     delta = h3_adapter_delta(adapted, fixed.packed.kwargs, fixed.packed.n_cond_video)
@@ -6266,7 +6320,11 @@ def qwen_edit_train(config_yaml: str) -> None:
     # come from the module-level tuple rather than from a constructed strategy: constructing one just
     # to read a constant would make the source list depend on the constructor's own defaults.
     data_sources = {name: _PRECOMPUTED_SOURCE_OUTPUT_KEYS[name] for name in QWEN_EDIT_DATA_SOURCES}
-    dataset = PrecomputedDataset(config.data.preprocessed_data_root, data_sources=data_sources)
+    dataset = PrecomputedDataset(
+        config.data.preprocessed_data_root,
+        data_sources=data_sources,
+        strict=config.data.strict_precomputed_pairing,
+    )
     print(
         f"[qwen_edit_train] dataset: {len(dataset)} sample(s) from "
         f"{config.data.preprocessed_data_root} over {sorted(data_sources)}."

@@ -83,6 +83,7 @@ from signet_trainer.conditioning.h3_geometry import (
     H3_FRAMES_PER_CHUNK,
     H3_LATENTS_PER_CHUNK,
     H3_PHASE10_REFERENCES_PER_SAMPLE,
+    h3_audio_rows,
     h3_latent_frames,
     reference_image_size,
     rows_of,
@@ -961,6 +962,7 @@ def encode_h3_audio_latents(
     *,
     is_reference: bool,
     seed: int = H3_KEYFRAME_ENCODE_SEED,
+    pixel_frames: int | None = None,
 ) -> torch.Tensor | None:
     """Encode a stereo waveform through the H3 audio VAE — with the OTHER posterior policy.
 
@@ -986,14 +988,32 @@ def encode_h3_audio_latents(
     unnoticed and cost its own metered container on the first campaign that targets audio. A guard
     added only where a failure has already been observed is how the same defect gets bought twice.
 
+    ⚠ **#21 finding 2 — the return shape is CHANNEL-MAJOR ROWS, not the raw posterior.** The raw
+    posterior out of ``audio_vae.encode`` carries the audio-channel axis at dim 0 (batch — stereo
+    is ``batch_size=2``, never two channels on axis 1; ``h3_vae_contract.assert_h3_audio_vae_encode_input``
+    is the refusal that names this) and the VAE's own ``EXPECTED_H3_AUDIO_IN_CHANNELS``-wide latent
+    channel axis at dim 1, time last. Every consumer instead wants ONE ROW per
+    ``(audio_channel, time)`` pair, audio-channel **slowest** —
+    ``conditioning/h3_packing.py::_fill_h3_audio_positions``'s ``time.repeat(audio_channels)`` RoPE
+    row order, and the row count ``conditioning/h3_geometry.h3_audio_rows`` prices, are both built
+    on that layout. Nothing performed this transpose before writing the cache, so the whole audio
+    arm was built on a wire format this encoder never produced — until now.
+
     Args:
         audio_vae: The H3 audio VAE.
         waveform: Stereo waveform at the VAE's rate, or ``None`` when the clip has no audio stream.
         is_reference: Selects the posterior policy. Required keyword — there is no safe default.
         seed: Fixed posterior seed (target audio only).
+        pixel_frames: Optional target-video pixel-frame count. When given, the reshaped row count
+            is cross-checked against ``h3_audio_rows(pixel_frames)`` (mirrors
+            ``encode_h3_video_latents``'s ``pixel_frames`` cross-check) so a VAE time resolution
+            that disagrees with the packed-sequence budget is caught HERE, before the cache is
+            written, rather than surfacing as a downstream shape mismatch in the CPU preflight or
+            (worse) a silently wrong row count that still happens to pack.
 
     Returns:
-        The encoded audio latents, or ``None`` when there is no audio stream.
+        The encoded audio latents as channel-major rows, ``[audio_channels * num_audio_latents,
+        EXPECTED_H3_AUDIO_IN_CHANNELS]``, or ``None`` when there is no audio stream.
     """
     if waveform is None or waveform.numel() == 0:
         logger.info(
@@ -1025,6 +1045,25 @@ def encode_h3_audio_latents(
             f"{EXPECTED_H3_AUDIO_IN_CHANNELS} (models/h3_loader.EXPECTED_H3_AUDIO_IN_CHANNELS). "
             f"The wrong audio VAE is mounted."
         )
+
+    # ⛔ #21 finding 2 (the boundary fix): raw posterior -> CHANNEL-MAJOR ROWS. ``squeeze(0)`` is a
+    # no-op on the ordinary stereo-as-batch shape (batch=2) and only fires if a caller ever hands a
+    # batch=1 waveform; ``permute(0, 2, 1)`` swaps the (channel, time) axes to (time, channel) per
+    # audio-channel block, and ``reshape(-1, EXPECTED_H3_AUDIO_IN_CHANNELS)`` flattens
+    # (audio_channel, time) into rows with audio_channel SLOWEST — exactly the row order
+    # ``_fill_h3_audio_positions`` assumes (``time.repeat(audio_channels)``).
+    latents = latents.squeeze(0).permute(0, 2, 1).reshape(-1, EXPECTED_H3_AUDIO_IN_CHANNELS)
+
+    if pixel_frames is not None:
+        expected_rows = h3_audio_rows(int(pixel_frames))
+        if latents.shape[0] != expected_rows:
+            raise RuntimeError(
+                f"[h3-encode] {pixel_frames} pixel frame(s) should produce {expected_rows} "
+                "channel-major audio row(s) (conditioning/h3_geometry.h3_audio_rows), but the "
+                f"reshaped audio latents carry {latents.shape[0]}. The audio VAE's time resolution "
+                "disagrees with the packed-sequence budget — refusing to write a mis-shaped "
+                "h3_audio_latents/ payload."
+            )
     return latents
 
 

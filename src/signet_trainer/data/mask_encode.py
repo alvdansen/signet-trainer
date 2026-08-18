@@ -368,6 +368,8 @@ def encode_mask_dataset(
                 rows.append(json.loads(line))
 
     written = 0
+    skipped_no_latent = 0
+    skipped_existing = 0
     for idx, row in enumerate(rows):
         if mask_column not in row:
             raise KeyError(
@@ -386,8 +388,14 @@ def encode_mask_dataset(
         if not latent_file.exists():
             # [canonical] :941-943 — the canonical encoder owns which samples survived; skip + warn.
             logger.warning("No target latent at %s, skipping mask %s", latent_file, row[mask_column])
+            skipped_no_latent += 1
             continue
         if not overwrite and out_file.is_file():
+            # #35 finding 1 / step 2: this is the hardcoded no-op — `overwrite` defaults False and
+            # (before #35 step 3) had no caller that ever passed True, so a repainted mask silently
+            # never re-encoded. Counted, not just skipped, so the loud summary below can name it —
+            # a bare "wrote 0" line reads as "already up to date", which is exactly the failure shape.
+            skipped_existing += 1
             continue
 
         meta = torch.load(latent_file, map_location="cpu", weights_only=True)
@@ -404,7 +412,23 @@ def encode_mask_dataset(
         _atomic_save(mask, out_file)  # BARE tensor — the GATE-SPEC contract payload (deviation #2)
         written += 1
 
-    logger.info("Mask encode complete: %d masks written to %s", written, output_path)
+    # #35 step 2 — make the skip LOUD (stdout): the package configures no logging handler (same gap
+    # #21 names for PrecomputedDataset), so `logger.info`/`logger.warning` alone never reach a Modal
+    # log. `print()` is what the Modal stages already use for anything an operator must see.
+    print(
+        f"[encode_mask_dataset] {written} mask(s) written, {skipped_existing} skipped (existing, "
+        f"overwrite={overwrite}) — pass overwrite=True to re-encode, "
+        f"{skipped_no_latent} skipped (no target latent) -> {output_path}."
+    )
+    if skipped_existing > 0 and not overwrite:
+        logger.warning(
+            "Mask encode: %d mask(s) written, %d skipped as already-existing (overwrite=False) — "
+            "pass overwrite=True to re-encode a repainted mask.",
+            written,
+            skipped_existing,
+        )
+    else:
+        logger.info("Mask encode complete: %d masks written to %s", written, output_path)
     return written
 
 
