@@ -243,6 +243,107 @@ def test_encode_mask_dataset_end_to_end(tmp_path: Path) -> None:
     )
 
 
+# ----------------------------------------------------------------------------------------------
+# #35 step 2 — the re-encode skip must be LOUD (stdout), not a bare "wrote 0" that reads as
+# "already up to date". #35 step 3 — the overwrite knob must actually reach a re-encode.
+# ----------------------------------------------------------------------------------------------
+
+
+def test_encode_mask_dataset_skip_counts_print_to_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#35 step 2: the existing-vs-no-latent skip counts print to STDOUT, named separately."""
+    import json
+
+    from signet_trainer.data.mask_encode import encode_mask_dataset
+
+    root = tmp_path
+    _write_pattern_pngs(root / "masks" / "clipA")
+    _write_latent_meta(root / ".precomputed" / "latents" / "clips" / "a.pt", 3, 2, 4)
+
+    manifest = root / "metadata.jsonl"
+    rows = [
+        {"caption": "x", "media_path": "clips/a.mp4", "video_mask": "masks/clipA"},
+        {"caption": "y", "media_path": "clips/missing.mp4", "video_mask": "masks/clipA"},
+    ]
+    manifest.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    encode_mask_dataset(
+        dataset_file=manifest,
+        mask_column="video_mask",
+        latents_dir=root / ".precomputed" / "latents",
+        output_dir=root / ".precomputed" / "video_masks",
+        media_column="media_path",
+    )
+    capsys.readouterr()  # discard pass 1's output — pass 2 is the interesting one
+
+    # Pass 2: "a" is now an EXISTING output (skipped_existing), "y" still has no latent
+    # (skipped_no_latent) — the two counts must be distinguishable in the printed line.
+    written = encode_mask_dataset(
+        dataset_file=manifest,
+        mask_column="video_mask",
+        latents_dir=root / ".precomputed" / "latents",
+        output_dir=root / ".precomputed" / "video_masks",
+        media_column="media_path",
+    )
+    assert written == 0
+    out = capsys.readouterr().out
+    assert "0 mask(s) written" in out
+    assert "1 skipped (existing" in out
+    assert "overwrite=True to re-encode" in out
+    assert "1 skipped (no target latent)" in out
+
+
+def test_encode_mask_dataset_overwrite_true_forces_reencode(tmp_path: Path) -> None:
+    """#35 step 3: overwrite=True must actually rewrite an existing mask, not just be accepted."""
+    import json
+
+    from signet_trainer.data.mask_encode import encode_mask_dataset
+
+    root = tmp_path
+    _write_pattern_pngs(root / "masks" / "clipA")
+    _write_latent_meta(root / ".precomputed" / "latents" / "clips" / "a.pt", 3, 2, 4)
+
+    manifest = root / "metadata.jsonl"
+    manifest.write_text(
+        json.dumps({"caption": "x", "media_path": "clips/a.mp4", "video_mask": "masks/clipA"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    encode_mask_dataset(
+        dataset_file=manifest,
+        mask_column="video_mask",
+        latents_dir=root / ".precomputed" / "latents",
+        output_dir=root / ".precomputed" / "video_masks",
+        media_column="media_path",
+    )
+    out_file = root / ".precomputed" / "video_masks" / "clips" / "a.pt"
+    mtime_1 = out_file.stat().st_mtime_ns
+
+    # Without overwrite: still a no-op (mirrors test_encode_mask_dataset_end_to_end).
+    written_default = encode_mask_dataset(
+        dataset_file=manifest,
+        mask_column="video_mask",
+        latents_dir=root / ".precomputed" / "latents",
+        output_dir=root / ".precomputed" / "video_masks",
+        media_column="media_path",
+    )
+    assert written_default == 0
+    assert out_file.stat().st_mtime_ns == mtime_1, "overwrite=False must not touch the file"
+
+    # overwrite=True: the #35 finding-1 knob — the SAME manifest, SAME output_dir, must re-encode.
+    written_forced = encode_mask_dataset(
+        dataset_file=manifest,
+        mask_column="video_mask",
+        latents_dir=root / ".precomputed" / "latents",
+        output_dir=root / ".precomputed" / "video_masks",
+        media_column="media_path",
+        overwrite=True,
+    )
+    assert written_forced == 1, "overwrite=True must count as WRITTEN, not skipped-existing"
+
+
 def test_encode_mask_dataset_missing_column_fails_loud(tmp_path: Path) -> None:
     """A manifest row without the mask column raises with an actionable message."""
     import json
@@ -422,4 +523,32 @@ def test_fns_registers_video_masks_source_output_key() -> None:
     code = _strip_comments_and_docstrings(_FNS.read_text(encoding="utf-8"))
     assert re.search(r'["\']video_masks["\']\s*:\s*["\']video_mask_conditions["\']', code), (
         "_PRECOMPUTED_SOURCE_OUTPUT_KEYS must register 'video_masks': 'video_mask_conditions'"
+    )
+
+
+def test_fns_preprocess_threads_overwrite_into_both_encoders() -> None:
+    """#35 step 3: preprocess(overwrite=) must reach BOTH preprocess_dataset and encode_mask_dataset.
+
+    Before this fix, ``preprocess_dataset(..., overwrite=False)`` was a hardcoded literal (no
+    config knob, no CLI flag) and ``encode_mask_dataset(...)`` never passed ``overwrite`` at all —
+    the repaint-and-retry r1 loop could never re-encode either one.
+    """
+    code = _strip_comments_and_docstrings(_FNS.read_text(encoding="utf-8"))
+
+    sig_match = re.search(r"def\s+preprocess\s*\((.*?)\)\s*->\s*str\s*:", code, flags=re.DOTALL)
+    assert sig_match is not None, "could not locate the preprocess(...) -> str signature"
+    assert re.search(r"overwrite:\s*bool\s*=\s*False", sig_match.group(1)), (
+        "preprocess(...) must accept overwrite: bool = False (backward-compatible default)"
+    )
+    def _call_window(call_name: str, window: int = 1200) -> str:
+        idx = code.index(f"{call_name}(")
+        return code[idx : idx + window]
+
+    assert re.search(r"overwrite\s*=\s*overwrite", _call_window("preprocess_dataset")), (
+        "the canonical preprocess_dataset(...) call must thread overwrite=overwrite, not a "
+        "hardcoded False"
+    )
+    assert re.search(r"overwrite\s*=\s*overwrite", _call_window("encode_mask_dataset")), (
+        "the signet-native encode_mask_dataset(...) call must thread overwrite=overwrite too — "
+        "before this fix it never passed overwrite at all"
     )

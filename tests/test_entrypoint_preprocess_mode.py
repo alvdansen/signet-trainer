@@ -100,6 +100,15 @@ def test_preprocess_arm_reads_metadata_and_output_from_config() -> None:
     )
 
 
+def test_preprocess_arm_threads_overwrite_knob() -> None:
+    """#35 step 3: the re-encode knob must reach preprocess.spawn(overwrite=cfg.data.preprocess_overwrite)."""
+    code = _entrypoint_code()
+    assert re.search(r"overwrite\s*=\s*cfg\.data\.preprocess_overwrite", code), (
+        "preprocess.spawn(...) must pass overwrite=cfg.data.preprocess_overwrite — before #35 "
+        "step 3 this was hardcoded overwrite=False with no config knob at all"
+    )
+
+
 def test_runtime_reference_fields_live_on_conditioning_not_data() -> None:
     """Load a real example YAML and prove the reference fields resolve on conditioning, not data."""
     from signet_trainer.config.load import load_config_from_text

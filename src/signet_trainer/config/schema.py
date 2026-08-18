@@ -154,6 +154,35 @@ class DataConfig(_Base):
         description="WxHxF bucket strings (enochiatron set); shape-validated at load (WR-04), "
         "parsed Modal-side to (F,H,W).",
     )
+    # #21 finding 1 — OPT-IN. ``PrecomputedDataset`` silently drops any primary-source file lacking
+    # a match in every other configured source (a partial ic_lora/reference/mask re-encode against a
+    # non-wiped output_dir, or a manual `modal volume put`), with the drop reported only through a
+    # `logger` line the package configures no handler for. Default False MUST NOT change: a legacy
+    # cache root with an operator's deliberate held-out set, or an in-progress re-encode, trains
+    # correctly today on the partial pairing — flipping this on by default would turn every one of
+    # those into a hard failure. An operator who wants the gated-run refusal opts in explicitly.
+    strict_precomputed_pairing: bool = Field(
+        default=False,
+        description="Refuse (raise) at PrecomputedDataset construction if ANY sample was dropped "
+        "for lacking a match in every configured source (skipped > 0) — the valid_count == 0 case "
+        "is ALWAYS fatal regardless of this flag. Default False (today's behavior, unchanged); set "
+        "True to make a gated Modal run refuse a silently-shrunken corpus instead of training on it.",
+    )
+    # #35 step 3 — ONE operator-visible re-encode knob, threaded end-to-end: this field ->
+    # modal/entrypoint.py's preprocess dispatch -> fns.preprocess(overwrite=) -> BOTH the upstream
+    # preprocess_dataset(..., overwrite=) and the signet-native encode_mask_dataset(..., overwrite=).
+    # Both were previously pinned literal ``overwrite=False`` with no config knob and no CLI flag —
+    # the repaint-and-retry r1 loop (repaint a mask, re-run --mode preprocess against the same
+    # preprocessed_data_root) could never re-encode. Default False keeps every existing config's
+    # encode byte-identical; an operator flips this to force a full re-encode of an unchanged
+    # manifest (e.g. after a mask repaint or a corrected reference clip).
+    preprocess_overwrite: bool = Field(
+        default=False,
+        description="Force the gated `--mode preprocess` encode to OVERWRITE already-encoded "
+        "outputs (latents/conditions/reference_latents/masks) instead of skipping them. Default "
+        "False (today's behavior — skip existing outputs, unchanged). Set True for a deliberate "
+        "full re-encode against an unchanged preprocessed_data_root (e.g. after a mask repaint).",
+    )
 
     @field_validator("batch_size")
     @classmethod

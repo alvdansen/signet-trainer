@@ -293,6 +293,44 @@ def test_no_phantom_image_cond_noise_scale():
     assert "image_cond_noise_scale" not in ConditioningConfig.model_fields
 
 
+# --------------------------------------------------------------------------------------------------
+# #21 finding 1 — DataConfig.strict_precomputed_pairing: OPT-IN, default False.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_strict_precomputed_pairing_defaults_false():
+    """Every existing config (no field set) must keep today's non-fatal partial-pairing behavior."""
+    cfg = SignetConfig.model_validate(_valid_payload())
+    assert cfg.data.strict_precomputed_pairing is False
+
+
+def test_strict_precomputed_pairing_accepts_explicit_true():
+    """An operator can opt a gated run into refusing a partial pre-encode pairing."""
+    payload = _valid_payload()
+    payload["data"]["strict_precomputed_pairing"] = True
+    cfg = SignetConfig.model_validate(payload)
+    assert cfg.data.strict_precomputed_pairing is True
+
+
+# --------------------------------------------------------------------------------------------------
+# #35 step 3 — DataConfig.preprocess_overwrite: the ONE re-encode knob, default False.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_preprocess_overwrite_defaults_false():
+    """Every existing config (no field set) must keep today's skip-existing-outputs behavior."""
+    cfg = SignetConfig.model_validate(_valid_payload())
+    assert cfg.data.preprocess_overwrite is False
+
+
+def test_preprocess_overwrite_accepts_explicit_true():
+    """An operator can opt a gated preprocess run into a full re-encode."""
+    payload = _valid_payload()
+    payload["data"]["preprocess_overwrite"] = True
+    cfg = SignetConfig.model_validate(payload)
+    assert cfg.data.preprocess_overwrite is True
+
+
 def test_single_frame_example_yaml_loads():
     # The shipped example config must load into a SignetConfig with the single-frame block wired.
     from pathlib import Path

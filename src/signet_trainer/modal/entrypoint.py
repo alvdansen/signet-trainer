@@ -1135,6 +1135,9 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             mask_column=mask_column,
             mask_output_dir_name=mask_output_dir_name,
             with_audio=with_audio,
+            # #35 step 3: the ONE operator-visible re-encode knob, config-driven (D-NOHARDCODE) —
+            # default False keeps this dispatch byte-identical to before the field existed.
+            overwrite=cfg.data.preprocess_overwrite,
         )
         _watch_dispatch(fc, cfg.modal.dispatch_watch_seconds, "preprocess")
     elif mode == "fuse":

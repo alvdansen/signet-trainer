@@ -107,6 +107,13 @@ class PrecomputedDataset(Dataset):
               "conditions": "text_conditions"}`` map.
             - a ``list[str]`` of directory names (output key == directory name).
             - a ``dict[str, str]`` mapping directory name -> output key.
+        strict: #21 finding 1, OPT-IN — default ``False`` matches every existing caller and every
+            legacy cache root byte-for-byte (a legacy cache with intentional strays trains
+            correctly today; flipping this default would silently turn every one of those into a
+            hard failure). When ``True``, refuse to construct if ANY primary-source file lacked a
+            match in every other configured source (``skipped > 0``) — not just the ``valid_count
+            == 0`` case, which is ALWAYS fatal regardless of this flag. Thread
+            ``config.data.strict_precomputed_pairing`` to opt a gated Modal run into this.
 
     Note:
         Latents are always returned non-patchified ``[C, F, H, W]``. The legacy patchified
@@ -117,12 +124,15 @@ class PrecomputedDataset(Dataset):
         self,
         data_root: str,
         data_sources: dict[str, str] | list[str] | None = None,
+        *,
+        strict: bool = False,
     ) -> None:
         super().__init__()
 
         self.data_root = self._setup_data_root(data_root)
         self.data_sources = self._normalize_data_sources(data_sources)
         self.source_paths = self._setup_source_paths()
+        self.strict = strict
         self.sample_files = self._discover_samples()
         self._validate_setup()
 
@@ -225,8 +235,19 @@ class PrecomputedDataset(Dataset):
                 valid_count += 1
 
         skipped = len(data_files) - valid_count
+        # #21 finding 1: the package configures NO logging handler anywhere (`grep -rn
+        # "basicConfig|setLevel|addHandler|dictConfig"` over src/ returns zero matches), so
+        # `logger.info`/`logger.debug` land in Python's last-resort WARNING-level handler and never
+        # reach a Modal log — a 3000-step run could train on a silently truncated corpus with no
+        # visible signal. `print()` is what the Modal stages already use for anything an operator
+        # must see (mirrors `modal/fns.py`'s own convention), so the count is STDOUT, unconditionally
+        # — not gated on `skipped > 0` — so "0 skipped" is an equally visible, equally cheap fact.
+        print(
+            f"[PrecomputedDataset] {self.data_root}: {valid_count} valid sample(s) from "
+            f"{len(data_files)} total ({skipped} skipped) over sources {list(self.data_sources)}."
+        )
         if skipped > 0:
-            logger.info(
+            logger.warning(
                 "Fast index: %d valid samples from %d total (%d skipped)",
                 valid_count,
                 len(data_files),
@@ -235,6 +256,9 @@ class PrecomputedDataset(Dataset):
         else:
             logger.debug("Fast index: %d valid samples from %d total", valid_count, len(data_files))
 
+        self._valid_count = valid_count
+        self._total_count = len(data_files)
+        self._skipped_count = skipped
         return sample_files
 
     def _get_expected_file_path(self, dir_name: str, data_file: Path, rel_path: Path) -> Path:
@@ -255,7 +279,14 @@ class PrecomputedDataset(Dataset):
             )
 
     def _validate_setup(self) -> None:
-        """Raise a clear error if no samples were paired, or counts mismatch across sources."""
+        """Raise a clear error if no samples were paired, counts mismatch, or (strict) any dropped.
+
+        #21 finding 1: ``valid_count == 0`` is hard-fatal UNCONDITIONALLY (below) — that half of
+        the guard never depended on ``strict`` and stays exactly as strict as it always was. A
+        PARTIAL pairing (``0 < skipped``) is fatal ONLY when ``self.strict`` is opted in — a legacy
+        cache root with intentional strays (an operator's deliberate held-out set, an in-progress
+        re-encode) trains correctly today, and flipping this on by default would break it.
+        """
         sample_counts = {key: len(files) for key, files in self.sample_files.items()}
         if not sample_counts or all(count == 0 for count in sample_counts.values()):
             raise ValueError(
@@ -265,6 +296,16 @@ class PrecomputedDataset(Dataset):
             )
         if len(set(sample_counts.values())) > 1:
             raise ValueError(f"Mismatched sample counts across sources: {sample_counts}")
+        if self.strict and self._skipped_count > 0:
+            raise ValueError(
+                f"strict=True (opt-in, e.g. config.data.strict_precomputed_pairing) refuses a "
+                f"partial pairing: {self._skipped_count} of {self._total_count} sample(s) in "
+                f"{self.data_root} had no matching file in every configured source "
+                f"({list(self.data_sources)}) and were dropped, leaving {self._valid_count} valid "
+                f"sample(s). Re-run the gated preprocess so every source is complete, or construct "
+                f"with strict=False (the default) to train on the {self._valid_count} paired "
+                f"sample(s) anyway."
+            )
 
     def __len__(self) -> int:
         first_key = next(iter(self.sample_files.keys()))

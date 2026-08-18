@@ -153,6 +153,74 @@ def test_mismatched_counts_raise_clear_error(tmp_path: Path) -> None:
         PrecomputedDataset(str(root))
 
 
+# --------------------------------------------------------------------------------------------------
+# #21 finding 1 — silent partial-pairing drops must be LOUD (stdout) and OPT-IN fatal (strict=).
+# --------------------------------------------------------------------------------------------------
+
+
+def test_partial_pairing_prints_valid_total_skipped_counts_to_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#21 finding 1: valid/total/skipped counts print to STDOUT — logger.info has no handler."""
+    from signet_trainer.data.precomputed import PrecomputedDataset
+
+    root = tmp_path / ".precomputed"
+    _write_latent(root / "latents" / "a.pt")
+    _write_condition(root / "conditions" / "a.pt")
+    _write_latent(root / "latents" / "b.pt")  # b has NO matching condition -> partial pairing
+
+    ds = PrecomputedDataset(str(root))  # default strict=False -> must NOT raise
+    assert len(ds) == 1
+
+    out = capsys.readouterr().out
+    assert "1 valid sample" in out
+    assert "2 total" in out
+    assert "1 skipped" in out
+
+
+def test_partial_pairing_default_strict_false_does_not_raise(tmp_path: Path) -> None:
+    """#21 finding 1: strict defaults False — a legacy cache with strays trains unchanged."""
+    from signet_trainer.data.precomputed import PrecomputedDataset
+
+    root = tmp_path / ".precomputed"
+    _write_latent(root / "latents" / "a.pt")
+    _write_condition(root / "conditions" / "a.pt")
+    _write_latent(root / "latents" / "b.pt")  # the intentional stray
+
+    ds = PrecomputedDataset(str(root))  # no strict= passed at all
+    assert ds.strict is False
+    assert len(ds) == 1
+
+
+def test_partial_pairing_strict_true_refuses_with_named_counts(tmp_path: Path) -> None:
+    """#21 finding 1: the OPT-IN strict knob turns skipped > 0 into a fatal, count-naming error."""
+    from signet_trainer.data.precomputed import PrecomputedDataset
+
+    root = tmp_path / ".precomputed"
+    _write_latent(root / "latents" / "a.pt")
+    _write_condition(root / "conditions" / "a.pt")
+    _write_latent(root / "latents" / "b.pt")
+    _write_latent(root / "latents" / "c.pt")
+
+    with pytest.raises(ValueError, match=r"strict=True") as excinfo:
+        PrecomputedDataset(str(root), strict=True)
+    message = str(excinfo.value)
+    assert "2 of 3 sample(s)" in message
+    assert "1 valid sample(s)" in message
+
+
+def test_strict_true_still_raises_on_valid_count_zero(tmp_path: Path) -> None:
+    """#21 finding 1: valid_count == 0 is fatal regardless of strict — no behavior change there."""
+    from signet_trainer.data.precomputed import PrecomputedDataset
+
+    root = tmp_path / ".precomputed"
+    _write_latent(root / "latents" / "a.pt")
+    (root / "conditions").mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(ValueError, match="(?i)no valid samples|matching"):
+        PrecomputedDataset(str(root), strict=True)
+
+
 def test_import_pulls_no_encoder() -> None:
     """Test 4 (loop-purity headline): no modal/ltx_core/ltx_trainer after import."""
     for mod in ("modal", "ltx_core", "ltx_trainer"):
