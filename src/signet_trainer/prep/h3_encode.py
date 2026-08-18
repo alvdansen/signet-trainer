@@ -72,6 +72,7 @@ deliberately are not.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -146,6 +147,7 @@ __all__ = [
     "encode_video_latents",
     "free_text_encoder",
     "h3_absent_audio_payload",
+    "h3_precomputed_complete",
     "imagenet_normalize",
     "prepare_h3_reference_images",
     "presentation_refs_from_prepared",
@@ -1620,6 +1622,53 @@ def _to_device(value: Any, model: Any) -> Any:
 # The precomputed writer.
 # --------------------------------------------------------------------------------------------------
 
+#: The four source dirs one sample's cache spans, in write order. ``h3_precomputed_complete`` and
+#: ``write_h3_precomputed`` both read THIS tuple, so "is a sample complete" can never drift from
+#: "what does a full encode write" — a fifth source added to one and not the other is the exact
+#: split-brain a resume guard must not have.
+H3_PRECOMPUTED_SOURCE_DIRS: tuple[str, ...] = (
+    H3_VIDEO_LATENTS_DIR,
+    H3_CONDITIONS_DIR,
+    H3_REFERENCE_LATENTS_DIR,
+    H3_AUDIO_LATENTS_DIR,
+)
+
+
+def _normalize_precomputed_rel(rel_path: str | Path) -> Path:
+    """Sample rel path -> the ``<rel>.pt`` every source file is named by. Shared by write + probe."""
+    rel = Path(rel_path)
+    if rel.is_absolute():
+        raise ValueError(f"rel_path must be relative to the precomputed root, got {rel}.")
+    return rel if rel.suffix == ".pt" else rel.with_suffix(".pt")
+
+
+def _atomic_save(payload: Any, destination: Path) -> None:
+    """Atomic ``torch.save`` via per-PID staging + ``replace`` (``data/mask_encode.py::_atomic_save``).
+
+    A container killed inside a bare ``torch.save`` publishes a TRUNCATED ``.pt`` at the canonical
+    name — which the completeness probes then count as a finished sample and ``PrecomputedDataset``
+    pairs into a training batch. Staging + rename makes the canonical name appear only whole. Not
+    imported from ``data/mask_encode``: that module pulls numpy at module scope, and this one is
+    pinned to torch-only imports (the CPU-gate closure test).
+    """
+    staging = destination.with_suffix(f"{destination.suffix}.tmp.{os.getpid()}")
+    torch.save(payload, staging)
+    staging.replace(destination)
+
+
+def h3_precomputed_complete(output_root: str | Path, rel_path: str | Path) -> bool:
+    """True iff ALL FOUR sources already hold a file for ``rel_path`` under ``output_root``.
+
+    The resume predicate for ``h3_preprocess``: a sample is only skippable when the whole quartet is
+    on disk, because ``PrecomputedDataset`` pairs sources by rel path and a partial write (e.g. a
+    PHASE-A-only ``h3_conditions/`` file from a container that died in PHASE B) must be re-encoded,
+    never trusted. Keyed on the same dir tuple the writer uses (mirroring
+    ``encode_mask_dataset(overwrite=False)``'s skip-if-present).
+    """
+    root = Path(output_root)
+    rel = _normalize_precomputed_rel(rel_path)
+    return all((root / dir_name / rel).is_file() for dir_name in H3_PRECOMPUTED_SOURCE_DIRS)
+
 
 def write_h3_precomputed(
     output_root: str | Path,
@@ -1653,26 +1702,18 @@ def write_h3_precomputed(
         ``{source_dir_name: written_path}`` for every payload actually written.
     """
     root = Path(output_root)
-    rel = Path(rel_path)
-    if rel.is_absolute():
-        raise ValueError(f"rel_path must be relative to the precomputed root, got {rel}.")
-    if rel.suffix != ".pt":
-        rel = rel.with_suffix(".pt")
+    rel = _normalize_precomputed_rel(rel_path)
 
     written: dict[str, Path] = {}
-    for dir_name, payload in (
-        (H3_VIDEO_LATENTS_DIR, video),
-        (H3_CONDITIONS_DIR, text),
-        (H3_REFERENCE_LATENTS_DIR, references),
-        (H3_AUDIO_LATENTS_DIR, audio),
-    ):
+    for dir_name, payload in zip(H3_PRECOMPUTED_SOURCE_DIRS, (video, text, references, audio)):
         if payload is None:
             continue
         if dir_name in (H3_VIDEO_LATENTS_DIR, H3_REFERENCE_LATENTS_DIR):
             _assert_video_latent_payload(dir_name, payload)
         destination = root / dir_name / rel
         destination.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, destination)
+        # Staged, never bare: a kill inside torch.save must not publish a truncated canonical file.
+        _atomic_save(payload, destination)
         written[dir_name] = destination
 
     logger.info("[h3-encode] wrote %d source(s) for %s -> %s", len(written), rel, root)

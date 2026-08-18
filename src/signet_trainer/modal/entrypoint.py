@@ -209,7 +209,7 @@ def _h3_encode_params(cfg: object) -> dict[str, object] | None:
     the wrong block raises ``AttributeError`` AFTER the approval pause; a named abort at this point
     still costs $0 (``.spawn()`` never fires) but it tells the operator what to fix.
 
-    ``h3_preprocess`` deliberately declares ALL 15 parameters REQUIRED with no defaults (10-10), so a
+    ``h3_preprocess`` deliberately declares ALL 17 parameters REQUIRED with no defaults (10-10), so a
     threading gap is a ``TypeError`` at dispatch rather than a silent wrong default. That contract is
     only worth anything if the supply side actually keeps up with it, which is why
     ``tests/test_h3_entrypoint_gate.py`` re-derives BOTH sides from the real signatures and diffs
@@ -258,6 +258,10 @@ def _h3_encode_params(cfg: object) -> dict[str, object] | None:
         "max_packed_rows": max_packed_rows_for_budget(
             cfg.h3.gpu_usable_gib, cfg.h3.resident_gib, cfg.h3.mib_per_packed_row
         ),
+        # cfg.h3 durability knobs (10-14): the periodic-commit window and the resume/overwrite
+        # switch — config-first so the loss-window/re-encode trade is a YAML edit, never a literal.
+        "preprocess_commit_every": cfg.h3.preprocess_commit_every,
+        "preprocess_overwrite": cfg.h3.preprocess_overwrite,
         # cfg.model — the four component DIRECTORIES under WEIGHTS_DIR (H3 IDs are dirs, not files).
         "model_id": cfg.model.model_id,
         "vae_id": cfg.model.vae_id,
@@ -1054,7 +1058,7 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         # (there is no canonical H3 encoder anywhere, so the enochiatron "never write a custom
         # encoder" landmine does not apply — 10-07). Routed by family, NOT by a new mode value.
         #
-        # Unlike the two config-text stages, ``h3_preprocess`` takes 15 REQUIRED kwargs with no
+        # Unlike the two config-text stages, ``h3_preprocess`` takes 17 REQUIRED kwargs with no
         # defaults, so the whole threading burden sits in ``_h3_encode_params`` — bound to a local
         # HERE, before the dispatch, so a field-read failure is a named abort rather than a
         # traceback out of a ``.spawn()`` expression (the 09-07 T3 burned-gate lesson).

@@ -3347,6 +3347,8 @@ def h3_preprocess(
     text_encoder_layer: int,
     with_audio: bool,
     max_packed_rows: int,
+    preprocess_commit_every: int,
+    preprocess_overwrite: bool,
     model_id: str,
     vae_id: str,
     audio_vae_id: str,
@@ -3381,9 +3383,20 @@ def h3_preprocess(
          the CODE is not (``CachedPromptEmbeddings`` / ``load_embeddings_processor`` are ltx-trainer
          objects with no H3 equivalent);
       4. PHASE B — load the video VAE (and the audio VAE when requested) and write ``h3_latents/``,
-         ``h3_reference_latents/`` and ``h3_audio_latents/``;
-      5. the LOUD-FAILURE guard — a requested output that produced ZERO files RAISES;
-      6. ``dataset_vol.commit()`` — commit-or-vanish (Pitfall 3), non-negotiable.
+         ``h3_reference_latents/`` and ``h3_audio_latents/``, committing the Volume every
+         ``preprocess_commit_every`` samples so a mid-corpus death loses a bounded window;
+      5. ``dataset_vol.commit()`` — commit-or-vanish (Pitfall 3), non-negotiable, and BEFORE the
+         guards below: a refused report must never destroy the encode that succeeded;
+      6. the LOUD-FAILURE guard — a requested output that produced ZERO files RAISES (it refuses
+         the SUCCESS REPORT, never the committed data).
+
+    Durability (10-14): both loops skip a sample whose FOUR source files are already on disk
+    (``h3_precomputed_complete``, ``preprocess_overwrite=False``), so a re-dispatch after a raise or
+    a preemption CONTINUES instead of re-paying the whole Qwen3-VL-32B pass — five containers once
+    died at the top of an 88-sample encode, each after PHASE A had pushed the entire corpus through
+    the 32B encoder with nothing committed. The write itself is staged + renamed
+    (``prep/h3_encode._atomic_save``), so a kill mid-``torch.save`` can never publish a truncated
+    ``.pt`` for the resume guard (or ``PrecomputedDataset``) to trust.
 
     Reference slots: EXACTLY ``references_per_sample`` per sample. An environment-bearing sample
     gets one rotating character reference plus the environment reference, which SUBSTITUTES for the
@@ -3441,6 +3454,7 @@ def h3_preprocess(
         encode_h3_video_latents,
         free_text_encoder,
         h3_absent_audio_payload,
+        h3_precomputed_complete,
         h3_vae_smoke_encode,
         prepare_h3_reference_images,
         presentation_refs_from_prepared,
@@ -3484,6 +3498,24 @@ def h3_preprocess(
 
     rows = _h3_manifest_rows(metadata_path)
     data_root = Path(metadata_path).parent
+    # The RESUME SET (10-14), decided once and shared by BOTH phase loops so they can never disagree
+    # about which samples this dispatch owns. A sample is skippable only when its whole quartet is on
+    # disk (h3_precomputed_complete) — a PHASE-A-only h3_conditions/ file from a container that died
+    # in PHASE B is re-encoded, never trusted. h3.preprocess_overwrite=True forces a full re-encode
+    # (required after any recipe change: the skipped files are trusted as-is).
+    resumed: set[str] = set()
+    if not preprocess_overwrite:
+        resumed = {
+            str(_h3_output_rel(row["media_path"]))
+            for row in rows
+            if h3_precomputed_complete(output_dir, _h3_output_rel(row["media_path"]))
+        }
+    if resumed:
+        print(
+            f"[h3_preprocess] resume: {len(resumed)}/{len(rows)} sample(s) already hold all four "
+            f"sources under {output_dir} and will be SKIPPED in both phases "
+            "(h3.preprocess_overwrite=false)."
+        )
     canvas_height, canvas_width = resolve_canvas_size(*target_aspect)
     n_target_video = h3_latent_frames(int(target_frames)) * rows_of(canvas_height, canvas_width)
     n_target_audio = h3_audio_rows(int(target_frames))
@@ -3580,6 +3612,8 @@ def h3_preprocess(
     per_sample: dict[str, dict] = {}
     for index, row in enumerate(rows):
         rel = _h3_output_rel(row["media_path"])
+        if str(rel) in resumed:
+            continue  # quartet-complete on disk — this dispatch re-pays nothing for it
         # NO-REFERENCE: nothing to resolve — the manifest needs no reference keys, and
         # _h3_resolve_references would (rightly) refuse a reference-less Ref2VA row.
         references = (
@@ -3705,8 +3739,23 @@ def h3_preprocess(
             )
 
     audio_present = 0
+    encoded_since_commit = 0
     for index, row in enumerate(rows):
         rel = _h3_output_rel(row["media_path"])
+        if str(rel) in resumed:
+            # Skipped in PHASE A too (same set, same predicate), so per_sample has no entry. The
+            # audio tail guard below judges the whole CACHE, not just this dispatch — count the
+            # cached leg's real latents (the absent marker is an explicit {"present": False} dict)
+            # so a fully-resumed re-dispatch of an audio-bearing corpus is not a false demux alarm.
+            if with_audio:
+                cached_audio = torch.load(
+                    Path(output_dir) / H3_AUDIO_LATENTS_DIR / rel,
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                if not (isinstance(cached_audio, dict) and cached_audio.get("present") is False):
+                    audio_present += 1
+            continue
         meta = per_sample[str(rel)]
         media = data_root / row["media_path"]
 
@@ -3790,19 +3839,13 @@ def h3_preprocess(
                 audio_payload = latents
                 audio_present += 1
 
-        write_h3_precomputed(
-            output_dir,
-            rel,
-            video=video_payload,
-            references=reference_payload,
-            audio=audio_payload,
-        )
-
         # REALIZED packed rows, from what was actually encoded. The config-load budget check prices
         # the worst-case pair from declared source sizes; this is the belt-and-braces sibling that
         # knows the true tokenized text length and the true encoded reference grids. NO-REFERENCE
         # contributes zero reference rows — the each-image-bills-TWICE rule removes BOTH sides
-        # (no vision tokens in text_rows, no ref latent rows here).
+        # (no vision tokens in text_rows, no ref latent rows here). It fires BEFORE the write
+        # (10-14): an over-ceiling sample must never land on disk, where the resume guard would
+        # trust its quartet on the next dispatch and ship the OOM to training after all.
         realized_ref_rows = (
             []
             if reference_payload is None
@@ -3817,8 +3860,17 @@ def h3_preprocess(
                 f"ceiling of {max_packed_rows} by {realized - max_packed_rows}. Encoding it would "
                 f"cache a sample that OOMs the training container. Lower "
                 f"reference_image_short_edge (currently {reference_image_short_edge}) or "
-                f"target_frames, or escalate the GPU — aborting at the cheap step."
+                f"target_frames, or escalate the GPU -- aborting at the cheap step, nothing cached "
+                f"for this sample."
             )
+
+        write_h3_precomputed(
+            output_dir,
+            rel,
+            video=video_payload,
+            references=reference_payload,
+            audio=audio_payload,
+        )
         print(
             f"[h3_preprocess]   {rel}: {realized}/{max_packed_rows} packed rows "
             f"(text {meta['text_rows']}, refs {realized_ref_rows}, "
@@ -3826,7 +3878,22 @@ def h3_preprocess(
         )
         del video_payload, reference_payload, audio_payload
 
-    # ── (5) LOUD-FAILURE guard — a requested output that produced ZERO files RAISES ───────────────
+        # Bound the loss window (h3.preprocess_commit_every, 10-14): every committed quartet
+        # survives a container death, and the resume set above turns the re-dispatch into a
+        # continuation instead of a full re-pay of the Qwen3-VL-32B pass.
+        encoded_since_commit += 1
+        if encoded_since_commit >= preprocess_commit_every:
+            dataset_vol.commit()
+            encoded_since_commit = 0
+
+    # ── (5) Pitfall 3 commit-or-vanish: without commit() the whole encode is lost on container exit
+    # and `modal volume ls signe-trainer-dataset` would show nothing. The commit comes BEFORE the
+    # loud-failure guards below (10-14): they exist to stop a FALSE SUCCESS REPORT, not to destroy
+    # the encode that succeeded — sat after them, a with_audio corpus that yielded zero streams
+    # threw a fully successful video+text encode away along with the report.
+    dataset_vol.commit()
+
+    # ── (6) LOUD-FAILURE guard — a requested output that produced ZERO files RAISES ───────────────
     # Copied from the a2v guard (fns.py:210-226) and it exists for the same reason: a swallowed
     # exception once produced a "successful" encode with an empty dir, and the run only failed much
     # later (or worse, trained without the conditioning it was supposed to have).
@@ -3864,12 +3931,8 @@ def h3_preprocess(
             "stream, so h3_audio_latents/ holds only absent-markers. Either the corpus genuinely "
             "has no audio (0 of 44 measured — D-10-AUDIO; then run with with_audio=False) or the "
             "demux is silently failing. Refusing to report a successful audio encode without "
-            "audio."
+            "audio (the encode itself is already committed -- a re-dispatch resumes, not re-pays)."
         )
-
-    # ── (6) Pitfall 3 commit-or-vanish: without commit() the whole encode is lost on container exit
-    # and `modal volume ls signe-trainer-dataset` would show nothing.
-    dataset_vol.commit()
 
     print(
         f"[h3_preprocess] committed {sum(counts.values())} file(s) across "

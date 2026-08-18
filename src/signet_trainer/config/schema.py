@@ -423,6 +423,34 @@ class H3Config(_Base):
         "exactly the failure H3-04 exists to prevent.",
     )
 
+    # ── PREPROCESS-side durability knobs (h3_preprocess only) ─────────────────────────────────────
+    # The pre-encode pushes the whole corpus through Qwen3-VL-32B (PHASE A) before the VAEs run
+    # (PHASE B), so a raise or a preemption late in PHASE B used to discard hours of paid encoder
+    # work: the only commit sat at the very end, and a re-dispatch started at row 0. These two knobs
+    # are the resume contract — periodic commits bound the loss window, skip-if-present makes a
+    # re-dispatch continue instead of re-pay.
+    preprocess_commit_every: int = Field(
+        default=8,
+        ge=1,
+        description="Commit the dataset Volume after every N samples PHASE B completes, so a "
+        "container death mid-corpus loses at most N samples' work instead of the entire "
+        "Qwen3-VL-32B pass (the documented five-containers-died-at-the-top loss, fns.py). Default 8 "
+        "bounds the re-pay window to minutes; 1 is maximally durable but pays a Volume commit per "
+        "sample, larger values amortize the commit latency across more samples at risk.",
+    )
+    preprocess_overwrite: bool = Field(
+        default=False,
+        description="Re-encode samples whose FOUR source files (h3_latents / h3_conditions / "
+        "h3_reference_latents / h3_audio_latents) already exist under the output root. Default "
+        "False = resume: a re-dispatch skips quartet-complete samples and only pays for what the "
+        "previous container never finished (mirroring encode_mask_dataset's overwrite=False). "
+        "WARNING: resume assumes the SAME recipe wrote the cache -- after changing anything that "
+        "alters the "
+        "encode (reference_image_short_edge, target frames/aspect, the reference set), set this "
+        "True or point data.preprocessed_data_root at a fresh directory, because a skipped sample "
+        "is trusted as-is.",
+    )
+
     # ── RENDER-side knobs (h3_sample only) ────────────────────────────────────────────────────────
     # These live on the h3 block rather than on `validation` on purpose. `validation` is shared with
     # the LTX family, and the LTX `sample` path consumes none of them — a field there would be
