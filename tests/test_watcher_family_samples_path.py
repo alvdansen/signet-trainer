@@ -230,6 +230,34 @@ def test_watcher_progress_probe_exists_and_is_finer_than_landed():
     assert '"base"' in body and '"lora"' in body
 
 
+def test_watcher_progress_probe_carries_the_widened_geometry_axes():
+    # Restack reconciliation (fix/h3-sample-base-dedup onto fix/watcher-stall-clock): the progress
+    # probe keys the LORA half on expected_h3_render_key exactly like render_landed does, so it must
+    # carry the same widened geometry axes — a probe still keyed on the pre-#22-finding-5 signature
+    # would silently watch the wrong (stale-geometry) directory for new clips.
+    body = _watcher_src().split("def render_progress_artifacts")[1].split("\ndef ")[0]
+    for axis in ("width=", "height=", "num_inference_steps="):
+        assert axis in body, f"render_progress_artifacts's expected_h3_render_key call is missing {axis!r}"
+
+
+def test_watcher_progress_probe_composes_the_base_path_outside_the_render_dir():
+    # Sibling-collision reconciliation (verify_c.json MAJOR finding): the base column now lives at
+    # SAMPLES_ROOT/base/<base key>/, a SIBLING of the checkpoint-keyed render dir (#12) — the probe
+    # must read that shared location for "base", never descend into f"{render_dir}/base" (which the
+    # base-dedup relocation left permanently empty). The "lora" half stays checkpoint-scoped.
+    body = _watcher_src().split("def render_progress_artifacts")[1].split("\ndef ")[0]
+    assert 'f"{render_dir}/base"' not in body, (
+        "the base column no longer lives under the checkpoint-scoped render_dir — reading it there "
+        "silently sees zero progress for the whole base phase of a fresh-geometry render"
+    )
+    assert "expected_h3_base_render_key(" in body
+    assert 'f"{SAMPLES_ROOT}/base/{base_key}"' in body, (
+        "the base descent must be composed from SAMPLES_ROOT (a sibling of the render dir), not the "
+        "checkpoint-scoped render_dir"
+    )
+    assert 'f"{render_dir}/lora"' in body, "the lora column stays checkpoint-scoped"
+
+
 def test_watcher_grid_refresh_uses_gridwatch_driver_for_h3():
     # finetune-gridwatch is the ONLY sanctioned grid builder; the H3 branch delegates to the
     # first-party incremental driver rather than re-staging by hand.
