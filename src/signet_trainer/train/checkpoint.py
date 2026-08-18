@@ -180,6 +180,21 @@ class CheckpointManager:
                 return candidate
         return None
 
+    def latest_step(self) -> int | None:
+        """The step of the highest-step COMPLETE checkpoint, or ``None`` on a cold start.
+
+        A cheap filesystem-only read (no model, no ``torch.load`` of ``training_state.pt``) — for
+        callers that only need "how far did this run actually get" without paying to construct a
+        model first. Added for the AUDIT #34 direction 7 acceptance-failed marker (h3_train):
+        checking whether a checkpoint has advanced past the step a zero-delta verdict was recorded
+        at is exactly this question.
+        """
+        latest = self.find_latest()
+        if latest is None:
+            return None
+        match = _STEP_RE.match(latest.name)
+        return int(match.group(1)) if match else None
+
     def prune(self, keep_n: int) -> None:
         """Delete all but the ``keep_n`` most-recent checkpoints (no-op when ``keep_n <= 0``)."""
         if keep_n <= 0:

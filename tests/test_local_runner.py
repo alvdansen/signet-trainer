@@ -168,6 +168,39 @@ def test_local_package_never_imports_modal():
         assert ".spawn(" not in stripped and ".remote(" not in stripped, py.name
 
 
+# ---- AUDIT #34 direction 2 belt-and-braces: gate_adapter.lora_dropout must match config ---------
+
+
+def test_run_asserts_gate_adapter_dropout_matches_config_before_reuse():
+    """Mirrors the Modal ``train()`` assertion in ``modal/fns.py``: on the Open-Q1 default path
+    ``run()`` reuses ``gate_adapter`` (the gate's check #5 adapter) as the training model without
+    re-injecting it, so a future drift between the gate's build and this reuse site must abort
+    BEFORE the training loop starts rather than silently train at the wrong dropout — the exact
+    #34 defect, guarded against recurring.
+    """
+    import inspect
+
+    from signet_trainer.local import runner as runner_mod
+
+    src = inspect.getsource(runner_mod.run)
+    stripped = re.sub(r'"""(?:.|\n)*?"""', "", src)
+    stripped = re.sub(r"#.*", "", stripped)
+
+    assert "gate_adapter" in stripped and "lora_dropout" in stripped and "config.lora.dropout" in stripped
+    assert re.search(
+        r"lora_dropout(?:.|\n)*?!=(?:.|\n)*?config\.lora\.dropout"
+        r"|config\.lora\.dropout(?:.|\n)*?!=(?:.|\n)*?lora_dropout",
+        stripped,
+    ), "run() must compare gate_adapter's lora_dropout against config.lora.dropout"
+    dropout_idx = stripped.index("lora_dropout")
+    reuse_idx = stripped.index("model = gate_adapter")
+    assert dropout_idx < reuse_idx, (
+        "the dropout consistency assertion must run BEFORE `model = gate_adapter` reuses the "
+        "adapter, not after"
+    )
+    assert "RuntimeError" in stripped[dropout_idx : reuse_idx + 50]
+
+
 def test_refused_run_never_reaches_torch(tmp_path, capsys, monkeypatch):
     # A refused config must exit BEFORE the heavy-import boundary: simulate torch being broken —
     # a refusal path that imports it would blow up instead of returning EXIT_REFUSED.

@@ -562,6 +562,17 @@ def train(config_yaml: str) -> None:
                 "[train] validation gate passed but returned no injected adapter — expected the "
                 "check #5 PEFT model to reuse on the Open-Q1 default path (03-07 double-inject fix)."
             )
+        # AUDIT #34 direction 2 belt-and-braces — the gate's check #5 built this adapter's dropout
+        # from config.lora.dropout too (validate_gate.check_training_step); assert the two agree
+        # BEFORE spending the training GPU, so a future drift between the gate's build and this
+        # reuse site is a pre-spend abort, not a silent train-at-the-wrong-dropout repeat of #34.
+        gate_dropout = gate_adapter.peft_config["default"].lora_dropout
+        if gate_dropout != config.lora.dropout:
+            raise RuntimeError(
+                f"[train] gate_adapter.lora_dropout ({gate_dropout}) != config.lora.dropout "
+                f"({config.lora.dropout}) — the reused adapter does not match the approved config; "
+                "aborting before the training loop starts (AUDIT #34 direction 2)."
+            )
         model = gate_adapter
         model.zero_grad(set_to_none=True)  # clear the gate's check #5 backward grads before training
 
@@ -3940,6 +3951,72 @@ def h3_adapter_delta(model: Any, batch_kwargs: dict, n_cond_video: int) -> float
             model.train()
 
 
+# AUDIT #34 direction 7 — the on-Volume marker ``h3_train`` writes when its zero-delta acceptance
+# check (below) fires, so a Modal-driven retry of the SAME deterministic failure can re-raise
+# BEFORE paying for the 61.7 GiB load instead of reproducing it eleven times. Deliberately NOT a
+# change to the ``max_retries=10`` preemption contract (fns.py h3_train decorator) or to the raise
+# itself (``tests/test_h3_train_wiring.py::test_a_zero_adapter_delta_raises`` pins that
+# deliberately) — only the retry's COST changes.
+#
+# The KEY (what makes the marker still describe the current state vs. a stale prior verdict) lives
+# in ``train/acceptance_marker.py`` — stdlib-only, its own tests, imported here function-local —
+# for the same reason ``inference/render_key.py`` does not live in this file either: a test that
+# had to import ``modal/fns.py`` to reach it would drag ``modal`` into ``sys.modules`` for the
+# whole pytest session. These two helpers own only the Volume PLUMBING (commit/reload + the
+# CheckpointManager read) around that key.
+
+
+def _h3_write_acceptance_failed_marker(config: Any, *, step: int, delta: float) -> None:
+    """Commit a marker recording the zero-delta verdict at ``step`` BEFORE the caller raises.
+
+    Written and the Volume committed BEFORE the RuntimeError propagates, so a fresh retry
+    container (``single_use_containers=True``) sees it on entry via ``_h3_check_acceptance_marker``.
+    """
+    from signet_trainer.train.acceptance_marker import write_acceptance_failed_marker  # noqa: PLC0415
+
+    write_acceptance_failed_marker(CHECKPOINTS_DIR / config.output_dir, step=step, delta=delta)
+    checkpoints_vol.commit()
+
+
+def _h3_check_acceptance_marker(config: Any) -> None:
+    """Re-raise a PRIOR zero-delta verdict immediately if nothing has trained since — BEFORE the
+    61.7 GiB weight load (h3_train step (2b), called right after config revalidation).
+
+    A stale marker (the latest checkpoint has advanced past the recorded step — real training
+    happened, so this is a legitimate new attempt) is cleared rather than honoured; see
+    ``train/acceptance_marker.py`` for the scoping rules this enforces.
+    """
+    from signet_trainer.train.acceptance_marker import (  # noqa: PLC0415
+        acceptance_marker_is_current,
+        clear_acceptance_failed_marker,
+        marker_path,
+        read_acceptance_failed_marker,
+    )
+    from signet_trainer.train.checkpoint import CheckpointManager  # noqa: PLC0415
+
+    run_dir = CHECKPOINTS_DIR / config.output_dir
+    recorded = read_acceptance_failed_marker(run_dir)
+    if recorded is None:
+        return
+
+    current_step = CheckpointManager(run_dir).latest_step()
+    if acceptance_marker_is_current(recorded["step"], current_step):
+        raise RuntimeError(
+            f"[h3_train] acceptance-failed marker at {marker_path(run_dir)} — a prior life "
+            f"already measured max|delta velocity| == 0.0 at step {recorded['step']} (recorded "
+            f"delta={recorded['delta']!r}) and the latest checkpoint is STILL that step, so "
+            "nothing has trained since. Re-raising WITHOUT re-loading the 61.7 GiB model (AUDIT "
+            "#34 direction 7) — this retry still reports FAILED, it just costs a container boot "
+            "instead of a full load. Delete the marker to force a genuine re-measurement."
+        )
+
+    # Stale: the latest checkpoint has moved past (or off of) the recorded step, so real training
+    # happened since the marker was written — a legitimate new attempt. Clear it so it can never
+    # wrongly block this run (or a future one that happens to pass through the same step again).
+    clear_acceptance_failed_marker(run_dir)
+    checkpoints_vol.commit()
+
+
 @app.function(
     # Same H3 family image + memory request as ``h3_preprocess``: diffusers at the pinned
     # DIFFUSERS_SHA, NOT the LTX ltx-core/ltx-trainer stack, and the 80 GiB RAM the P10-1 probe
@@ -4118,6 +4195,13 @@ def h3_train(config_yaml: str) -> None:
             "[h3_train] H3 NO-REFERENCE TRAINING IS ALPHA - smoke-tested only, no end-to-end run "
             "exists; file issues"
         )
+
+    # ── (2b) AUDIT #34 direction 7 — the acceptance-failed marker, checked BEFORE the 61.7 GiB
+    # load. Cheap (filesystem-only): if a prior life already proved this exact retry will
+    # reproduce the identical zero-delta verdict, re-raise now instead of paying for the load,
+    # the CPU preflight, and the whole training loop to re-derive a verdict already on record.
+    checkpoints_vol.reload()  # reload-before-read: see everything committed before checking.
+    _h3_check_acceptance_marker(config)
 
     device = "cuda"
     checkpoint_path = str(WEIGHTS_DIR / config.model.model_id)
@@ -4335,6 +4419,12 @@ def h3_train(config_yaml: str) -> None:
         f"value is attributable to the optimizer steps and nothing else)."
     )
     if delta == 0.0:
+        # AUDIT #34 direction 7 — commit the acceptance-failed marker BEFORE raising, so a
+        # Modal-driven retry (single_use_containers=True — a FRESH container) can see it via
+        # _h3_check_acceptance_marker at step (2b) and re-raise WITHOUT paying for another 61.7 GiB
+        # load. The raise itself is untouched (test_a_zero_adapter_delta_raises pins it
+        # deliberately) — only the retry's cost changes.
+        _h3_write_acceptance_failed_marker(config, step=final_step, delta=delta)
         raise RuntimeError(
             f"[h3_train] the trained adapter did NOT change the model output (max|delta velocity| "
             f"== 0.0 after {final_step} step(s)). D-10-SCOPEGUARD's acceptance criterion is that "

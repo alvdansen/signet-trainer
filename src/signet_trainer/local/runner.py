@@ -309,6 +309,16 @@ def run(
                 "[signet-local] validation gate passed but returned no injected adapter -- "
                 "expected the check #5 PEFT model to reuse (03-07 double-inject fix)."
             )
+        # AUDIT #34 direction 2 belt-and-braces -- mirrors the Modal train() assertion: the gate's
+        # check #5 built this adapter's dropout from config.lora.dropout too, so assert the two
+        # agree before the training loop starts rather than silently training at the wrong dropout.
+        gate_dropout = gate_adapter.peft_config["default"].lora_dropout
+        if gate_dropout != config.lora.dropout:
+            raise RuntimeError(
+                f"[signet-local] gate_adapter.lora_dropout ({gate_dropout}) != config.lora.dropout "
+                f"({config.lora.dropout}) -- the reused adapter does not match the approved config; "
+                "aborting before the training loop starts (AUDIT #34 direction 2)."
+            )
         model = gate_adapter
         model.zero_grad(set_to_none=True)
 
