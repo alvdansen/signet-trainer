@@ -28,8 +28,8 @@ needs a heavy backend, import it **function-locally**, not at module scope.
 
 ## Running the tests — what is expected to fail
 
-`python -m pytest` is **not green on a fresh clone** of this beta: expect roughly **48 failed,
-~1890 passed, 27 skipped**. Every failure falls into one of the known buckets below. If you hit
+`python -m pytest` is **not green on a fresh clone** of this beta: expect roughly **51 failed,
+2345 passed, 49 skipped**. Every failure falls into one of the known buckets below. If you hit
 something outside them, that is a real bug.
 
 ### 1. Tests that lint the private house-memory scaffold — these SKIP, they do not fail

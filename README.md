@@ -316,9 +316,9 @@ tracked in issue #45):
   times out. Watch long metered runs; do not fire-and-forget under a tight budget.
 
 `python -m pytest` is **not** green out of the box, for reasons that are known rather than
-mysterious. Expect roughly **48 failed, ~1890 passed, 27 skipped**, in three groups:
+mysterious. Expect roughly **40 failed, ~2766 passed, 51 skipped**, in three groups:
 
-- **~31 — the H3 parity suites.** They deliberately refuse to skip: they must execute against
+- **~33 — the H3 parity suites.** They deliberately refuse to skip: they must execute against
   `transformers`/`diffusers` at the exact pinned version, in a separate overlay interpreter, or the
   check would pass while the real dispatch failed. Bootstrap it once with the two commands the
   failure message prints, or leave them red. A few in this group are regression checks pinned to
@@ -330,7 +330,7 @@ mysterious. Expect roughly **48 failed, ~1890 passed, 27 skipped**, in three gro
   render-dispatch timeout exemption, the `CAP_STOP_EXIT` contract, the heartbeat touch) run against
   the SHIPPED `scripts/watch_parallel_inference.py` and are green — issue #19 item 1 stopped the
   unpublished fork's absence from masking that result.
-- **27 skipped (not failed) — the house-memory scaffold lints.** Some tests lint a project-private
+- **51 skipped (not failed) — mostly the house-memory scaffold lints.** Some tests lint a project-private
   memory scaffold under `.planning/harness/` (`DECISION-LOG.md`, `KNOWLEDGE.md`, `SESSION-STATE.json`,
   campaign cards). That directory holds live per-project run history and is deliberately not
   published, so those tests skip with a reason instead of failing.
