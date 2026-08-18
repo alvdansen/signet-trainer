@@ -19,22 +19,27 @@ Zero GPU / zero Modal / zero spend — pure string functions and a source scan.
 
 from __future__ import annotations
 
+import importlib.util
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 from signet_trainer.inference.render_key import h3_render_key
 from signet_trainer.inference.samples_layout import (
+    STEP_KEYED_LTX_MODES,
     committed_clip_names,
     expected_h3_render_key,
     landed_render_ids,
+    layout_mode,
     samples_root,
     samples_subdir,
 )
 
 REPO = Path(__file__).resolve().parents[1]
 WATCHER = REPO / "scripts" / "watch_parallel_inference.py"
+SAMPLE_CONFIG = REPO / "configs" / "sample.yaml"
 
 
 # ---- the layout table itself ----------------------------------------------------------------
@@ -60,6 +65,48 @@ def test_unknown_family_raises_never_defaults_to_ltx():
     # hole would be re-opened for the next family, and the symptom is spend, not an exception.
     with pytest.raises(ValueError, match="unknown model family"):
         samples_subdir("wan")
+
+
+# ---- LTX is MODE-aware too, not just family-aware (issue #45 PR-4) ----------------------------
+
+
+def test_ltx_default_mode_is_unchanged_without_a_mode_argument():
+    # Every call site that predates PR-4 (and every non-LTX family, which has no mode axis) omits
+    # `mode` entirely — it must keep resolving to the historical "samples" answer.
+    assert samples_subdir("ltx") == "samples"
+    assert samples_subdir("ltx", None) == "samples"
+    assert samples_subdir("ltx", "none") == "samples"
+    assert samples_root("outputs/embe_r1", "ltx") == "outputs/embe_r1/samples"
+
+
+def test_ltx_non_default_modes_resolve_their_own_root():
+    # Transcribed from modal/fns.py's per-mode sample() branches — the whole point of PR-4: family
+    # alone picks "samples" for ALL of these, which is the wrong directory for every one of them.
+    assert samples_subdir("ltx", "inpaint") == "samples_inpaint"
+    assert samples_subdir("ltx", "audio_to_video") == "samples_a2v"
+    assert samples_subdir("ltx", "single_frame") == "samples_single_frame"
+    assert samples_subdir("ltx", "multi_frame") == "samples_multi_frame"
+    assert samples_subdir("ltx", "ic_lora") == "samples_ic_lora"
+    assert samples_subdir("ltx", "ic_lora_baseline") == "samples_ic_lora_baseline"
+    assert samples_root("outputs/x", "ltx", "inpaint") == "outputs/x/samples_inpaint"
+
+
+def test_mode_is_ignored_for_non_ltx_families():
+    # H3/qwen_edit have no mode axis; passing one (e.g. a stray default) must never redirect them.
+    assert samples_subdir("h3", "inpaint") == "samples_h3"
+    assert samples_subdir("qwen_edit", "inpaint") == "samples_qwen_edit"
+
+
+def test_layout_mode_splits_ic_lora_on_two_stage_upscale():
+    # modal/fns.py's own dispatch: conditioning.mode == "ic_lora" + two_stage_upscale picks the
+    # SEPARATELY-GATED ic_lora_baseline branch, not the single-stage ic_lora one. layout_mode must
+    # reproduce this exactly or the watcher and the render key on different identities.
+    assert layout_mode(conditioning_mode="ic_lora", two_stage_upscale=False) == "ic_lora"
+    assert layout_mode(conditioning_mode="ic_lora", two_stage_upscale=True) == "ic_lora_baseline"
+    # every other mode is untouched by two_stage_upscale (single_frame/multi_frame ban it outright;
+    # mode "none" doesn't gate on it here).
+    assert layout_mode(conditioning_mode="single_frame", two_stage_upscale=True) == "single_frame"
+    assert layout_mode(conditioning_mode="none", two_stage_upscale=False) == "none"
 
 
 # ---- landed-render detection, per family ------------------------------------------------------
@@ -89,6 +136,71 @@ def test_h3_landed_ids_are_identity_keys_not_stamps():
     # An H3 listing carries NO wall-clock stamp; the old regex would have returned [] here, which is
     # exactly the "render never landed" mis-read that caused the re-dispatch loop.
     assert not re.search(r"\d{8}T\d{6}Z", _H3_LISTING)
+
+
+# ---- STEP-KEYED LTX modes: inpaint / audio_to_video (issue #45 PR-4) ---------------------------
+#
+# modal/fns.py's inpaint/a2v branches write a STABLE `<stem>` dir (named after the held-out test
+# clip) that every dispatched checkpoint adds ONE `step_<N>.mp4` file into — never a fresh
+# UTC-stamped dir per render. A stem-only id would make step 600 and step 1200 the identical
+# render the moment the FIRST one committed (the verifier's finding against the original fix);
+# `landed_render_ids` must return the STEP-BEARING id `"<stem>/step_<N>"` instead.
+
+_LTX_INPAINT_LISTING = (
+    "outputs/embe_inpaint_r1/samples_inpaint/clip_a\n"
+    "outputs/embe_inpaint_r1/samples_inpaint/clip_b\n"
+    "outputs/embe_inpaint_r1/samples_inpaint/clip_a/input.mp4\n"
+    "outputs/embe_inpaint_r1/samples_inpaint/clip_a/step_0.mp4\n"
+    "outputs/embe_inpaint_r1/samples_inpaint/clip_a/step_600.mp4\n"
+    "outputs/embe_inpaint_r1/samples_inpaint/clip_b/step_600.mp4\n"
+)
+
+
+def test_ltx_step_keyed_modes_land_as_stem_dirs_not_stamps():
+    ids = landed_render_ids(_LTX_INPAINT_LISTING, "ltx", "inpaint")
+    assert ids == ["clip_a/step_0", "clip_a/step_600", "clip_b/step_600"]
+    # STEM-anchored, never wall-clock-anchored — the family/mode contrast this test is named for.
+    assert not any(re.search(r"\d{8}T\d{6}Z", i) for i in ids)
+    # the staged raw input clip (never a render) must never be mistaken for a landed step.
+    assert not any("input" in i for i in ids)
+
+
+def test_ltx_step_keyed_deep_listing_resolves_to_the_stem():
+    # `modal volume ls` has no recursive flag (confirmed against the real CLI) — SAMPLES_ROOT's own
+    # one-level listing shows only the bare STEM dir, carrying no render identity by itself.
+    stems_only = "outputs/x/samples_a2v/interview_clip\n"
+    assert landed_render_ids(stems_only, "ltx", "audio_to_video") == []
+    # once the caller folds in that stem's OWN listing (committed_render_stamps' per-stem probe),
+    # the deeper path resolves DOWN to stem + step regardless of how many segments came before it.
+    deep = stems_only + "outputs/x/samples_a2v/interview_clip/step_1200.mp4\n"
+    assert landed_render_ids(deep, "ltx", "audio_to_video") == ["interview_clip/step_1200"]
+
+
+def test_ltx_step_keyed_ids_distinguish_cadence_boundaries():
+    # The exact bug a stem-only id let through: two renders at DIFFERENT steps into the SAME stem
+    # dirs must never collapse to one identity, or a step-1200 render would read as already landed
+    # the moment step-600 committed.
+    at_step_600 = (
+        "outputs/x/samples_inpaint/clip_a/step_600.mp4\n"
+        "outputs/x/samples_inpaint/clip_b/step_600.mp4\n"
+    )
+    at_step_1200 = (
+        "outputs/x/samples_inpaint/clip_a/step_1200.mp4\n"
+        "outputs/x/samples_inpaint/clip_b/step_1200.mp4\n"
+    )
+    ids_600 = set(landed_render_ids(at_step_600, "ltx", "inpaint"))
+    ids_1200 = set(landed_render_ids(at_step_1200, "ltx", "inpaint"))
+    assert ids_600, "fixture must actually produce ids for this to be a real test"
+    assert ids_600.isdisjoint(ids_1200), (
+        "renders at different steps into the identical stem set must never share an id"
+    )
+
+
+def test_step_keyed_modes_are_the_documented_subset():
+    # Pins the registered subset itself — a mode added to SAMPLES_SUBDIR_BY_LTX_MODE without also
+    # being added here (if it is truly step-keyed) would silently fall through to the stamp regex
+    # and return [] forever, the exact "render never landed" mis-read this module exists to close.
+    assert STEP_KEYED_LTX_MODES == frozenset({"inpaint", "audio_to_video"})
 
 
 def test_h3_configs_differing_only_in_reference_are_distinct_renders():
@@ -180,7 +292,10 @@ def test_watcher_has_no_hardcoded_samples_path_in_the_landed_check():
     # never from an f-string pinning `/samples`. (refresh_grid keeps its LTX-only legacy staging
     # branch, which is guarded by `if FAMILY == "h3": return` above it.)
     src = _watcher_src()
-    assert "SAMPLES_ROOT = samples_root(OUTPUT_DIR, FAMILY)" in src
+    # issue #45 PR-4: SAMPLES_ROOT is now MODE-aware too, not just family-aware (family alone picks
+    # the wrong root for 5 of 6 non-default LTX conditioning.mode branches) — RENDER_MODE is the
+    # third argument, resolved via layout_mode() rather than hardcoded.
+    assert "SAMPLES_ROOT = samples_root(OUTPUT_DIR, FAMILY, RENDER_MODE)" in src
     assert 'FAMILY = _cfg.model.family' in src
     body = src.split("def committed_render_stamps")[1].split("def latest_checkpoint_name")[0]
     assert "SAMPLES_ROOT" in body
@@ -305,3 +420,66 @@ def test_watcher_still_runs_its_own_pre_dispatch_cap_check():
     assert "read_ledger" in src and "session_cap_check" in src
     main_body = src.split("\ndef main()")[1]
     assert "session_cap_check(" in main_body
+
+# ---- render_landed's stale-id fix (issue #45 PR-4) — behavioral, not a source scan -------------
+#
+# PR-2's verifier already flagged pure source-scans as test theater for a decision this exact
+# shaped (a semantic inversion of one comparison surviving every test in
+# tests/test_watcher_hardening.py). render_landed's stale-id branch is the same shape: it decides
+# `bool(set(ids) - _pending_baseline_ids)`, and a source scan cannot tell that apart from the old,
+# buggy `bool(ids)` if someone "fixed" the diff back out while leaving comments untouched. These
+# tests import the REAL watcher module (mirroring tests/test_watcher_pending_clock.py's
+# `_load_watcher()` pattern) and drive `render_landed` directly, with only the Volume-shelling seam
+# (`committed_render_stamps`) monkeypatched — zero Modal, zero spend.
+
+
+def _load_watcher_module():
+    old_argv = sys.argv
+    sys.argv = ["watch_parallel_inference.py", str(SAMPLE_CONFIG)]
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "watch_parallel_inference_under_test_samples_path", WATCHER
+        )
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        sys.argv = old_argv
+
+
+def test_stale_id_present_before_dispatch_does_not_land_the_render(monkeypatch):
+    # configs/sample.yaml is LTX, conditioning.mode "none" -> the STAMPED (non-step-keyed) branch.
+    mod = _load_watcher_module()
+    assert mod.FAMILY == "ltx" and mod.RENDER_MODE not in mod.STEP_KEYED_LTX_MODES
+    stale_stamp = "20260805T100000Z"
+    # This stamp already existed on the Volume BEFORE the pending render was ever dispatched — the
+    # baseline main() would have captured at dispatch time.
+    monkeypatch.setattr(mod, "_pending_baseline_ids", frozenset({stale_stamp}))
+    monkeypatch.setattr(mod, "committed_render_stamps", lambda: [stale_stamp])
+    assert mod.render_landed(50, None) is False, (
+        "a stamp that already existed before this render was dispatched must never count as proof "
+        "THIS render landed — bool(ids) alone (the pre-PR-4 behaviour) would have returned True here"
+    )
+
+
+def test_new_id_beyond_the_baseline_does_land_the_render(monkeypatch):
+    mod = _load_watcher_module()
+    stale_stamp = "20260805T100000Z"
+    fresh_stamp = "20260805T110000Z"
+    monkeypatch.setattr(mod, "_pending_baseline_ids", frozenset({stale_stamp}))
+    monkeypatch.setattr(mod, "committed_render_stamps", lambda: [stale_stamp, fresh_stamp])
+    assert mod.render_landed(50, None) is True, (
+        "a stamp that appeared AFTER the dispatch-time baseline is exactly what 'landed' must mean "
+        "on the stamped LTX path"
+    )
+
+
+def test_baseline_only_gates_the_stamped_path_h3_stays_identity_keyed():
+    # The h3 arm's landed criterion (identity-dir check with the captured checkpoint) must be
+    # UNCHANGED by this fix — it never reads _pending_baseline_ids at all.
+    body = _watcher_src().split("def render_landed")[1].split("\ndef ")[0]
+    assert "_pending_baseline_ids" not in body.split('if checkpoint is None:')[1], (
+        "the h3 branch must not read the LTX stale-id baseline"
+    )
+    assert "want in ids" in body, "h3 stays a pure identity-membership check"

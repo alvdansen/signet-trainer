@@ -44,10 +44,12 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 from signet_trainer.config.load import load_config  # noqa: E402
 from signet_trainer.inference.samples_layout import (  # noqa: E402
+    STEP_KEYED_LTX_MODES,
     committed_clip_names,
     expected_h3_base_render_key,
     expected_h3_render_key,
     landed_render_ids,
+    layout_mode,
     samples_root,
 )
 from signet_trainer.inference.stall_clock import next_pending_since  # noqa: E402
@@ -83,7 +85,19 @@ CKPT_VOL = _cfg.modal.checkpoints_volume_name
 # on the next poll — booking the full estimate each time with no refund path (KNOWLEDGE.md
 # `watcher` `phantom-spend`). Resolved from `model.family`, never hardcoded per-family here.
 FAMILY = _cfg.model.family
-SAMPLES_ROOT = samples_root(OUTPUT_DIR, FAMILY)
+# ⛔ issue #45 PR-4 — MODE-AWARE, NOT JUST FAMILY-AWARE, on LTX. `family == "ltx"` alone still picks
+# the WRONG root for five of the six non-default `conditioning.mode` branches in `modal/fns.py`'s
+# `sample()` (inpaint -> samples_inpaint, audio_to_video -> samples_a2v, single_frame ->
+# samples_single_frame, multi_frame -> samples_multi_frame, ic_lora -> samples_ic_lora or
+# samples_ic_lora_baseline under two_stage_upscale). `layout_mode` reproduces fns.py's own
+# ic_lora+two_stage_upscale dispatch so the watcher and the render can never key differently. `None`
+# on every non-LTX family (H3/qwen_edit have no mode axis; `samples_root` ignores `mode` for them).
+RENDER_MODE = (
+    layout_mode(conditioning_mode=_cfg.conditioning.mode,
+                two_stage_upscale=_cfg.validation.two_stage_upscale)
+    if FAMILY == "ltx" else None
+)
+SAMPLES_ROOT = samples_root(OUTPUT_DIR, FAMILY, RENDER_MODE)
 POLL_SECONDS = 240
 RENDER_EST_USD = round(_cfg.modal.est_hours * _cfg.modal.hourly_rate_usd, 2)
 DEADLINE_HOURS = 12.0
@@ -192,7 +206,23 @@ def committed_render_stamps() -> list[str]:
     # re-pointing only the directory would still mis-verify every H3 render.
     r = sh(["modal", "volume", "ls", CKPT_VOL, SAMPLES_ROOT],
            timeout=VOLUME_OP_TIMEOUT_S)
-    return landed_render_ids(r.stdout or "", FAMILY)
+    listing = r.stdout or ""
+    # ⛔ issue #45 PR-4 STEP-KEYED DEEPENING — `SAMPLES_ROOT`'s own listing shows only the STEM
+    # dirs (`modal volume ls` has no recursive flag — confirmed against the real CLI: no `-r` /
+    # `--recursive` option exists), never the `step_<N>.mp4` files `landed_render_ids` needs to key
+    # on. Probe every stem dir found at the top level and fold its own one-level listing in too —
+    # the same multi-call pattern `render_progress_artifacts` already uses for the h3 base/lora
+    # split, not a new idiom.
+    if FAMILY == "ltx" and RENDER_MODE in STEP_KEYED_LTX_MODES:
+        stems = sorted({
+            ln.strip().rstrip("/").split(f"{SAMPLES_ROOT}/")[-1].split("/")[0]
+            for ln in listing.splitlines() if ln.strip()
+        })
+        for stem in stems:
+            rr = sh(["modal", "volume", "ls", CKPT_VOL, f"{SAMPLES_ROOT}/{stem}"],
+                    timeout=VOLUME_OP_TIMEOUT_S)
+            listing += "\n" + (rr.stdout or "")
+    return landed_render_ids(listing, FAMILY, RENDER_MODE)
 
 
 def latest_checkpoint_name() -> str | None:
@@ -200,6 +230,17 @@ def latest_checkpoint_name() -> str | None:
     r = sh(["modal", "volume", "ls", CKPT_VOL, OUTPUT_DIR])
     names = re.findall(r"(checkpoint-step-\d+-loss-[\d.]+)", r.stdout or "")
     return max(names, key=lambda n: int(re.search(r"step-(\d+)", n).group(1))) if names else None
+
+
+# issue #45 PR-4 — the stale-id baseline, captured AT DISPATCH TIME by main() (mirroring
+# pending_checkpoint's capture-before-book discipline, PR-1 must-fix #2). Read here as a MODULE
+# GLOBAL rather than a `render_landed` parameter: `render_landed`'s call site (`render_landed(
+# pending_step, pending_checkpoint)`, two positional args) is pinned by
+# tests/test_watcher_pending_clock.py's full monkeypatch replacement of `render_landed` itself —
+# `render_landed` already reads several other module globals directly (`FAMILY`, `RENDER_MODE`,
+# and transitively `SAMPLES_ROOT`/`CKPT_VOL` via `committed_render_stamps()`), so this follows the
+# same established pattern rather than inventing a new one.
+_pending_baseline_ids: frozenset[str] = frozenset()
 
 
 def render_landed(step: int, checkpoint: str | None) -> bool:
@@ -210,8 +251,23 @@ def render_landed(step: int, checkpoint: str | None) -> bool:
     their prompt set and therefore write identical clip FILENAMES — only the render-dir identity
     separates them. A coarser check (checkpoint alone) would accept the `A+029` render as proof the
     `B+029` render landed, and the grid would come out labelled for a reference condition it does not
-    contain. On LTX there is no per-render identity, so ANY new committed stamp is the signal — the
-    historical behaviour, unchanged.
+    contain.
+
+    On LTX there is no checkpoint-keyed render identity, but there IS still a per-render one:
+
+      * STEP-KEYED modes (`RENDER_MODE in STEP_KEYED_LTX_MODES` — inpaint / audio_to_video, issue
+        #45 PR-4): `landed_render_ids` returns step-bearing ids (`"<stem>/step_<N>"`); checking for
+        THIS step's suffix distinguishes a step-600 render from a step-1200 render into the SAME
+        stem dirs — the bug a stem-only id would reopen, since the stem persists across every
+        dispatch and would otherwise read as "landed" the moment the FIRST render ever committed.
+      * every other LTX mode writes a FRESH UTC-stamped dir per render, so "landed" means a NEW
+        stamp beyond `_pending_baseline_ids` — the dispatch-time snapshot main() captures before
+        booking spend (mirroring the checkpoint capture-before-book discipline below). A stamp that
+        already existed BEFORE this render was dispatched is a PRIOR render's artifact (or a stale
+        probe left by an earlier campaign at the same output_dir) — never proof THIS one landed.
+        `bool(ids)` alone — the pre-PR-4 behaviour — would have returned True on the very FIRST poll
+        after dispatch purely because that stale stamp was already sitting under SAMPLES_ROOT,
+        which is exactly the stale-id false-landed hole issue #45 PR-4 exists to close.
 
     `checkpoint` MUST be the value main() captured AT DISPATCH TIME (issue #45 PR-1 must-fix #2),
     never re-derived here via a fresh `latest_checkpoint_name()` call. Re-resolving "latest" on every
@@ -221,7 +277,10 @@ def render_landed(step: int, checkpoint: str | None) -> bool:
     """
     ids = committed_render_stamps()
     if FAMILY != "h3":
-        return bool(ids)
+        if RENDER_MODE in STEP_KEYED_LTX_MODES:
+            target = f"/step_{step}"
+            return any(i.endswith(target) for i in ids)
+        return bool(set(ids) - _pending_baseline_ids)
     if checkpoint is None:
         # Kill the match-anything path: a caller with no resolved checkpoint must be REFUSED, never
         # silently satisfied by whatever the identity-independent branch above would have returned.
@@ -422,6 +481,7 @@ def main() -> None:
     # DISPATCH TIME (must-fix #2) that `render_landed`/`render_progress_artifacts` verify against for
     # the life of this pending render — never re-derived mid-flight. `pending_progress` is the last
     # observed artifact snapshot, compared each poll to decide whether the clock resets.
+    global _pending_baseline_ids  # issue #45 PR-4 — assigned below, at successful dispatch
     pending_step: int | None = None
     pending_since = 0.0
     pending_checkpoint: str | None = None
@@ -464,6 +524,12 @@ def main() -> None:
             # at MAX_STEPS could write the run-complete sentinel having verified nothing. LTX has no
             # checkpoint-keyed render identity to resolve, so it is exempt.
             ckpt_at_dispatch = latest_checkpoint_name() if FAMILY == "h3" else None
+            # issue #45 PR-4 — the SAME capture-before-book discipline for the stale-id baseline: the
+            # ids that already exist BEFORE this dispatch, so render_landed's stamped-LTX branch can
+            # tell a genuinely NEW artifact apart from one this render never produced. h3 doesn't
+            # need it (its landed-check is already identity-keyed, not existence-keyed) — frozenset()
+            # there is inert.
+            baseline_at_dispatch = frozenset(committed_render_stamps()) if FAMILY == "ltx" else frozenset()
             if FAMILY == "h3" and ckpt_at_dispatch is None:
                 print(f"[watcher] step {step}: could not resolve the latest checkpoint name (modal "
                       "volume ls timeout or empty listing) — REFUSING to book spend/dispatch for a "
@@ -481,6 +547,7 @@ def main() -> None:
                 if ok:
                     pending_step, pending_since = step, time.time()
                     pending_checkpoint, pending_progress = ckpt_at_dispatch, frozenset()
+                    _pending_baseline_ids = baseline_at_dispatch
                 else:
                     print(f"[watcher] dispatch for step {step} REFUSED/FAILED before spawn — "
                           "eligible again next poll (cap-gated).", flush=True)
