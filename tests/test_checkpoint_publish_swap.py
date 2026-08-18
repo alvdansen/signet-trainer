@@ -168,6 +168,31 @@ def test_orphan_tmp_dir_for_a_superseded_step_is_swept(tmp_path) -> None:
     assert not orphan.exists(), "an orphaned staging dir for an already-superseded step must be swept"
 
 
+def test_legacy_loss_suffixed_orphan_for_a_superseded_step_is_swept(tmp_path) -> None:
+    """A LEGACY ``.tmp-...-loss-...`` orphan (every pre-fix crash) must also be reclaimed.
+
+    Before the step-scoped staging rename, ``save()`` named staging after the loss-suffixed
+    ``final_name`` — so every crash left an orphan of the shape
+    ``.tmp-checkpoint-step-{N}-loss-{loss}``. If the sweep's regex is ``$``-anchored right after
+    the step digits, this legacy shape never matches and the orphan is invisible forever, even on
+    a build that already carries the step-scoped fix. A fresh save at a later step must still
+    sweep it.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    legacy_orphan = tmp_path / f".tmp-{CHECKPOINT_PREFIX}00200-loss-0.9999"
+    legacy_orphan.mkdir(parents=True)
+    (legacy_orphan / ADAPTER_FILENAME).write_bytes(b"partial-legacy")
+
+    model = _wrapped()
+    opt, sched = _opt_and_sched(model)
+    mgr = CheckpointManager(tmp_path)
+    mgr.save(model, opt, sched, step=400, loss=0.5)
+
+    assert not legacy_orphan.exists(), (
+        "a legacy loss-suffixed .tmp- orphan for an already-superseded step must be swept"
+    )
+
+
 def test_orphan_sweep_does_not_touch_a_higher_step_staging_dir(tmp_path) -> None:
     """The sweep must be scoped to steps <= the one being committed, never a step still ahead."""
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -180,6 +205,35 @@ def test_orphan_sweep_does_not_touch_a_higher_step_staging_dir(tmp_path) -> None
     mgr.save(model, opt, sched, step=400, loss=0.5)
 
     assert future.exists(), "the sweep must not delete a staging dir for a step beyond the current save"
+
+
+def test_crash_mid_write_leaves_a_step_scoped_not_loss_suffixed_staging_name(tmp_path, monkeypatch) -> None:
+    """The staging dir ``save()`` writes into must be named by STEP ONLY, never by ``final_name``.
+
+    Forces the crash to land INSIDE ``model.save_pretrained`` — before the publish rename ever
+    runs — so whatever the orphan left on disk is named is exactly the name ``save()`` chose for
+    ``staging``, decoupled from ``_sweep_orphaned_staging`` (which would otherwise clean up a
+    same-step orphan regardless of its name and mask this). If ``staging`` is derived from the
+    loss-suffixed ``final_name`` (the pre-fix naming issue #30 f5 replaced), a resumed retry at a
+    DIFFERENT loss can never recognize this orphan as its own — the two names differ.
+    """
+    model = _wrapped()
+    opt, sched = _opt_and_sched(model)
+    mgr = CheckpointManager(tmp_path)
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("simulated crash mid-write")
+
+    monkeypatch.setattr(model, "save_pretrained", _boom)
+    with pytest.raises(RuntimeError, match="simulated crash mid-write"):
+        mgr.save(model, opt, sched, step=200, loss=0.1234)
+
+    tmp_dirs = [p for p in tmp_path.iterdir() if p.name.startswith(".tmp-")]
+    assert len(tmp_dirs) == 1, f"expected exactly one staging orphan, found {tmp_dirs}"
+    assert tmp_dirs[0].name == f".tmp-{CHECKPOINT_PREFIX}00200", (
+        "the staging dir must be named by STEP ONLY (no loss suffix) so a same-step retry at a "
+        f"different loss reclaims the identical name; got {tmp_dirs[0].name!r}"
+    )
 
 
 def test_crash_mid_write_orphan_is_reclaimed_by_a_same_step_retry_at_a_different_loss(tmp_path) -> None:

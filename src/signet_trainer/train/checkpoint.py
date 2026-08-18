@@ -196,10 +196,18 @@ class CheckpointManager:
         case — a step that crashes mid-save and is never revisited (e.g. the crash landed on the
         unconditional tail save and training already ended) — which the old loss-suffixed staging
         name left permanently orphaned on every crash-and-resume cycle.
+
+        NOT ``$``-anchored right after the step digits: every pre-fix crash left a LEGACY,
+        loss-suffixed orphan (``.tmp-checkpoint-step-{N}-loss-{loss}``, the naming ``save()`` used
+        before this module's step-scoped fix). An anchor immediately after the step-digit group
+        made those invisible to this sweep forever — a legacy orphan from BEFORE the fix would
+        never be reclaimed by a build AFTER it. The optional ``(?:-loss-...)?`` suffix keeps
+        matching both the current step-scoped name and every legacy loss-suffixed name it
+        superseded.
         """
         if not self.output_dir.exists():
             return
-        tmp_re = re.compile(rf"^\.tmp-{re.escape(CHECKPOINT_PREFIX)}(\d+)$")
+        tmp_re = re.compile(rf"^\.tmp-{re.escape(CHECKPOINT_PREFIX)}(\d+)(?:-loss-[0-9.]+)?$")
         for stale in self.output_dir.glob(f".tmp-{CHECKPOINT_PREFIX}*"):
             if not stale.is_dir():
                 continue
