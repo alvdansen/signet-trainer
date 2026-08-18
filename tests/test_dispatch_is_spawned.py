@@ -27,7 +27,10 @@ its own body, mirroring ``test_single_use_containers_is_a_real_modal_sdk_kwarg``
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
 _ENTRYPOINT = _ROOT / "src" / "signet_trainer" / "modal" / "entrypoint.py"
@@ -307,6 +310,50 @@ def test_the_function_call_id_is_printed() -> None:
     assert "FunctionCall.from_id" in src, (
         "entrypoint.py must print the re-attach RECIPE (modal.FunctionCall.from_id('<id>')), not "
         "merely the bare id — the next agent should not have to know the API."
+    )
+
+
+def test_every_documented_entrypoint_launch_block_has_detach() -> None:
+    """issue #19 item 4 — every fenced ``modal run ... signet_trainer.modal.entrypoint`` block in a
+    TRACKED ``.md`` file must contain ``--detach``, extending this file's AST-derived pin from the
+    CODE side (the entrypoint's own runtime advisory, `test_the_detach_advisory_exists` below) to the
+    DOCS side.
+
+    The regression this closes: the canonical launch block six docs pointed operators at all omitted
+    ``--detach`` — a copy-pasted multi-hour ``--mode preprocess``/``--mode sample`` dispatch survives
+    the async ``.spawn()`` input but the non-detached ephemeral APP shell still dies with the local
+    client, killing the encode/render partway with nothing committed. `entrypoint.py`'s own
+    post-spawn warning claims "every documented launch form in this repo carries --detach" — this
+    test is what makes that claim true instead of aspirational.
+
+    ``git ls-files`` (not a glob) so a NEW doc under any directory is covered automatically, and a
+    generated/gitignored ``.md`` (e.g. a frozen grid page) can never be scanned by accident. Skips
+    (rather than fails) when git itself is unavailable — this is a documentation pin, not a git
+    dependency for the whole suite.
+    """
+    import subprocess  # noqa: PLC0415
+
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "*.md"], cwd=str(_ROOT), capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("git ls-files unavailable — cannot enumerate tracked .md files")
+
+    fence_re = re.compile(r"```(?:[^\n]*)\n([\s\S]*?)```")
+    offenders: list[str] = []
+    for rel_path in out.stdout.splitlines():
+        if not rel_path:
+            continue
+        text = (_ROOT / rel_path).read_text(encoding="utf-8")
+        for block in fence_re.findall(text):
+            if "signet_trainer.modal.entrypoint" not in block or "modal run" not in block:
+                continue  # a fenced block that mentions the entrypoint in prose, not a launch line
+            if "--detach" not in block:
+                offenders.append(f"{rel_path}: {block.strip()[:80]!r}...")
+    assert not offenders, (
+        "these fenced entrypoint launch blocks omit --detach (a copy-paste of any of them can lose "
+        f"a multi-hour metered run to a closed laptop): {offenders}"
     )
 
 

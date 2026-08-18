@@ -92,11 +92,17 @@ Every metered run is driven through the entrypoint, never around it:
 
 ```bash
 PYTHONPATH=src PYTHONUTF8=1 \
-  modal run -m signet_trainer.modal.entrypoint \
+  modal run --detach -m signet_trainer.modal.entrypoint \
   --config configs/<x>.yaml \
   --mode <train|sample|preprocess|fuse> \
   [--approve]
 ```
+
+**`--detach` is REQUIRED here, not optional** — this IS the canonical launch block CLAUDE.md
+points at. Without it, Modal tears the ephemeral app shell down with the local client that
+dispatched it; `.spawn()` alone only fixes the INPUT type, not the app lifetime (see the
+`--detach` advisory in `entrypoint.py`, and README "The three things about this command that
+are not optional").
 
 The entrypoint enforces the ordering:
 `load config -> dry-run hard gate -> cost print + guardrail -> BLOCKING approval

@@ -34,7 +34,11 @@ from signet_trainer.modal.session_cap import append_spend, read_ledger
 REPO = Path(__file__).resolve().parents[1]
 FORK = REPO / "scripts" / "_watch_campaign_parallel_inference.py"
 GENERALIZED = REPO / "scripts" / "watch_parallel_inference.py"
-_WATCHERS = (FORK, GENERALIZED)
+# issue #19 item 1 — FORK is not published in this repo; see test_watcher_hardening.py's identical
+# filter for the full rationale. Filtering here keeps `test_watchers_do_not_subprocess_for_append_
+# spend` from aborting on the fork before it ever scans the shipped watcher.
+assert GENERALIZED.is_file(), "the shipped generalized watcher must always be present"
+_WATCHERS = tuple(p for p in (FORK, GENERALIZED) if p.is_file())
 
 
 def _strip_comments(src: str) -> str:

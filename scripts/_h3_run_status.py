@@ -236,6 +236,11 @@ def load_recipe(config_path: Path) -> dict:
             cost_guardrail_usd=cfg.modal.cost_guardrail_usd,
             family=cfg.model.family,
             gpu_usable_gib=getattr(getattr(cfg, "h3", None), "gpu_usable_gib", None),
+            # issue #19 item 3 (D-NOHARDCODE): the checkpoints Volume / App name this run actually
+            # reads/dispatches under, so main() can default --volume/--app-name from them instead of
+            # a hardcoded literal.
+            checkpoints_volume_name=cfg.modal.checkpoints_volume_name,
+            app_name=cfg.modal.app_name,
         )
         return recipe
     except Exception as exc:  # noqa: BLE001 — fall back rather than fail the whole page
@@ -257,6 +262,8 @@ def load_recipe(config_path: Path) -> dict:
         cost_guardrail_usd=modal_cfg.get("cost_guardrail_usd"),
         family=(raw.get("model", {}) or {}).get("family"),
         gpu_usable_gib=(raw.get("h3", {}) or {}).get("gpu_usable_gib"),
+        checkpoints_volume_name=modal_cfg.get("checkpoints_volume_name"),
+        app_name=modal_cfg.get("app_name"),
     )
     return recipe
 
@@ -1106,14 +1113,19 @@ def main(argv: list[str] | None = None) -> int:
                              "Default: derived from the config stem.")
     parser.add_argument("--session-state", default=".planning/harness/SESSION-STATE.json",
                         help="Spend ledger — the single numeric source of truth for spend/cap.")
-    parser.add_argument("--volume", default="signe-trainer-checkpoints",
-                        help="Modal Volume holding <output_dir>/checkpoint-step-*.")
+    parser.add_argument("--volume", default=None,
+                        help="Modal Volume holding <output_dir>/checkpoint-step-*. Default: the "
+                             "loaded config's modal.checkpoints_volume_name (D-NOHARDCODE) — falls "
+                             "back to the schema default only when the config never set it.")
     parser.add_argument("--out", default="_h3_status",
                         help="Output directory for index.html + status.json (gitignored).")
     # ⛔ PRE-RENAME DEFAULT ON PURPOSE (matches SignetConfig.modal.app_name / app.py APP_NAME):
     # this is the name of an EXISTING Modal App that in-flight runs are dispatched under. Renaming
     # it to "signet-trainer" would silently attribute nothing and report a live run as missing.
-    parser.add_argument("--app-name", default="signe-trainer", help="Modal app name to attribute.")
+    # issue #19 item 3 (D-NOHARDCODE): default resolved from the loaded config's modal.app_name
+    # below (falling back to the schema default), never a literal repeated here.
+    parser.add_argument("--app-name", default=None, help="Modal app name to attribute. Default: "
+                         "the loaded config's modal.app_name.")
     parser.add_argument("--app-id", default="", help="Pin a specific Modal app id.")
     parser.add_argument("--stale-minutes", type=float, default=60.0,
                         help="Flag the run STALE when the newest checkpoint is older than this.")
@@ -1126,6 +1138,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=120.0, help="Per-CLI-call timeout, seconds.")
     parser.add_argument("--open", action="store_true", help="Open the page in a browser when done.")
     args = parser.parse_args(argv)
+    # issue #19 item 3 — remember whether --volume was passed explicitly BEFORE defaulting it from
+    # the config below, so the reproduction command only echoes --volume when the operator actually
+    # overrode it (not merely because the config's own checkpoints_volume_name differs from the
+    # schema default — that case is already implied by --config).
+    volume_explicit = args.volume is not None
 
     config_path = Path(args.config)
     if not config_path.is_absolute():
@@ -1143,6 +1160,16 @@ def main(argv: list[str] | None = None) -> int:
     if not output_dir:
         print(f"[status] {config_path} has no output_dir — nothing to point at.", file=sys.stderr)
         return 2
+    if args.volume is None or args.app_name is None:
+        # issue #19 item 3 (D-NOHARDCODE) — config-first: the loaded config's own
+        # modal.checkpoints_volume_name / modal.app_name win; only a config that never set a field
+        # falls through to the schema's own default (never a literal repeated here, so the two
+        # can't drift).
+        from signet_trainer.config.schema import ModalConfig  # noqa: PLC0415
+        if args.volume is None:
+            args.volume = recipe.get("checkpoints_volume_name") or ModalConfig().checkpoints_volume_name
+        if args.app_name is None:
+            args.app_name = recipe.get("app_name") or ModalConfig().app_name
 
     card_path = Path(args.card) if args.card else (
         REPO_ROOT / ".planning/harness/cards"
@@ -1191,7 +1218,7 @@ def main(argv: list[str] | None = None) -> int:
     command = (
         f"MSYS_NO_PATHCONV=1 PYTHONPATH=src python scripts/_h3_run_status.py "
         f"--config {args.config}"
-        + (f" --volume {args.volume}" if args.volume != "signe-trainer-checkpoints" else "")
+        + (f" --volume {args.volume}" if volume_explicit else "")
         + (" --no-logs" if args.no_logs else "")
     )
 

@@ -322,8 +322,13 @@ mysterious. Expect roughly **48 failed, ~1890 passed, 27 skipped**, in three gro
   check would pass while the real dispatch failed. Bootstrap it once with the two commands the
   failure message prints, or leave them red. A few in this group are regression checks pinned to
   in-house run configs that are not published.
-- **~17 — the watcher-hardening suite.** It reads a long-running campaign watcher script that is
-  operational tooling rather than library code and is not published.
+- **~6 — the campaign-fork watcher tests.** `tests/test_watcher_hardening.py`'s `test_fork_*` tests
+  (and one `test_both_final_done_guarded_by_success` half) read a long-running campaign watcher
+  script that is operational tooling rather than library code and is not published. The suite's
+  `test_both_*` money-safety assertions (session-cap gate, append-spend-on-every-dispatch, the
+  render-dispatch timeout exemption, the `CAP_STOP_EXIT` contract, the heartbeat touch) run against
+  the SHIPPED `scripts/watch_parallel_inference.py` and are green — issue #19 item 1 stopped the
+  unpublished fork's absence from masking that result.
 - **27 skipped (not failed) — the house-memory scaffold lints.** Some tests lint a project-private
   memory scaffold under `.planning/harness/` (`DECISION-LOG.md`, `KNOWLEDGE.md`, `SESSION-STATE.json`,
   campaign cards). That directory holds live per-project run history and is deliberately not
