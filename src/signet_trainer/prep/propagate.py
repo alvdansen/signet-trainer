@@ -33,7 +33,11 @@ DUAL BACKEND (``--backend``), stable seam ``run(jpeg_dir, seed_bool_hw, n_frames
 
 REV set (D-08): pass a mask stem to ``rev`` to seed the LAST frame and propagate BACKWARD — done
 precedent-style by reversing the physical frame order fed to the predictor and remapping indices
-(backend-uniform; re-seeds clips that drifted forward).
+(backend-uniform; re-seeds clips that drifted forward). ``load_directions`` reads the SAME set from
+textseed's ``textseed_records.json`` (``--directions``, #36 finding 3) so the fwd/rev decision
+reaches this module as structured data, not a printed line the operator retypes. Every ``--rev`` /
+``--only`` / ``--directions`` stem is validated against the discovered seed PNGs in
+``propagate_masks`` — an unmatched stem is a fatal error, never a silent no-op.
 
 RUNNABLE-LATER: NO heavy imports at module top — torch/cv2/numpy/sam/transformers imports are
 function-local and fail with a clear install hint, so this module PARSES + unit-tests on a CPU/CI
@@ -115,6 +119,21 @@ def _need(module: str):
 # --------------------------------------------------------------------------------------------------
 # Job discovery: one job per seed PNG. Stem resolution is single-sourced via prep.resolve (D-13).
 # --------------------------------------------------------------------------------------------------
+
+def load_directions(records_path: str | Path) -> set[str]:
+    """Read textseed's structured JSON handoff (``--directions``) and return its REV mask-stem set.
+
+    Replaces copy-pasting the ``[textseed] rev stems: [...]`` print into ``--rev`` by hand (#36
+    finding 3): this reads the SAME ``direction`` field, from the SAME ``textseed_records.json``
+    that print was only summarizing, so a file is the transport, not an operator's clipboard.
+    """
+    import json  # noqa: PLC0415  (function-local, import-confined)
+
+    from signet_trainer.prep.textseed import rev_stems  # noqa: PLC0415
+
+    records = json.loads(Path(records_path).read_text(encoding="utf-8"))
+    return set(rev_stems(records))
+
 
 def discover_jobs(args) -> list[dict]:
     """One job per seed PNG: {'mask_stem','type','seed_png','clip'} (clip=None if unresolved)."""
@@ -510,9 +529,27 @@ def propagate_masks(args) -> int:
     args.rev = set(getattr(args, "rev", []) or [])
     args.only = set(getattr(args, "only", []) or [])
 
+    directions = getattr(args, "directions", None)
+    if directions:
+        # Structured handoff (#36 finding 3): union textseed's decided REV set into --rev rather
+        # than requiring the operator to copy it off stdout by hand.
+        args.rev |= load_directions(directions)
+
     jobs = discover_jobs(args)
     if not jobs:
         raise SystemExit(f"[sam-propagate] no seed PNGs found in {args.masks_dir}")
+
+    # Typo-fatal (#36 finding 3): a --rev/--only/--directions stem that matches no discovered seed
+    # PNG must abort loudly, never silently no-op — a dropped/mistyped --rev seeds the wrong frame
+    # with nothing downstream able to see the mistake.
+    discovered = sorted({j["mask_stem"] for j in jobs})
+    for flag, stems in (("--rev", args.rev), ("--only", args.only)):
+        unknown = sorted(s for s in stems if s not in discovered)
+        if unknown:
+            raise SystemExit(
+                f"[sam-propagate] unknown {flag} stem(s) {unknown}; discovered: {discovered}"
+            )
+
     unresolved = [j["mask_stem"] for j in jobs if j["clip"] is None]
 
     if args.dry_run:

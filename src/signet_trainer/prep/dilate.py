@@ -17,7 +17,11 @@ over-growth past the ceiling).
 Import-confined (Anti-Pattern 6): ``numpy`` and ``cv2`` are imported function-local so the module
 PARSES on CI without a numeric/GPU env. The coverage/target-stop math has a PURE-NUMPY dilation
 path (``_dilate_once_numpy``) so the growth/target/ceiling logic is fully testable WITHOUT cv2;
-cv2's structuring-element dilation is only used as a faster equivalent when cv2 is present.
+cv2's structuring-element dilation (``MORPH_RECT``, full 3x3 all-ones — matching the numpy path's
+8-connectivity bit-for-bit) is used as a faster equivalent when cv2 is present (#36 finding 4: a
+prior ``MORPH_ELLIPSE`` kernel was 4-connected and produced a DIFFERENT grown mask than the numpy
+path from the same seed — production always took that untested cv2 branch while every test in
+``tests/test_prep_dilate.py`` pinned ``use_cv2=False``).
 """
 
 from __future__ import annotations
@@ -71,12 +75,19 @@ def _dilate_once_numpy(mask):
 
 
 def _dilate_1px(mask, use_cv2: bool):
-    """Grow a bool mask by ~1 px. Uses cv2's 3x3 ellipse when available; pure-numpy otherwise."""
+    """Grow a bool mask by ~1 px. Uses cv2's 3x3 full-square kernel when available; pure-numpy otherwise.
+
+    #36 finding 4: this MUST be ``MORPH_RECT`` (all-ones 3x3, 8-connected), not ``MORPH_ELLIPSE``
+    ([[0,1,0],[1,1,1],[0,1,0]], 4-connected) — the ellipse kernel grows a DIFFERENT (smaller) region
+    per step than :func:`_dilate_once_numpy`'s full 3x3, so ``max_margin_px`` silently meant a
+    different radius depending on whether cv2 was installed. ``MORPH_RECT`` (3, 3) is bit-identical
+    to the numpy path.
+    """
     if use_cv2:
         cv2 = _try_cv2()
         if cv2 is not None:
             np = _need_numpy()
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
             grown = cv2.dilate(np.asarray(mask, dtype=np.uint8), kernel, iterations=1)
             return grown.astype(bool)
     return _dilate_once_numpy(mask)

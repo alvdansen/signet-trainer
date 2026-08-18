@@ -528,6 +528,13 @@ def run(args) -> int:
         f"weak={s['weak']} not_found={s['not_found']}",
         flush=True,
     )
-    print(f"[textseed] rev stems: {rev_stems(records)}", flush=True)
+    # Convenience echo ONLY (#36 finding 3) — the transport is args.records_out itself: pass
+    # `--directions <records_out>` to prep_inpaint_propagate.py and it derives this same REV set
+    # from the JSON's 'direction' field, rather than the operator retyping this printed list.
+    print(
+        f"[textseed] rev stems: {rev_stems(records)} "
+        f"(structured handoff: pass --directions {args.records_out} to prep_inpaint_propagate.py)",
+        flush=True,
+    )
     print("TEXTSEED_DONE", flush=True)
     return 0
