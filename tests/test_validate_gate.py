@@ -24,6 +24,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 import torch.nn as nn
 
 # The heavy modules the gate must NOT pull in at import time (function-local only).
@@ -456,3 +457,51 @@ def test_gate_video_inner_dim_constant_is_loader_single_source() -> None:
 
     assert validate_gate.EXPECTED_VIDEO_INNER_DIM is loader.EXPECTED_VIDEO_INNER_DIM
     assert loader.EXPECTED_VIDEO_INNER_DIM == 4096  # video branch (audio_attn1 is the 2048 misread)
+
+
+# --------------------------------------------------------------------------------------------------
+# Issue #13 step 2 (verifier round 2) — ``_make_schedule`` must actually THREAD
+# ``config.training.timestep_std`` into the ``FlowMatchingSchedule`` it builds, not merely accept
+# the field on the schema. A mutation that reverted the threading (built the schedule with the
+# hardcoded default instead of reading the config) left every prior test green — none of them
+# constructed a schedule from a config and inspected ``.std``.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_make_schedule_threads_nondefault_timestep_std_from_a_bare_namespace() -> None:
+    """The minimal construction seam: any object shaped like ``config.training.timestep_std``."""
+    from types import SimpleNamespace
+
+    from signet_trainer.train.validate_gate import _make_schedule
+
+    config = SimpleNamespace(training=SimpleNamespace(uniform_prob=0.1, timestep_std=1.7))
+    schedule = _make_schedule(config)
+    assert schedule.std == pytest.approx(1.7)
+
+
+def test_make_schedule_threads_nondefault_timestep_std_from_a_real_signetconfig() -> None:
+    """The real construction seam: a validated ``SignetConfig`` with a non-default ``timestep_std``."""
+    from signet_trainer.config.schema import SignetConfig
+    from signet_trainer.train.validate_gate import _make_schedule
+    from tests.test_h3_config_schema import _h3_payload
+
+    config = SignetConfig.model_validate(
+        _h3_payload(training={"max_steps": 100, "timestep_std": 1.7})
+    )
+    schedule = _make_schedule(config)
+    assert schedule.std == pytest.approx(1.7)
+
+
+def test_make_schedule_default_timestep_std_is_the_byte_identical_one() -> None:
+    """The other half of non-vacuity: leaving ``timestep_std`` unset must still yield ``std == 1.0``.
+
+    Without this, a mutation that hardcoded some OTHER constant (e.g. always threading 1.7) would
+    also make the two tests above pass.
+    """
+    from types import SimpleNamespace
+
+    from signet_trainer.train.validate_gate import _make_schedule
+
+    config = SimpleNamespace(training=SimpleNamespace(uniform_prob=0.1, timestep_std=1.0))
+    schedule = _make_schedule(config)
+    assert schedule.std == pytest.approx(1.0)
