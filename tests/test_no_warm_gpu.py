@@ -136,3 +136,77 @@ def test_entrypoint_runs_dryrun_gate_before_remote() -> None:
     assert dryrun_match.start() < remote_match.start(), (
         "the dry-run gate must run before any .spawn() dispatch"
     )
+
+
+def test_h3_sample_gpu_resolved_via_env_override() -> None:
+    """``h3_sample``'s GPU must be ``SIGNET_H3_SAMPLE_GPU``-overridable (house audit, PR #51, HIGH).
+
+    A 3-reference render leg is a known Qwen3-VL text-encode OOM on an A100, and the mitigation
+    (moving that leg to an H200) only exists in the sibling internal repo today. ``@app.function``
+    binds ``gpu=`` at IMPORT time, so the env read has to happen at module import — same seam as
+    ``app.py``'s ``SIGNET_*_SECRET_NAME`` overrides, scanned as TEXT for the same reason
+    ``test_secret_names_resolved_via_env_override`` scans ``app.py`` rather than importing it:
+    importing ``fns.py`` builds the Modal app graph and eagerly resolves every ``Secret.from_name``.
+    """
+    fns_src = (_MODAL_DIR / "fns.py").read_text(encoding="utf-8")
+    assert "SIGNET_H3_SAMPLE_GPU" in fns_src, (
+        "fns.py must read SIGNET_H3_SAMPLE_GPU for the h3_sample GPU override"
+    )
+    assert re.search(
+        r'H3_SAMPLE_GPU\s*=\s*_os\.environ\.get\(\s*"SIGNET_H3_SAMPLE_GPU"\s*,\s*"A100-80GB"\s*\)',
+        fns_src,
+    ), "SIGNET_H3_SAMPLE_GPU's default must stay the unchanged 'A100-80GB'"
+
+    # The decorator must actually READ the constant — a hardcoded literal alongside it would make
+    # the env seam dead code declared but never wired.
+    h3_sample_def = re.search(r"\ndef h3_sample\(", fns_src)
+    assert h3_sample_def is not None, "expected a top-level h3_sample( def in fns.py"
+    decorator_start = fns_src.rfind("@app.function", 0, h3_sample_def.start())
+    assert decorator_start != -1, "expected an @app.function decorator immediately above h3_sample"
+    decorator_src = _strip_comments_and_docstrings(fns_src[decorator_start : h3_sample_def.start()])
+    assert re.search(r"gpu\s*=\s*H3_SAMPLE_GPU\b", decorator_src), (
+        "h3_sample's @app.function must set gpu=H3_SAMPLE_GPU, not a hardcoded literal"
+    )
+    assert "A100-80GB" not in decorator_src, (
+        "h3_sample's gpu= must not fall back to a hardcoded literal alongside the env-driven "
+        "constant — that would shadow the override"
+    )
+
+
+def test_h3_sample_gpu_env_var_actually_changes_the_value() -> None:
+    """Behavioral half of the above: exec the REAL ``H3_SAMPLE_GPU`` assignment out of fns.py's own
+    parsed source (same technique ``tests/test_h3_reference_descriptors.py::_resolver`` uses to test
+    ``_h3_resolve_references`` without importing the Modal app graph) and prove the env var actually
+    reaches it, both directions.
+    """
+    import ast
+    import os
+
+    fns_src = (_MODAL_DIR / "fns.py").read_text(encoding="utf-8")
+    tree = ast.parse(fns_src)
+    assign = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "H3_SAMPLE_GPU"
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[assign], type_ignores=[]))
+    code = compile(module, "<fns-h3-sample-gpu-slice>", "exec")
+
+    saved = os.environ.pop("SIGNET_H3_SAMPLE_GPU", None)
+    try:
+        namespace: dict = {"_os": os}
+        exec(code, namespace)  # noqa: S102
+        assert namespace["H3_SAMPLE_GPU"] == "A100-80GB", "default must be unchanged"
+
+        os.environ["SIGNET_H3_SAMPLE_GPU"] = "H200"
+        namespace = {"_os": os}
+        exec(code, namespace)  # noqa: S102
+        assert namespace["H3_SAMPLE_GPU"] == "H200", "the env override must actually take effect"
+    finally:
+        if saved is None:
+            os.environ.pop("SIGNET_H3_SAMPLE_GPU", None)
+        else:
+            os.environ["SIGNET_H3_SAMPLE_GPU"] = saved

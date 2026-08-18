@@ -518,7 +518,13 @@ def test_both_stages_declare_the_h3_image_and_the_memory_request(stage: str) -> 
     assert "memory=" in decorator
     # ``ast.unparse`` normalizes string quoting, so match the value rather than the literal.
     assert "gpu=" in decorator
-    assert "A100-80GB" in decorator
+    if stage == "h3_sample":
+        # house audit (PR #51, HIGH): a 3-reference render leg is a known Qwen3-VL text-encode OOM
+        # on an A100, so h3_sample's gpu reads SIGNET_H3_SAMPLE_GPU instead of a bare literal — the
+        # constant's default is still "A100-80GB", pinned by name over in test_no_warm_gpu.py.
+        assert "gpu=H3_SAMPLE_GPU" in decorator
+    else:
+        assert "A100-80GB" in decorator
 
 
 def test_h3_train_declares_retries_and_h3_sample_does_not() -> None:

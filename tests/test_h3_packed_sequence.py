@@ -986,12 +986,22 @@ def test_three_of_three_selection_is_the_identity_permutation() -> None:
 def test_at_most_one_environment_reference_even_at_three_slots() -> None:
     """The environment cap is a property of SUBSTITUTION, not of the slot count.
 
-    Regression guard: the cap used to be computed as ``references_per_sample - 1``, which happened
-    to equal 1 only while the count was pinned at 2. At 3 it admitted a second environment that the
-    call site then dropped silently, because only ``environments[0]`` is ever passed through.
-    """
-    from signet_trainer.conditioning.h3_ref import H3Reference, resolve_reference_slots
+    Regression guard (house audit, PR #51, MAJOR-2): the cap used to be computed as
+    ``references_per_sample - 1``, which happened to equal 1 only while the count was pinned at 2.
+    At 3 it admitted a SECOND environment reference that the call site then dropped silently,
+    because only ``environments[0]`` is ever passed through to ``resolve_reference_slots``.
 
+    ``resolve_reference_slots`` itself has NO environment-cap logic — it just takes the single
+    ``environment_reference`` argument it is handed. The hardened cap lives one layer up, in
+    ``H3RefStrategy._resolve_slots`` (``h3_ref.py:854``), which is what must be driven here. A
+    version of this test that only calls the free function (as the original did) is vacuous: it
+    cannot fail even if the cap in ``_resolve_slots`` is reverted, because it never reaches that
+    line. Mutation-checked: reverting line 854 to ``references_per_sample - 1`` makes this test
+    fail.
+    """
+    from signet_trainer.conditioning.h3_ref import H3Reference, H3RefStrategy
+
+    strategy = H3RefStrategy(references_per_sample=3)
     characters = [
         H3Reference(path=f"refs/char_{s}.png", kind="character", subject_id=s,
                     width=1024, height=1536)
@@ -1002,10 +1012,9 @@ def test_at_most_one_environment_reference_even_at_three_slots() -> None:
                     width=1344, height=768)
         for i in range(2)
     ]
-    # one environment substitutes for the last character slot and is fine at 3
-    slots = resolve_reference_slots(0, characters, environments[0], references_per_sample=3)
-    assert len(slots) == 3
-    assert sum(1 for s in slots if s.kind == "environment") == 1
+    pool = [(ref, torch.zeros(1, 1, 1)) for ref in (*characters, *environments)]
+    with pytest.raises(ValueError, match="environment reference"):
+        strategy._resolve_slots(0, pool)
 
 
 # --------------------------------------------------------------------------------------------------
