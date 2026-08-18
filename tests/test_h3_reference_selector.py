@@ -331,8 +331,24 @@ def test_the_embe_eval_is_a_clean_split_one_axis_per_comparison() -> None:
 #: carry it are in the caption grammar and prompt 6 (prompt 5 with it removed) isolates the lever.
 _AUDIO_TAG = ", silent footage"
 
+#: In-house Phase 10 eval matrix — 0 files on a published clone (CONTRIBUTING.md documents this
+#: file as non-signal there). Hoisted to a module constant per the loud-guard pattern already used
+#: at ``test_h3_pipeline_local_source.py:316-320``: emptiness must surface as a guard-test failure
+#: plus a skip-with-reason on the parametrized test below, never as a test that iterates over
+#: nothing and still reports PASSED (issue #41 finding 2).
+_EMBE_SAMPLE_CONFIGS = sorted(
+    Path(__file__).resolve().parents[1].glob("configs/h3_embe_r1_sample*.yaml")
+)
 
-def test_the_audio_control_tag_probe_isolates_exactly_one_lever() -> None:
+
+def test_the_embe_sample_configs_exist() -> None:
+    """Guard for ``_EMBE_SAMPLE_CONFIGS``. On a published clone this FAILS loudly instead of
+    letting ``test_the_audio_control_tag_probe_isolates_exactly_one_lever`` pass over zero cases."""
+    assert len(_EMBE_SAMPLE_CONFIGS) == 5
+
+
+@pytest.mark.parametrize("path", _EMBE_SAMPLE_CONFIGS, ids=lambda p: p.name)
+def test_the_audio_control_tag_probe_isolates_exactly_one_lever(path: Path) -> None:
     """D-10-AUDIO: prompt 6 must be prompt 5 with the tag REMOVED and nothing else changed.
 
     H3 is guidance-distilled with no negative branch, so NEGATION may reinforce rather than
@@ -341,18 +357,16 @@ def test_the_audio_control_tag_probe_isolates_exactly_one_lever() -> None:
     """
     from signet_trainer.config.load import load_config  # noqa: PLC0415
 
-    repo = Path(__file__).resolve().parents[1]
-    for path in sorted(repo.glob("configs/h3_embe_r1_sample*.yaml")):
-        prompts = list(load_config(str(path)).validation.prompts)
-        assert len(prompts) == 6, f"{path.name}: the eval set is 6 prompts"
-        assert prompts[4] == prompts[5] + _AUDIO_TAG, (
-            f"{path.name}: prompt 6 must be prompt 5 with `{_AUDIO_TAG}` removed and NOTHING else "
-            f"changed, or the omission probe measures a prompt difference instead of the lever"
-        )
-        assert all(p.endswith(_AUDIO_TAG) for p in prompts[:5]), (
-            f"{path.name}: prompts 1-5 must all carry the control tag verbatim — a named "
-            f"association is steerable, an inconsistent one is not"
-        )
+    prompts = list(load_config(str(path)).validation.prompts)
+    assert len(prompts) == 6, f"{path.name}: the eval set is 6 prompts"
+    assert prompts[4] == prompts[5] + _AUDIO_TAG, (
+        f"{path.name}: prompt 6 must be prompt 5 with `{_AUDIO_TAG}` removed and NOTHING else "
+        f"changed, or the omission probe measures a prompt difference instead of the lever"
+    )
+    assert all(p.endswith(_AUDIO_TAG) for p in prompts[:5]), (
+        f"{path.name}: prompts 1-5 must all carry the control tag verbatim — a named "
+        f"association is steerable, an inconsistent one is not"
+    )
 
 
 def test_the_eval_set_is_ranging_weighted_not_caption_dominated() -> None:
@@ -386,15 +400,23 @@ def test_the_eval_set_is_ranging_weighted_not_caption_dominated() -> None:
 
 
 def test_every_shipped_h3_config_still_loads_and_declares_its_slots() -> None:
-    """A config that names a condition must also DECLARE those subjects' sizes, or it is unpriced."""
+    """A config that names a condition must also DECLARE those subjects' sizes, or it is unpriced.
+
+    ``exercised`` guards against the unconditional-``continue`` failure mode (issue #41 finding 2):
+    if every shipped ``h3_*.yaml`` skips (as the sole clone-shipped ``h3_t2va_noref.example.yaml``
+    does today — it deliberately names no condition), the loop body never runs an assertion and the
+    test would otherwise report PASSED having checked nothing.
+    """
     from signet_trainer.config.load import load_config  # noqa: PLC0415
 
     repo = Path(__file__).resolve().parents[1]
+    exercised = False
     for path in sorted((repo / "configs").glob("h3_*.yaml")):
         config = load_config(str(path))
         wanted = list(config.validation.reference_subject_ids)
         if not wanted:
             continue
+        exercised = True
         declared = {
             str(entry[2])
             for entry in [
@@ -408,3 +430,4 @@ def test_every_shipped_h3_config_still_loads_and_declares_its_slots() -> None:
             f"h3.character_reference_sizes / h3.environment_reference_sizes. An undeclared subject "
             f"is a reference the worst-case packed-row budget never priced."
         )
+    assert exercised, "no shipped h3 config names a condition — this check ran on nothing"

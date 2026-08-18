@@ -285,13 +285,21 @@ def test_a_pin_that_is_a_path_is_refused(bad: str) -> None:
 
 def test_the_render_knobs_are_refused_under_a_non_h3_family() -> None:
     """The lean field-split REVERSE guard covers them automatically (it diffs a pristine H3Config),
-    so an LTX config that sets one gets a config-load error instead of a silent no-op."""
+    so an LTX config that sets one gets a config-load error instead of a silent no-op.
+
+    Sources the SHIPPED ``configs/ltx23_lora.example.yaml`` rather than an unpublished in-house
+    fixture (issue #41 finding 3): this is a pure library-behaviour assertion —
+    ``load_config_from_text`` must refuse an ``h3:`` knob under a non-h3 family — and needs no
+    private carrier to demonstrate that. Any non-h3 config would do; this one ships in every clone.
+    """
     pytest.importorskip("torch")
     import yaml  # noqa: PLC0415
 
     from signet_trainer.config.load import load_config_from_text  # noqa: PLC0415
 
-    raw = yaml.safe_load((REPO / "configs" / "embe_r1_sample.yaml").read_text(encoding="utf-8"))
+    raw = yaml.safe_load(
+        (REPO / "configs" / "ltx23_lora.example.yaml").read_text(encoding="utf-8")
+    )
     # No `model:` block at all — the LTX family is the schema default, which is precisely the
     # config shape a stray h3 knob would hide in.
     assert raw.get("model", {}).get("family", "ltx") != "h3", (
