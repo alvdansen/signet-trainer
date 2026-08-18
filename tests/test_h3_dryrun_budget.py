@@ -435,6 +435,10 @@ def _h3_three_ref_payload(short_edge: int, **over) -> dict:
         },
         "model": {"family": "h3"},
         "training": {"max_steps": 100},
+        # The 3-ref campaign renders AT its trained length (22 frames, off the 5-15s band), so the
+        # real config carries the waiver — without it the schema-level renderable-band guard (#20
+        # item 1, landed after this fixture was written) refuses the inherited frame_count default.
+        "validation": {"allow_offband_frame_count": True},
         "h3": {
             "references_per_sample": 3,
             "character_reference_sizes": list(_THREE_REF_SIZES),

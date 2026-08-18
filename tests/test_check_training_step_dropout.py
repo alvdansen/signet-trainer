@@ -37,7 +37,7 @@ def _stubbed_gate(monkeypatch, *, captured: dict) -> None:
         def parameters(self):
             return iter([param])
 
-    def _fake_inject_lora(transformer, lora_config):  # noqa: ANN001
+    def _fake_inject_lora(transformer, lora_config, **kwargs):  # noqa: ANN001
         return _FakeModel()
 
     def _fake_training_step(model, batch, schedule, rng, **kwargs):  # noqa: ANN001
