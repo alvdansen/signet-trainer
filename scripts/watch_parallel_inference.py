@@ -39,6 +39,7 @@ from signet_trainer.inference.samples_layout import (  # noqa: E402
     landed_render_ids,
     samples_root,
 )
+from signet_trainer.inference.stall_clock import next_pending_since  # noqa: E402
 from signet_trainer.modal.session_cap import (  # noqa: E402
     append_spend as _append_spend,
     read_ledger,
@@ -412,9 +413,15 @@ def main() -> None:
             if not landed:
                 # PROGRESS REFRESH (issue #45 PR-1 must-fix #1): reset the clock on evidence of life
                 # BEFORE measuring staleness, not after — see the RENDER_STALL_MIN comment above for
-                # why render_landed's coarse check cannot supply this signal on its own.
+                # why render_landed's coarse check cannot supply this signal on its own. The
+                # DECISION itself is delegated to next_pending_since() (inference/stall_clock.py) — a
+                # pure, importable function, not an inline comparison — because a PR-2 verifier
+                # caught a semantic inversion of this exact comparison (`!=` -> `==`) surviving every
+                # test in tests/test_watcher_hardening.py; those tests only scan main()'s SOURCE and
+                # cannot exercise a decision that lives only inline. See
+                # tests/test_watcher_pending_clock.py for the behavioral coverage that closes it.
                 progress = render_progress_artifacts(pending_checkpoint)
-                if progress != pending_progress:
+                if next_pending_since(progress, pending_progress, pending_since, time.time()) != pending_since:
                     print(f"[watcher] render step {pending_step}: new committed artifact(s) "
                           f"({len(progress)} total) — resetting the stall clock.", flush=True)
                     pending_progress = progress
