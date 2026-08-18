@@ -8,7 +8,37 @@ only from the operator's own signed-in devices). One process, N port forwards. S
 Usage: python scripts/_tailnet_relay.py <tailscale-ip> <port> [<port> ...]
 """
 import asyncio
+import ipaddress
 import sys
+
+#: Tailscale's CGNAT range (100.64.0.0/10) — the ONLY range this relay may bind to. Issue #40
+#: finding 5: sys.argv[1] used to reach asyncio.start_server(host=...) with zero validation, so
+#: a plausible typo (0.0.0.0 when `tailscale ip -4` isn't to hand) bound silently and exposed the
+#: reviewed surface to the whole LAN despite the module docstring's "NEVER 0.0.0.0" promise.
+_TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _validate_tailnet_host(raw: str) -> str:
+    """Reject anything that is not a literal address inside Tailscale's CGNAT range.
+
+    Exits (via SystemExit, caught by ``main``'s caller as a non-zero process exit) rather than
+    binding, and names the command that produces a correct value.
+    """
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        raise SystemExit(
+            f"[relay] refusing to bind: {raw!r} is not a valid IP address. Run `tailscale ip -4` "
+            f"and pass ITS output as the host argument."
+        )
+    if addr not in _TAILSCALE_CGNAT:
+        raise SystemExit(
+            f"[relay] refusing to bind: {raw!r} is not in Tailscale's CGNAT range "
+            f"({_TAILSCALE_CGNAT}) — binding outside it (0.0.0.0, ::, a LAN IP, ...) would expose "
+            f"the reviewed surface beyond the tailnet, which this relay exists to prevent. Run "
+            f"`tailscale ip -4` and pass ITS output as the host argument."
+        )
+    return raw
 
 
 async def pipe(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -38,7 +68,7 @@ async def handle(port: int, cr: asyncio.StreamReader, cw: asyncio.StreamWriter) 
 
 
 async def main() -> None:
-    ip, ports = sys.argv[1], [int(p) for p in sys.argv[2:]]
+    ip, ports = _validate_tailnet_host(sys.argv[1]), [int(p) for p in sys.argv[2:]]
     servers = []
     for port in ports:
         servers.append(await asyncio.start_server(
