@@ -1804,6 +1804,36 @@ class ValidationConfig(_Base):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_prompt_slug_collision(self) -> "ValidationConfig":
+        # #22 finding 5 (cheap slice): inference/grid.py's `slug()` is the SOLE per-row clip
+        # filename key for validation.prompts renders, and it truncates every prompt to its first
+        # 60 alnum-ish characters (_SLUG_MAX_LEN). Two prompts sharing that prefix collide on the
+        # same filename. Before resume (D-8) this was a silent overwrite; under resume it is a
+        # silently SKIPPED render — `_render` finds the file already non-empty from the FIRST
+        # prompt and never renders the second, so the colliding row shows the first prompt's
+        # pixels and zero GPU work ever reveals it. The house eval convention (a couple of
+        # in-distribution prompts plus ranging probes built on the same anchor words) actively
+        # produces near-duplicate 60-char prefixes, so this is refused for free at config load
+        # rather than discovered inside a metered container.
+        from signet_trainer.inference.grid import slug  # noqa: PLC0415 — stdlib-only at module scope
+
+        by_slug: dict[str, list[str]] = {}
+        for p in self.prompts:
+            by_slug.setdefault(slug(p), []).append(p)
+        collisions = {k: v for k, v in by_slug.items() if len(v) > 1}
+        if collisions:
+            raise ValueError(
+                f"validation.prompts has {len(collisions)} slug collision(s) — prompts that "
+                f"reduce to the SAME inference/grid.py `slug()` (first ~60 alnum-ish characters): "
+                f"{collisions}. Under resume the colliding row's render is silently SKIPPED (the "
+                "second prompt never gets its own file — `_render` sees the first prompt's file "
+                "already non-empty and moves on), showing one prompt's pixels under the other's "
+                "banner with no GPU work to reveal it (#22 finding 5). Reword one of each "
+                "colliding pair so their first ~60 characters differ."
+            )
+        return self
+
 
 class ConditioningItem(_Base):
     """One multi-frame keyframe: which pixel frame to anchor, its image, and its strength (D-6-ITEMS).

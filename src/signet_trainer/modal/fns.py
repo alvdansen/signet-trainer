@@ -1089,17 +1089,30 @@ def sample(config_yaml: str) -> None:
     # PHASE B of the two-phase load: with_text_encoder=False whenever PHASE A cached the prompt
     # embeddings (multi_frame) — the render loop never touches Gemma, so it is never loaded
     # alongside the 22B transformer. Every other mode keeps the byte-identical default (True).
-    components = load_ltxv_components(
-        checkpoint_path=checkpoint_path,
-        text_encoder_path=text_encoder_path,
-        device=device,
-        with_video_vae_decoder=True,
-        with_text_encoder=cached_by_prompt is None,
-        # a2v render (2026-07-15 burned dispatch): the driving .wav is VAE-encoded at sample time,
-        # so the audio VAE ENCODER must ride the components load for audio_to_video mode — the
-        # run_audio_condition_sampler guard hard-fails without it. All other modes: byte-identical
-        # default (False; decoder/vocoder stay OFF regardless).
-        with_audio_vae_encoder=config.conditioning.mode == "audio_to_video",
+    #
+    # SKIP entirely for the ic_lora_baseline leg (#22 finding 2): with two_stage=True, PHASE A
+    # above never runs (cached_by_prompt stays None), so with_text_encoder would resolve True and
+    # this load would drag the full 22B transformer + Gemma-12B onto CUDA — components the
+    # `ic_lora_baseline` branch below (3e-baseline) never reads; it builds its own ICLoraPipeline
+    # from raw weight paths and owns its own Gemma. Two 22B transformers + two Gemma-12Bs cannot
+    # coexist on one A100-80GB (the two-phase VRAM rule) — guaranteed OOM before the first clip.
+    # No branch between here and 3e-baseline matches `conditioning.mode == "ic_lora"` (each checks
+    # a different mode string), so `components` is never read on this leg before the early return.
+    components = (
+        None
+        if (config.conditioning.mode == "ic_lora" and two_stage)
+        else load_ltxv_components(
+            checkpoint_path=checkpoint_path,
+            text_encoder_path=text_encoder_path,
+            device=device,
+            with_video_vae_decoder=True,
+            with_text_encoder=cached_by_prompt is None,
+            # a2v render (2026-07-15 burned dispatch): the driving .wav is VAE-encoded at sample
+            # time, so the audio VAE ENCODER must ride the components load for audio_to_video mode
+            # — the run_audio_condition_sampler guard hard-fails without it. All other modes:
+            # byte-identical default (False; decoder/vocoder stay OFF regardless).
+            with_audio_vae_encoder=config.conditioning.mode == "audio_to_video",
+        )
     )
 
     fps = config.validation.frame_rate
