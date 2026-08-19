@@ -90,7 +90,7 @@ def test_disabled_backup_mode_aborts_before_dry_run(tmp_path, monkeypatch, mode)
     # If the guard did not fire we would reach the dry-run gate — make that loud so the test cannot
     # pass for the wrong reason (e.g. a refusal that happens to also raise SystemExit later, post-cost).
     monkeypatch.setattr(
-        entrypoint, "run_dryrun", lambda cfg: pytest.fail("reached dry-run — 1c guard did not fire")
+        entrypoint, "run_dryrun", lambda cfg, mode=None: pytest.fail("reached dry-run — 1c guard did not fire")
     )
 
     with pytest.raises(SystemExit) as exc:
@@ -111,7 +111,7 @@ def test_enabled_backup_mode_passes_the_gate_and_reaches_dry_run(tmp_path, monke
     # not a blanket refusal of backup/restore).
     entrypoint, raw_main = _raw_main()
     _stub_backup_fns(monkeypatch)
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 7)  # sentinel -> SystemExit(7)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 7)  # sentinel -> SystemExit(7)
 
     with pytest.raises(SystemExit) as exc:
         raw_main(config=_write_config(tmp_path, _ENABLED_BACKUP_CONFIG), approve=True, mode="backup")
@@ -140,7 +140,10 @@ def test_disabled_backup_does_not_affect_train_mode(tmp_path, monkeypatch) -> No
 
     train_rec = _RecordingFn()
     monkeypatch.setattr(fns, "train", train_rec)
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
+    # #73: an approved train dispatch books the ledger — neutralize so this test never writes the
+    # default project-relative SESSION-STATE.json (un-skips the live-harness lints for later runs).
+    monkeypatch.setattr(entrypoint, "append_spend", lambda *a, **k: None)
 
     raw_main(config=_write_config(tmp_path, _DISABLED_BACKUP_CONFIG), approve=True, mode="train")
 

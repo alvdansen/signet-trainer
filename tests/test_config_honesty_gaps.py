@@ -189,6 +189,13 @@ def test_inband_training_length_prints_no_notice(capsys) -> None:
     SignetConfig.model_validate(
         _h3_payload(
             training_dims=[1344, 768, 124],
+            # #77's coherence guard: the declared bucket must agree with training_dims F now that
+            # buckets are load-bearing on h3 — keep the fixture coherent at 124.
+            data={
+                "preprocessed_data_root": "/data/h3_preprocessed",
+                "batch_size": 1,
+                "resolution_buckets": ["1344x768x124"],
+            },
             validation={"frame_count": 124},
             # A 124f NO-REFERENCE campaign busts the measured 13,777-row ceiling (unrelated to
             # this test) — widen the budget so only the notice logic under test is exercised.
