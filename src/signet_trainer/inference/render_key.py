@@ -31,9 +31,16 @@ break the dry-run gate's Anti-Pattern-6 assertion for the whole session.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-__all__ = ["h3_base_render_key", "h3_render_key", "qwen_edit_render_key"]
+__all__ = [
+    "clip_already_rendered",
+    "h3_base_render_key",
+    "h3_render_key",
+    "ltx_render_key",
+    "qwen_edit_render_key",
+]
 
 #: Characters allowed through into a directory name. Everything else becomes ``_`` — a checkpoint
 #: name is derived from a Volume path, and a separator or a ``..`` in it would escape the samples
@@ -133,6 +140,89 @@ def h3_base_render_key(
     """
     ids = "-".join(_sanitize(str(s)) for s in subject_ids) or "noref"
     return f"s{int(seed)}_f{int(frame_count)}_w{int(width)}_h{int(height)}_n{int(num_inference_steps)}_{ids}"
+
+
+def ltx_render_key(
+    *,
+    checkpoint: str,
+    seed: int,
+    frame_count: int,
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    guidance_scale: float,
+    stg_scale: float,
+    condition: str,
+) -> str:
+    """The LTX ``sample`` render's identity as ONE directory name (issue #45 PR-2):
+    ``<checkpoint>_s<seed>_f<frames>_w<width>_h<height>_n<steps>_g<guidance>_st<stg>_<condition>``.
+
+    PR-2 sibling of ``h3_render_key``: the LTX ``sample`` branches used to key their samples dir on
+    the WALL CLOCK (``strftime``), so a server-side retry (or manual re-dispatch) of a preempted
+    render computed a NEW dir, found nothing to skip, and re-rendered every clip from zero — on a
+    preemption cycle shorter than the render the run could NEVER finish, and ``sample``'s
+    ``retries=3`` multiplied the burn 4x instead of self-healing it. Keyed on WHAT is rendered, a
+    retry RESUMES.
+
+    ⚠ **The first cut of this key carried only ``checkpoint`` / ``seed`` / ``frame_count`` /
+    ``condition`` and was refuted on review**: ``validation.width`` / ``height`` /
+    ``num_inference_steps`` / ``guidance_scale`` / ``stg_scale`` are exactly as load-bearing to WHAT
+    GETS RENDERED as ``frame_count`` (mirrors ``h3_render_key``'s #22 finding 5) —
+    ``write_comparison_gallery`` and its siblings stamp every one of them into the banner. A settings
+    sweep at a fixed checkpoint/seed/frame_count that omitted them would land in the SAME directory,
+    the ``_clip_done`` skip guard would treat the OLD settings' clips as already rendered, and the
+    banner would claim the NEW settings for pixels rendered under the old ones — silent, at a valid
+    shape, on precisely the axis a sweep exists to vary. Every geometry/sampling axis the ``pipe(...)``
+    call reads is in this key for that reason.
+
+    **The per-clip PROMPT axis is deliberately NOT in the key** (mirrors ``h3_render_key``'s prompt
+    handling): each clip's own filename carries ``{slug(prompt)}...``, so sibling renders that differ
+    only in their prompt set land in the SAME directory and simply render the missing filenames —
+    they never skip each other's clips. Promoting the prompt set into the directory name would only
+    make the path longer, not safer.
+
+    Deliberately human-readable rather than a hash — this name is what an operator reads off a
+    ``modal volume ls``.
+
+    Args:
+        checkpoint: The resolved checkpoint directory NAME (``find_latest``'s per-step dir), or the
+            branch's honest substrate label when no trained adapter exists (e.g. ``"base"``).
+        seed: The render seed — every column uses it, so it identifies the set.
+        frame_count: ``validation.frame_count``; the LENGTH axis.
+        width: ``validation.width`` fed to the render call — a GEOMETRY axis.
+        height: ``validation.height`` fed to the render call — a GEOMETRY axis.
+        num_inference_steps: ``validation.num_inference_steps`` — the SAMPLING axis.
+        guidance_scale: ``validation.guidance_scale`` — a SAMPLING axis.
+        stg_scale: ``validation.stg_scale`` — a SAMPLING axis.
+        condition: The conditioning axis (the branch's ``conditioning.mode`` variant, e.g.
+            ``"single_frame"``; the base-vs-LoRA branch passes a constant such as ``"none"``).
+
+    Returns:
+        A filesystem-safe directory name containing no path separator.
+    """
+    return (
+        f"{_sanitize(str(checkpoint))}_s{int(seed)}_f{int(frame_count)}_w{int(width)}_"
+        f"h{int(height)}_n{int(num_inference_steps)}_g{guidance_scale:g}_st{stg_scale:g}_"
+        f"{_sanitize(str(condition)) or 'none'}"
+    )
+
+
+def clip_already_rendered(path: Path | str) -> bool:
+    """The resume PREDICATE every ``sample()`` render site guards its save on (issue #45 PR-2).
+
+    ``True`` only for a NON-EMPTY existing file — a container killed mid-``save_video`` leaves a
+    0-byte file at ``path``, and treating that as "already rendered" would put a corrupt clip in
+    the grid rather than re-render it (mirrors ``h3_sample``'s own resume guard, same rationale).
+
+    Lives here — stdlib-only — for the same reason every other function in this module does: a
+    test reaching it must never import ``modal/fns.py`` and drag ``modal`` into ``sys.modules`` for
+    the whole pytest session. ``fns.py``'s ``sample()`` imports this SAME function (never a
+    re-implementation) as its per-branch skip guard, so a test exercising this predicate against a
+    real file is exercising the actual resume check every LTX render site runs, not a parallel
+    stand-in for it.
+    """
+    p = Path(path)
+    return p.exists() and p.stat().st_size > 0
 
 
 def qwen_edit_render_key(*, checkpoint: str, seed: int, control_ids: Any) -> str:

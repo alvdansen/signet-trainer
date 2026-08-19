@@ -34,10 +34,13 @@ _FNS = _ROOT / "src" / "signet_trainer" / "modal" / "fns.py"
 #: Anchor every ``{fn}.`` scan so an ``h3_``-prefixed dispatch cannot satisfy an LTX assertion.
 #:
 #: Phase 10 (H3-07) added ``h3_train`` / ``h3_sample`` / ``h3_preprocess`` alongside the LTX three,
-#: and ``h3_train.with_options(timeout=`` literally CONTAINS ``train.with_options(timeout=`` — so the
-#: unanchored form below made ``test_train_dispatch_stays_24h_no_with_options`` fail while LTX
-#: ``train`` was in fact still a bare ``train.spawn(config_text)``. The assertion was reporting on
-#: the wrong function. Same lookbehind the sibling gate scans use.
+#: and ``h3_train.with_options(timeout=`` literally CONTAINS ``train.with_options(timeout=`` — so an
+#: unanchored scan for one dispatch form can spuriously match the OTHER function's line. (Historical
+#: note: this bit an earlier version of ``test_train_dispatch_no_longer_stays_24h_no_with_options``
+#: back when LTX ``train`` was still a bare ``train.spawn(config_text)`` and the H3 match was the
+#: false positive; issue #45 PR-2 retired that exemption, but the anchor stays load-bearing for the
+#: ``qwen_edit_train`` / ``wan_train`` scans below, which have the identical substring hazard.) Same
+#: lookbehind the sibling gate scans use.
 _ANCHOR = r"(?<![\w.])"
 
 
@@ -93,30 +96,47 @@ def test_derived_timeout_reads_est_hours_and_timeout_margin() -> None:
     )
 
 
-def test_train_dispatch_stays_24h_no_with_options() -> None:
-    """LTX train() keeps its 24h decorator: its dispatch stays a bare ``train.spawn(config_text)``."""
+def test_train_dispatch_no_longer_stays_24h_no_with_options() -> None:
+    """issue #45 PR-2 RETIRED LTX train()'s 24h-decorator exemption (AUDIT-#5's original deviation).
+
+    LTX train's dispatch used to stay a bare ``train.spawn(config_text)`` so a driver-level hang
+    would burn to the fixed 24h decorator ceiling — the SAME gap the H3/qwen_edit/wan train arms
+    already closed for themselves (see the two positive assertions below). PR-2 closed it for LTX
+    train too, for a SECOND reason beyond the hang: the cost gate now prices the worst-case ceiling
+    as ``rate * bounded_hours * lives``, and pricing a bound the dispatch never actually used would
+    make the printed/guardrailed estimate dishonest. train's dispatch now carries the SAME
+    config-derived timeout bound every other GPU arm uses.
+    """
     code = _entrypoint_code()
-    assert re.search(rf"{_ANCHOR}train\.spawn\s*\(\s*config_text\s*\)", code), (
-        "train must dispatch as a bare train.spawn(config_text) (keeps the 24h decorator ceiling; AUDIT-#5)"
+    assert re.search(
+        rf"{_ANCHOR}train\.with_options\(timeout=train_timeout_s\)\.spawn\s*\(\s*config_text\s*\)",
+        code,
+    ), (
+        "train must dispatch via train.with_options(timeout=train_timeout_s).spawn(config_text) — "
+        "the 24h-decorator exemption is retired (issue #45 PR-2)"
     )
-    assert not re.search(rf"{_ANCHOR}train\.with_options\(\s*timeout\s*=", code), (
-        "train must NOT override its timeout via with_options — it keeps the 24h decorator (AUDIT-#5)"
-    )
 
 
-def test_h3_train_DOES_bound_its_shell_with_a_config_derived_timeout() -> None:
-    """The H3 train arm deliberately DIVERGES from LTX train's 24h decorator ceiling (10-12).
-
-    Pinned as a positive claim rather than merely tolerated by the anchoring above, so the deviation
-    is a documented property instead of a gap. Reason: LTX ``train``'s exemption predates the H3
-    figures — a driver-level hang on a 61.7 GiB model burning to the 24h ceiling is ~$40 of A100 for
-    nothing, so the H3 arm bounds the metered shell at ``est_hours * timeout_margin`` like the sample
-    and preprocess arms.
+def test_h3_train_and_qwen_edit_train_and_wan_train_bound_their_shell_with_a_config_derived_timeout() -> None:
+    """The H3 / qwen_edit / wan train arms bound their metered shell at ``est_hours *
+    timeout_margin`` — LTX train (above) now matches them uniformly (issue #45 PR-2 retired the
+    deviation this test used to document); pinned here as a positive claim on the OTHER three arms
+    so a future regression can't quietly re-exempt any of the four from the config-derived bound.
+    Reason it matters beyond honesty in the cost print: a driver-level hang burning to a bare 24h
+    decorator ceiling is ~$40+ of A100 for nothing.
     """
     code = _entrypoint_code()
     assert re.search(r"h3_train\.with_options\(\s*timeout\s*=[^)]*\)\.spawn\s*\(", code), (
         "the H3 train arm must dispatch via h3_train.with_options(timeout=...).spawn(...) — a "
         "config-derived bound on the metered shell, not the 24h decorator ceiling"
+    )
+    assert re.search(r"qwen_edit_train\.with_options\(\s*timeout\s*=[^)]*\)\.spawn\s*\(", code), (
+        "the qwen_edit train arm must dispatch via qwen_edit_train.with_options(timeout=...)."
+        "spawn(...) — a config-derived bound on the metered shell"
+    )
+    assert re.search(r"wan_train\.with_options\(\s*timeout\s*=[^)]*\)\.spawn\s*\(", code), (
+        "the wan train arm must dispatch via wan_train.with_options(timeout=...).spawn(...) — a "
+        "config-derived bound on the metered shell"
     )
 
 

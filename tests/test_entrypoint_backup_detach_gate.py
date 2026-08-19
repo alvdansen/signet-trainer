@@ -27,6 +27,11 @@ data:
   preprocessed_data_root: "precomputed"
 training:
   max_steps: 10
+modal:
+  # explicit generous values: this file tests the backup/detach gates, not the worst-case-priced
+  # guardrail/cap (issue #45 PR-2), whose house defaults would refuse the train dispatch first.
+  cost_guardrail_usd: 500.0
+  session_cap_usd: 500.0
 """
 
 _ENABLED_BACKUP_CONFIG = """
@@ -52,6 +57,11 @@ class _RecordingCall:
 class _RecordingFn:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+
+    def with_options(self, **_kwargs) -> "_RecordingFn":
+        # issue #45 PR-2 retired train()'s 24h exemption — it now dispatches via
+        # train.with_options(timeout=...).spawn(...) like every other GPU arm.
+        return self
 
     def spawn(self, *args, **kwargs) -> _RecordingCall:
         self.calls.append((args, kwargs))

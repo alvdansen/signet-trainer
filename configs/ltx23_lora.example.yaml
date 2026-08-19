@@ -57,7 +57,11 @@ offload:
 
 modal:
   hourly_rate_usd: 1.64      # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing
-  cost_guardrail_usd: 50.0
+  # issue #45 PR-2 RE-BASELINE: the gate now prices the WORST-CASE authorized ceiling — rate x
+  # (est_hours x timeout_margin) per container life x (max_retries + 1) lives (train: retries=10 ->
+  # 11 lives). For this config that is 1.64 x (2.0 x 1.5) x 11 = $54.12, so the old $50 guardrail
+  # would BLOCK this example train launch.
+  cost_guardrail_usd: 60.0
   est_hours: 2.0
   # Modal secret NAMES — config-driven so each account uses its own. Defaults match the
   # maintainer account; the app graph reads the same names via env overrides

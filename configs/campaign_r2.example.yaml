@@ -78,7 +78,11 @@ offload:
 
 modal:
   hourly_rate_usd: 1.64      # DEVIATION — A100-80GB rate; the precedent used 4.0 (H100)
-  cost_guardrail_usd: 20.0
+  # issue #45 PR-2 RE-BASELINE: the gate now prices the WORST-CASE authorized ceiling — rate x
+  # (est_hours x timeout_margin) per container life x (max_retries + 1) lives (train: retries=10 ->
+  # 11 lives). For this config that is 1.64 x (8.0 x 1.5) x 11 = $216.48, so the old $20 guardrail
+  # would BLOCK this round's train launch (same chain as campaign_r1.example.yaml — see its comment).
+  cost_guardrail_usd: 220.0
   est_hours: 8.0             # 3000 steps, multi-F + in-loop renders
   huggingface_secret_name: my-huggingface-secret
   wandb_secret_name: my-wandb-secret

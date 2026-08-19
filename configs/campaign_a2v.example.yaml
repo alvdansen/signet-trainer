@@ -89,7 +89,11 @@ offload:
 
 modal:
   hourly_rate_usd: 1.64      # A100-80GB (single-A100 house rule)
-  cost_guardrail_usd: 20.0   # small overfit; session cap tracked separately
+  # issue #45 PR-2 RE-BASELINE: the gate now prices the WORST-CASE authorized ceiling — rate x
+  # (est_hours x timeout_margin) per container life x (max_retries + 1) lives (train: retries=10 ->
+  # 11 lives). For this config that is 1.64 x (1.5 x 1.5) x 11 = $40.59, so the old $20 guardrail
+  # would BLOCK this overfit's train launch.
+  cost_guardrail_usd: 45.0   # small overfit; session cap tracked separately
   est_hours: 1.5             # 600-step overfit
   huggingface_secret_name: my-huggingface-secret
   wandb_secret_name: my-wandb-secret

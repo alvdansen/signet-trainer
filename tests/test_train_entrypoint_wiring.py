@@ -75,9 +75,15 @@ def test_train_remote_passes_config_text() -> None:
 
     The ``configs/`` dir is not shipped into the image, so a path would not resolve remotely — the
     dispatch must pass the config CONTENTS (``config_text``), which the train body re-validates.
+
+    issue #45 PR-2 retired train()'s 24h-decorator exemption, so the dispatch is now
+    ``train.with_options(timeout=train_timeout_s).spawn(config_text)`` rather than a bare
+    ``train.spawn(config_text)`` — this assertion allows an optional ``.with_options(...)`` prefix
+    so it stays about what this test is actually for (config passed BY VALUE), not the timeout wiring
+    (covered by test_entrypoint_timeout_and_prints.py).
     """
     code = _strip_comments_and_docstrings(_ENTRYPOINT.read_text(encoding="utf-8"))
-    assert re.search(r"train\.spawn\s*\(\s*config_text\s*\)", code), (
+    assert re.search(r"train(?:\.with_options\([^)]*\))?\.spawn\s*\(\s*config_text\s*\)", code), (
         "train.spawn(config_text) must forward the config YAML text so the container re-runs the "
         "gate without needing the file on its filesystem"
     )

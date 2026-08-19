@@ -117,9 +117,12 @@ offload:
 modal:
   hourly_rate_usd: 1.64
   # Sized for THIS run, not copied. 250 steps at the method doc's measured 16-25 s/it on a 48GB
-  # A6000 is ~1.1-1.7 h; an A100-80GB should beat that. 6.0 leaves headroom for the first-run
-  # encode without leaving room for a runaway.
-  cost_guardrail_usd: 6.0
+  # A6000 is ~1.1-1.7 h; an A100-80GB should beat that. The single-life $6.0 above named headroom
+  # for the first-run encode; issue #45 PR-2's gate instead prices the WORST-CASE authorized
+  # ceiling — rate x (est_hours x timeout_margin) per container life x (max_retries + 1) lives
+  # (qwen_edit_train: retries=10 -> 11 lives) = 1.64 x (1.5 x 1.5) x 11 = $40.59, which the old
+  # $6.0 guardrail would BLOCK.
+  cost_guardrail_usd: 45.0
   est_hours: 1.5
   huggingface_secret_name: my-huggingface-secret
   wandb_secret_name: my-wandb-secret

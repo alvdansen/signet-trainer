@@ -323,11 +323,17 @@ def test_the_params_helper_is_called_before_the_dispatch_not_inside_it() -> None
 
 
 def test_the_ltx_dispatch_arms_are_untouched() -> None:
-    """The three LTX arms keep their exact dispatch forms — H3 widened nothing about them."""
+    """The three LTX arms keep their exact dispatch forms — H3 widened nothing about them.
+
+    issue #45 PR-2 retired train()'s 24h-decorator exemption (it now dispatches via
+    ``.with_options(timeout=...)`` like the other two arms below) — that change is PR-2's, not
+    H3's, so this test's train assertion was updated to match rather than pinning the pre-PR-2 form.
+    """
     code = _entrypoint_code()
-    assert re.search(r"(?<![\w.])train\.spawn\s*\(\s*config_text\s*\)", code), (
-        "the LTX train arm must still be a bare train.spawn(config_text)"
-    )
+    assert re.search(
+        r"(?<![\w.])train\.with_options\(timeout=train_timeout_s\)\.spawn\s*\(\s*config_text\s*\)",
+        code,
+    ), "the LTX train arm must dispatch via train.with_options(timeout=...).spawn(config_text)"
     assert re.search(
         r"(?<![\w.])sample\.with_options\(timeout=sample_timeout_s\)\.spawn\s*\(\s*config_text\s*\)",
         code,

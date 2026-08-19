@@ -122,7 +122,11 @@ modal:
   # loaded, quantized, injected and completed 250 steps well inside one hour on an A100-80GB. At
   # 20x the steps, 8.0 h is a deliberately loose upper bound — the guardrail exists to stop a
   # runaway, not to be a tight forecast, and a too-tight bound aborts a healthy long run.
-  cost_guardrail_usd: 40.0
+  # issue #45 PR-2 RE-BASELINE: the gate now prices the WORST-CASE authorized ceiling on TOP of
+  # that loose bound — rate x (est_hours x timeout_margin) per container life x (max_retries + 1)
+  # lives (qwen_edit_train: retries=10 -> 11 lives) = 1.64 x (8.0 x 1.5) x 11 = $216.48, which the
+  # old $40 guardrail would BLOCK.
+  cost_guardrail_usd: 220.0
   est_hours: 8.0
   huggingface_secret_name: my-huggingface-secret
   wandb_secret_name: my-wandb-secret

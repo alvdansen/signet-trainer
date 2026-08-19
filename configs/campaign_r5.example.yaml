@@ -84,7 +84,12 @@ offload:
 
 modal:
   hourly_rate_usd: 1.64      # DEVIATION — A100-80GB rate; the precedent used 4.0 (H100)
-  cost_guardrail_usd: 40.0   # per-run guardrail sized for the 10k round (est below); SESSION cap ($200) is separate + needs the operator's bump before dispatch
+  # issue #45 PR-2 RE-BASELINE: the gate now prices the WORST-CASE authorized ceiling — rate x
+  # (est_hours x timeout_margin) per container life x (max_retries + 1) lives (train: retries=10 ->
+  # 11 lives). For this config that is 1.64 x (5.5 x 1.5) x 11 = $148.83, so the old $40 guardrail
+  # would BLOCK this round's train launch — the honest worst case, not the ~$9 single-life estimate
+  # the old comment below still names (kept for the preprocess-dispatch context it describes).
+  cost_guardrail_usd: 150.0  # per-run guardrail sized for the 10k round (est below); SESSION cap ($200) is separate + needs the operator's bump before dispatch
   est_hours: 5.5             # r5: 3000 steps at ~545/hr ≈ 5.5h → train cost print ≈ $9; ALSO used for the preprocess dispatch (encode actual ~20min of 16 short clips, far under this print)
   huggingface_secret_name: my-huggingface-secret
   wandb_secret_name: my-wandb-secret

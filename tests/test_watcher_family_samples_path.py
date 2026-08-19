@@ -129,6 +129,47 @@ def test_ltx_landed_ids_are_the_utc_stamps():
     assert landed_render_ids(_LTX_LISTING, "ltx") == ["20260805T154357Z", "20260805T184725Z"]
 
 
+#: issue #45 PR-2 — post-fix, sample() writes an IDENTITY key (render_key.ltx_render_key), never a
+#: wall-clock stamp, for every non-step-keyed mode.
+_LTX_IDENTITY_LISTING = (
+    "outputs/embe_r1/samples/checkpoint-step-3000_s42_f81_w768_h512_n30_g3_st1_none\n"
+    "outputs/embe_r1/samples/checkpoint-step-3000_s42_f81_w768_h512_n30_g3_st1_single_frame\n"
+)
+
+
+def test_ltx_landed_ids_recognize_the_post_pr2_identity_key():
+    """The blocker a verifier found: sample() stopped writing stamped dirs, but the pre-fix
+    ``landed_render_ids`` only knew ``_LTX_STAMP_RE`` — a listing of real post-PR-2 renders would
+    have matched ZERO ids, reading to the watcher as "nothing landed" and re-dispatching a metered
+    A100 over a render that already committed (the exact phantom-spend shape this module exists to
+    prevent, now wearing a PR-2 disguise instead of an H3 one)."""
+    ids = landed_render_ids(_LTX_IDENTITY_LISTING, "ltx")
+    assert ids == [
+        "checkpoint-step-3000_s42_f81_w768_h512_n30_g3_st1_none",
+        "checkpoint-step-3000_s42_f81_w768_h512_n30_g3_st1_single_frame",
+    ]
+
+
+def test_ltx_landed_ids_union_legacy_stamps_and_the_new_identity_key():
+    """A Volume that has not been fully re-run under the new key carries BOTH eras — a mid-campaign
+    listing must report every render from either, never silently drop one family for the other."""
+    mixed = _LTX_LISTING + _LTX_IDENTITY_LISTING
+    ids = set(landed_render_ids(mixed, "ltx"))
+    assert ids == {
+        "20260805T154357Z",
+        "20260805T184725Z",
+        "checkpoint-step-3000_s42_f81_w768_h512_n30_g3_st1_none",
+        "checkpoint-step-3000_s42_f81_w768_h512_n30_g3_st1_single_frame",
+    }
+
+
+def test_ltx_identity_key_and_h3_identity_key_do_not_cross_match():
+    """The two families' identity-key regexes must stay mutually exclusive by construction (same
+    discipline as ``_QWEN_EDIT_KEY_RE`` vs ``_H3_KEY_RE``): an H3-shaped listing read as ``ltx``
+    must report nothing plausible, never a partial/wrong list."""
+    assert landed_render_ids(_H3_LISTING.replace("samples_h3", "samples"), "ltx") == []
+
+
 def test_h3_landed_ids_are_identity_keys_not_stamps():
     ids = landed_render_ids(_H3_LISTING, "h3")
     assert len(ids) == 3
