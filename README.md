@@ -322,7 +322,7 @@ tracked in issue #45):
   times out. Watch long metered runs; do not fire-and-forget under a tight budget.
 
 `python -m pytest` is **not** green out of the box, for reasons that are known rather than
-mysterious. Expect roughly **40 failed, ~2766 passed, 51 skipped**, in three groups:
+mysterious. Expect roughly **40 failed, ~2870 passed, 51 skipped**, in three groups:
 
 - **~33 — the H3 parity suites.** They deliberately refuse to skip: they must execute against
   `transformers`/`diffusers` at the exact pinned version, in a separate overlay interpreter, or the
