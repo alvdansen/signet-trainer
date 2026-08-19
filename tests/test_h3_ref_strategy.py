@@ -1269,3 +1269,90 @@ def test_an_absent_audio_row_count_that_cannot_be_derived_is_REFUSED_not_zeroed(
     """Defaulting to 0 IS the defect; the count is a function of the campaign frame count."""
     with pytest.raises(ValueError, match="target_audio_rows"):
         _strategy().prepare_training_inputs(_absent_audio_batch())
+
+
+# --------------------------------------------------------------------------------------------------
+# 11. issue #52 — reference-pool provenance: refuse ONLY a positively-marked explicit-manifest
+#     mismatch; a flag-less (legacy) or pool-derived payload must be UNAFFECTED.
+#
+# ``_batch()``'s default pool (CHARACTERS = A, B, C — three entries) against ``_strategy()``'s
+# default ``references_per_sample=2`` is already the Embe corpus regime this fix must never touch:
+# a pool DELIBERATELY larger than the slot count, rotating across segments. Every test in this file
+# that calls plain ``_batch()`` already exercises that combination without a flag key at all, so
+# this section adds the DEDICATED, adversarial-audit-cited coverage on top.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_a_flagless_pool_larger_than_slot_count_is_not_refused() -> None:
+    """The Embe corpus regime: a 3-entry pool, 2 slots, NO 'explicit_manifest' key at all.
+
+    This is what ``_batch()`` already builds by default (``h3_ref_latent_conditions`` carries no
+    provenance key), so this test names the property directly rather than leaning on it being an
+    accident of every other test's fixture.
+    """
+    batch = _batch()
+    assert "explicit_manifest" not in batch["h3_ref_latent_conditions"]
+    inputs = _strategy().prepare_training_inputs(batch)
+    assert len(inputs.references) == 2
+
+
+def test_explicit_manifest_true_with_a_mismatched_pool_is_refused() -> None:
+    """The hard half of issue #52: a row positively marked explicit whose cached pool disagrees.
+
+    The scenario named in the issue: a 3-reference cache exists (references_per_sample was 3 when
+    it was written, and the row's references came from an explicit 'reference_paths' list), and a
+    'references_per_sample: 2' config now points at it — the realistic path in is a VRAM retreat
+    against a cache already paid to encode. That must be LOUD, not a silent 2-of-3 rotation.
+    """
+    batch = _batch()  # CHARACTERS pool has 3 entries
+    batch["h3_ref_latent_conditions"]["explicit_manifest"] = True
+    with pytest.raises(ValueError, match="explicit-manifest"):
+        _strategy(references_per_sample=2).prepare_training_inputs(batch)
+
+
+def test_explicit_manifest_true_with_a_matching_pool_is_allowed() -> None:
+    """A positively-marked explicit row whose pool size DOES agree trains normally."""
+    batch = _batch(characters=[_character("A"), _character("B")])
+    batch["h3_ref_latent_conditions"]["explicit_manifest"] = True
+    inputs = _strategy(references_per_sample=2).prepare_training_inputs(batch)
+    assert len(inputs.references) == 2
+
+
+def test_explicit_manifest_mismatch_is_refused_on_a_dropped_step_too() -> None:
+    """The cache contract is validated on EVERY step that touches it, dropped or not (D-10-REFDROP
+    only removes the reference ROWS from a step's inputs — it never skips validating the cache the
+    step still reads).
+    """
+    batch = _batch()  # CHARACTERS pool has 3 entries
+    batch["h3_ref_latent_conditions"]["explicit_manifest"] = True
+    with pytest.raises(ValueError, match="explicit-manifest"):
+        _strategy(references_per_sample=2, reference_dropout=1.0).prepare_training_inputs(batch)
+
+
+def test_a_flagless_legacy_payload_trains_byte_identically_to_an_explicit_false_payload() -> None:
+    """BINDING adversarial-audit constraint: a MISSING flag must behave as pool-derived —
+    byte-identical to today (i.e. to a payload that positively records ``explicit_manifest=False``,
+    the only other value that skips the new refusal). Every cache on the Volume predates this field,
+    so this is the regression the fix may never introduce.
+    """
+    video_noise = torch.full((1, N_TARGET_VIDEO, PATCH_DIM), 0.25)
+    reference_noise = torch.full((1, 2 * REF_ROWS, PATCH_DIM), -0.5)
+
+    flagless = _batch(video_noise=video_noise)
+    flagless["reference_noise"] = reference_noise
+    assert "explicit_manifest" not in flagless["h3_ref_latent_conditions"]
+
+    flagged_false = _batch(video_noise=video_noise)
+    flagged_false["reference_noise"] = reference_noise
+    flagged_false["h3_ref_latent_conditions"]["explicit_manifest"] = False
+
+    strategy_a = _strategy()
+    strategy_b = _strategy()
+    inputs_a = strategy_a.prepare_training_inputs(flagless)
+    inputs_b = strategy_b.prepare_training_inputs(flagged_false)
+
+    assert [r.path for r in inputs_a.references] == [r.path for r in inputs_b.references]
+    assert torch.equal(
+        inputs_a.packed.kwargs["hidden_states"], inputs_b.packed.kwargs["hidden_states"]
+    )
+    assert torch.equal(inputs_a.video_targets, inputs_b.video_targets)

@@ -671,6 +671,7 @@ def encode_h3_reference_latents(
     descriptors: Any,
     references_per_sample: int = H3_PHASE10_REFERENCES_PER_SAMPLE,
     seed: int = H3_KEYFRAME_ENCODE_SEED,
+    explicit_manifest: bool = False,
 ) -> dict[str, Any]:
     """Encode the reference IMAGES and build the committed ``h3_reference_latents/`` payload.
 
@@ -713,11 +714,22 @@ def encode_h3_reference_latents(
             from the manifest by ``modal/fns.py::_h3_resolve_references``, never inferred here.
         references_per_sample: Required slot count. Defaults to the Phase-10 value.
         seed: Fixed posterior seed.
+        explicit_manifest: issue #52 provenance — ``True`` when this row's references came from an
+            explicit ``reference_paths`` list (the exact set, order load-bearing), ``False`` when
+            they came from the rotating ``character_references`` pool (deliberately allowed to
+            outnumber ``references_per_sample`` — the Embe corpus regime). Recorded verbatim as
+            ``payload["explicit_manifest"]`` so ``conditioning/h3_ref.H3RefStrategy`` can refuse a
+            cached-pool-size mismatch ONLY on a row positively marked explicit; a payload with no
+            such key at all (every cache written before this field existed) reads as ``False`` —
+            pool-derived, byte-identical to pre-fix behaviour. Defaults to ``False`` so every OTHER
+            caller of this function (the both-modalities smoke, hand-built test fixtures) keeps
+            writing the pool-derived shape it always has.
 
     Returns:
         The ``h3_reference_latents/`` payload. ``payload["references"]`` is the per-slot list, each
         entry ``{"latents": [24, 1, H, W], "num_frames", "height", "width", "source_wh",
-        "encoded_wh", "latent_rows", "path", "kind", "subject_id"}``.
+        "encoded_wh", "latent_rows", "path", "kind", "subject_id"}``. ``payload["explicit_manifest"]``
+        is the issue #52 provenance flag described above.
 
         ⚠ ``height`` / ``width`` are the LATENT grid dims; ``source_wh`` is the SOURCE pixel size,
         and that is what an ``H3Reference`` means by width/height. The parser reads ``source_wh``
@@ -810,6 +822,10 @@ def encode_h3_reference_latents(
         "references": encoded,
         "num_references": len(encoded),
         "reference_short_edge": int(short_edge),
+        # issue #52 provenance — see the Args docstring. A payload with no such key (every cache
+        # written before this field existed) is read by H3RefStrategy as False, never as a
+        # missing-therefore-refuse state.
+        "explicit_manifest": bool(explicit_manifest),
     }
     # Plan-10-04 allowlist contract: h3_reference_latents routes through _normalize_video_latents,
     # which reads data["latents"] unconditionally. Slot 0 is the alias that satisfies it.

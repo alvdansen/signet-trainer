@@ -94,7 +94,12 @@ _CHARACTER = {"path": "refs/char_a.png", "kind": "character", "subject_id": "A"}
 _ENVIRONMENT = {"path": "refs/env_029.png", "kind": "environment", "subject_id": "029"}
 
 
-def _encode(descriptors: list[dict], sizes: list[tuple[int, int]] | None = None) -> dict:
+def _encode(
+    descriptors: list[dict],
+    sizes: list[tuple[int, int]] | None = None,
+    *,
+    explicit_manifest: bool = False,
+) -> dict:
     sizes = sizes or [(1024, 1536), (1344, 768)]
     images = [_StubImage(w, h) for w, h in sizes[: len(descriptors)]]
     return encode_h3_reference_latents(
@@ -104,6 +109,7 @@ def _encode(descriptors: list[dict], sizes: list[tuple[int, int]] | None = None)
         *_LATENT_STATS,
         descriptors=descriptors,
         references_per_sample=len(descriptors),
+        explicit_manifest=explicit_manifest,
     )
 
 
@@ -130,6 +136,43 @@ def test_the_descriptor_is_paired_with_its_own_latents_not_another_slots() -> No
     assert tuple(slots[0]["source_wh"]) == (1024, 1536)
     assert slots[1]["subject_id"] == "029"
     assert tuple(slots[1]["source_wh"]) == (1344, 768)
+
+
+# ==================================================================================================
+# issue #52 — the provenance flag: explicit-manifest vs pool-derived
+# ==================================================================================================
+
+
+def test_the_payload_defaults_to_pool_derived_when_the_caller_says_nothing() -> None:
+    """A caller that never mentions ``explicit_manifest`` gets the pool-derived (``False``) shape —
+    every OTHER caller of this function (the both-modalities smoke, hand-built fixtures) keeps
+    writing exactly what it always has.
+    """
+    payload = _encode([_CHARACTER, _ENVIRONMENT])
+    assert payload["explicit_manifest"] is False
+
+
+def test_the_explicit_manifest_flag_is_recorded_verbatim() -> None:
+    """The flag travels into the payload unchanged — the ONLY place it is decided is the caller."""
+    payload = _encode([_CHARACTER, _ENVIRONMENT], explicit_manifest=True)
+    assert payload["explicit_manifest"] is True
+
+    payload = _encode([_CHARACTER, _ENVIRONMENT], explicit_manifest=False)
+    assert payload["explicit_manifest"] is False
+
+
+def test_the_flag_survives_a_save_and_reload_round_trip(tmp_path: Path) -> None:
+    """``H3RefStrategy`` reads the flag off the SAME dict ``PrecomputedDataset`` hands it — prove
+    the round trip a real training run takes, not just the in-memory dict this module builds.
+    """
+    from signet_trainer.data.precomputed import PrecomputedDataset
+
+    payload = _encode([_CHARACTER, _ENVIRONMENT], explicit_manifest=True)
+    write_h3_precomputed(tmp_path, Path("segment_000.pt"), references=payload)
+    dataset = PrecomputedDataset(
+        tmp_path, data_sources={H3_REFERENCE_LATENTS_DIR: "h3_ref_latent_conditions"}
+    )
+    assert dataset[0]["h3_ref_latent_conditions"]["explicit_manifest"] is True
 
 
 def test_the_latent_grid_dims_are_not_the_source_pixel_size() -> None:
@@ -344,6 +387,20 @@ def _resolver():
     return namespace["_h3_resolve_references"]
 
 
+def _row_explicit_manifest_fn():
+    """Import ``_h3_row_is_explicit_manifest`` the same exec-a-slice way, for the same reason."""
+    tree = ast.parse(_FNS.read_text(encoding="utf-8"))
+    node = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_h3_row_is_explicit_manifest"
+    )
+    module = ast.Module(body=[node], type_ignores=[])
+    namespace: dict = {}
+    exec(compile(ast.fix_missing_locations(module), "<fns-slice>", "exec"), namespace)  # noqa: S102
+    return namespace["_h3_row_is_explicit_manifest"]
+
+
 _POOL_ROW = {
     "character_references": [
         {"path": "refs/char_a.png", "subject_id": "A"},
@@ -351,6 +408,30 @@ _POOL_ROW = {
     ],
     "environment_reference": {"path": "refs/env_029.png", "subject_id": "029"},
 }
+
+_EXPLICIT_ROW = {
+    "reference_paths": [
+        {"path": "refs/a.png", "subject_id": "A", "kind": "character"},
+        {"path": "refs/b.png", "subject_id": "B", "kind": "character"},
+    ]
+}
+
+
+def test_a_pool_row_is_not_explicit_manifest() -> None:
+    """``character_references`` is the rotating pool — never positively marked explicit."""
+    assert _row_explicit_manifest_fn()(_POOL_ROW) is False
+
+
+def test_a_reference_paths_row_is_explicit_manifest() -> None:
+    """``reference_paths`` is the exact, order-load-bearing set — issue #52's 'explicit' case."""
+    assert _row_explicit_manifest_fn()(_EXPLICIT_ROW) is True
+
+
+def test_an_empty_reference_paths_list_is_not_explicit_manifest() -> None:
+    """An empty list is falsy — this row has no explicit references at all, so it is not the
+    explicit-manifest case (and ``_h3_resolve_references`` falls through to the pool branch,
+    which will refuse it for a different, unrelated reason)."""
+    assert _row_explicit_manifest_fn()({"reference_paths": []}) is False
 
 
 def test_kind_comes_from_the_manifest_key_not_from_a_guess() -> None:
@@ -503,6 +584,11 @@ def test_h3_preprocess_threads_the_descriptors_into_the_encode() -> None:
         assert "descriptors" in supplied, (
             "the encode must be handed the resolved descriptors; without them the cache carries "
             "sizes but no identity and the trainer cannot read it (D-10-DEF-2)"
+        )
+        assert "explicit_manifest" in supplied, (
+            "issue #52: the encode must be handed the row's provenance too; without it the cache "
+            "cannot record whether its pool was explicit-manifest or rotating, and "
+            "H3RefStrategy's mismatch refusal can never target the right rows"
         )
 
 

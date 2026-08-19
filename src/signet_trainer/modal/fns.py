@@ -3395,6 +3395,21 @@ def _h3_reference_entry(entry: Any, index: int, kind: str | None, where: str) ->
     }
 
 
+def _h3_row_is_explicit_manifest(row: dict) -> bool:
+    """True when a row's reference slots come from ``reference_paths`` (issue #52 provenance).
+
+    ⛔ Mirrors the SAME branch test ``_h3_resolve_references`` uses to pick its resolution path —
+    this must never grow a second opinion about what counts as "explicit". An explicit-manifest row
+    declares the EXACT reference set the sample carries (a flat list, order load-bearing); a
+    ``character_references`` pool DECLARES a rotation candidate set that is deliberately allowed to
+    outnumber ``references_per_sample`` (the Embe corpus regime). Only the former is eligible for
+    the train-time size-mismatch refusal in ``conditioning/h3_ref.H3RefStrategy`` — the two cases
+    are indistinguishable from the cached pool alone, which is why the distinction has to be
+    recorded here, at the one place that still has the manifest row.
+    """
+    return bool(row.get("reference_paths"))
+
+
 def _h3_resolve_references(
     row: dict,
     index: int,
@@ -4028,6 +4043,12 @@ def h3_preprocess(
             # Carried across the phase boundary so PHASE B can REFUSE a disagreement rather than
             # cache one. The shared resize makes them equal; this makes an inequality loud.
             "vision_counts": vision_counts,
+            # issue #52 provenance: whether THIS row's references came from an explicit
+            # 'reference_paths' list vs the rotating 'character_references' pool. Carried across
+            # the phase boundary so PHASE B can write it into the persisted payload — it is a
+            # property of the MANIFEST ROW, not of anything PHASE B computes. Unused (and unread)
+            # on a NO-REFERENCE row: there is no reference payload to stamp it into.
+            "explicit_manifest": _h3_row_is_explicit_manifest(row),
         }
         del hidden, prompt_only_hidden  # never two samples' hidden states resident at once
 
@@ -4126,6 +4147,10 @@ def h3_preprocess(
                 # for. They are propagated from the manifest, never inferred from a tensor.
                 descriptors=meta["references"],
                 references_per_sample=references_per_sample,
+                # issue #52 provenance: recorded so H3RefStrategy can refuse a pool-size mismatch
+                # ONLY on a row positively marked explicit — a flag-less (pre-fix) cache reads as
+                # pool-derived, byte-identical to today.
+                explicit_manifest=meta["explicit_manifest"],
             )
 
             # ⛔ D-10-DEF-4, the cross-phase assertion. `prepare_h3_reference_images` makes these equal
