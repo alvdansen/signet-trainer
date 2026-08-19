@@ -78,6 +78,17 @@ _TRANSITIVE_SUPPLIER_REGISTRY: dict[tuple[str, str], str] = {
         "same supplier and the same reasoning as the pydantic entry above (PyYAML arrives through "
         "the ltx-trainer dependency tree)."
     ),
+    ("ltx25_gpu_image", "pydantic"): (
+        "SAME supplier and SAME reasoning as the gpu_image entry above — ltx25_gpu_image ALSO "
+        "editable-installs ltx-trainer (from the /opt/LTX-25 checkout at LTX25_COMMIT_SHA, a "
+        "different pin of the SAME upstream package that supplies gpu_image), so the identical "
+        "transitive-supply argument applies. Not re-declared here for the identical reason: an "
+        "explicit pip_install would invalidate this image's own layer cache for no defect that has "
+        "occurred on it. Equally FRAGILE — re-verify the day LTX25_COMMIT_SHA is bumped (issue #53)."
+    ),
+    ("ltx25_gpu_image", "yaml"): (
+        "same supplier and the same reasoning as the ltx25_gpu_image/pydantic entry above."
+    ),
 }
 
 
@@ -277,7 +288,8 @@ def test_the_real_config_loading_stages_are_all_still_detected() -> None:
     assertion is to be an independent statement of the expected result that a change to the
     detection logic must survive; deriving it from the detector would make it circular. Both
     documented incidents are represented: ``backup_sync``/``restore`` (download_image, 2026-08-05)
-    and ``h3_train``/``h3_sample`` (h3_gpu_image, 2026-08-06).
+    and ``h3_train``/``h3_sample`` (h3_gpu_image, 2026-08-06). ``ltx25_train`` (ltx25_gpu_image,
+    issue #53 Stage 1) is the third — it calls ``load_config_from_text`` in-container the same way.
 
     ``wan_train`` is deliberately ABSENT: it is the one stage that cannot load a config, because
     ``wan_musubi_image`` carries musubi's pydantic 1.x.
@@ -287,6 +299,7 @@ def test_the_real_config_loading_stages_are_all_still_detected() -> None:
         "download_image": ["backup_sync", "restore"],
         "gpu_image": ["fuse", "sample", "train"],
         "h3_gpu_image": ["h3_sample", "h3_train"],
+        "ltx25_gpu_image": ["ltx25_train"],
         "qwen_gpu_image": ["qwen_edit_sample", "qwen_edit_train"],
     }, detected
 

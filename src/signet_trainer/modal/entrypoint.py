@@ -1688,6 +1688,47 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             ledger_path=ledger_path,
             est_usd=decision.est_usd,
         )
+    elif mode == "preprocess" and cfg.model.family == "ltx" and cfg.model.ltx_generation == "2.5":
+        # LTX-2.5 Stage 1 (issue #53) arm of the SAME mode: the canonical v1.2.0 pre-encode
+        # (ltx25_preprocess, running upstream's OWN process_dataset.py from /opt/LTX-25, on
+        # ltx25_gpu_image — LTX25_STAGE1_DESIGN.md §5). Routed by ltx_generation, NOT by a new
+        # mode value, mirroring the family-routing precedent above (h3/qwen_edit's own preprocess
+        # arms) — family stays "ltx" for both generations (§0), so this is the ONE arm keyed on
+        # ltx_generation instead of family.
+        from signet_trainer.modal.fns import ltx25_preprocess
+
+        if cfg.conditioning.mode not in ("none", "single_frame", "multi_frame"):
+            raise SystemExit(
+                f"[signet-entrypoint] conditioning.mode={cfg.conditioning.mode!r} is out of "
+                "Stage-1 scope for LTX-2.5 (issue #53 §9 — ic_lora/inpaint/audio_to_video-on-2.5 "
+                "are not implemented by this PR; ltx25_preprocess takes no reference/mask/audio "
+                "encode params at all). Set model.ltx_generation: '2.3' for that conditioning "
+                "mode, or file an issue for Stage 2+. Aborting pre-approval, no dispatch."
+            )
+        ltx25_preprocess_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
+        print(
+            "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
+            "Dispatching ltx25_preprocess.spawn() (gated, ltx_generation: '2.5'); the v1.2.0 "
+            "canonical encode writes {latents,conditions}/ + PROVENANCE.json to the dataset "
+            "Volume under cfg.data.preprocessed_data_root."
+        )
+        fc = ltx25_preprocess.with_options(timeout=ltx25_preprocess_timeout_s).spawn(
+            metadata_path=cfg.data.metadata_path,
+            resolution_buckets=_parse_resolution_buckets(cfg.data.resolution_buckets),
+            output_dir=cfg.data.preprocessed_data_root,
+            model_id=cfg.model.model_id,
+            gemma_root=cfg.model.text_encoder_id,
+            video_vae_path=cfg.ltx25.video_vae_path,
+            audio_vae_path=cfg.ltx25.audio_vae_path,
+            overwrite=cfg.data.preprocess_overwrite,
+        )
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "ltx25_preprocess",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
     elif mode == "preprocess":
         # Phase-8 canonical pre-encode as a first-class GATED mode (D-8-PREPROC) — retires the
         # hardcoded hourly-rate drift in the throwaway scripts/_encode_demo*.py by routing the
@@ -1906,6 +1947,33 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             fc,
             cfg.modal.dispatch_watch_seconds,
             "wan_train",
+            ledger_path=ledger_path,
+            est_usd=decision.est_usd,
+        )
+    elif cfg.model.family == "ltx" and cfg.model.ltx_generation == "2.5":
+        # LTX-2.5 Stage 1 (issue #53) arm of the DEFAULT ``train`` mode. Routed by
+        # ltx_generation, NOT by family (family stays "ltx" for both generations, §0) — the ONE
+        # train-arm branch keyed this way, mirroring the preprocess arm above. ``ltx25_train``
+        # takes the recipe BY VALUE and re-parses it in-container (same shape as the plain LTX
+        # arm below), so there is nothing to thread; the ``.spawn`` CALL sits strictly after
+        # ``_require_approval`` (MODL-02).
+        from signet_trainer.modal.fns import ltx25_train
+
+        ltx25_train_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
+        print(
+            "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
+            "Dispatching ltx25_train.spawn() (gated, ltx_generation: '2.5'); checkpoints commit "
+            "to signe-trainer-checkpoints under <output_dir>/.\n"
+            "[signet-entrypoint] ⚠ HONESTY (D3 open): the metadata-driven arch gate RECORDS "
+            "observed values from the checkpoint's own embedded config — it does not assert them "
+            "against any EXPECTED_*_25 constant, because none exists yet. This is not live-tested "
+            "against real LTX-2.5/Gemma-4 weights (issue #53 D3)."
+        )
+        fc = ltx25_train.with_options(timeout=ltx25_train_timeout_s).spawn(config_text)
+        _watch_dispatch(
+            fc,
+            cfg.modal.dispatch_watch_seconds,
+            "ltx25_train",
             ledger_path=ledger_path,
             est_usd=decision.est_usd,
         )

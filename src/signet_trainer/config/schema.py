@@ -432,6 +432,26 @@ class ModelConfig(_Base):
         "in SHAPE from LTX's, so there is nothing to sniff in either case. 'wan' is the "
         "musubi-tuner RUNNER family — the only one that consumes data.sources.",
     )
+    # LTX-2.5 Stage 1 (issue #53 / LTX25_UPSTREAM_DIFF.md) — the checkpoint GENERATION
+    # discriminator, meaningful only under model.family == "ltx". Deliberately a SEPARATE field
+    # from `family`, not a fifth family value (see LTX25_STAGE1_DESIGN.md §0): 2.5 is still the
+    # LTX transformer/VAE/Gemma backend, still trained through train/loop.py's LTX default step —
+    # making it a family would force every LTX-only field (frame law, resolution buckets,
+    # ic_lora/inpaint/a2v knobs) to be duplicated or bypass the lean field-split guard. Explicit by
+    # design for the SAME reason `family` is explicit: the Modal image graph is built at
+    # module-import time (modal/app.py), before any GPU container or checkpoint byte exists, so
+    # nothing can be auto-detected from the weights before the image is already chosen. Default
+    # "2.3" keeps every existing config byte-identical.
+    ltx_generation: Literal["2.3", "2.5"] = Field(
+        default="2.3",
+        description="LTX checkpoint GENERATION discriminator, meaningful only when "
+        "model.family == 'ltx'. Explicit by design — NOT sniffed from model_id or the "
+        "checkpoint's embedded metadata (mirrors the family field's own reasoning). Default "
+        "'2.3' keeps every existing config byte-identical. Set '2.5' to route through "
+        "ltx25_preprocess/ltx25_train (ltx25_gpu_image, LTX25_COMMIT_SHA) instead of "
+        "preprocess/train. A non-default value under model.family != 'ltx' is refused by "
+        "SignetConfig._cross_field_checks (lean field-split).",
+    )
     vae_id: str | None = Field(
         default=None,
         description="H3 / qwen_edit: VAE dir or file under WEIGHTS_DIR (e.g. 'minimax-h3/vae', "
@@ -477,6 +497,48 @@ class ModelConfig(_Base):
         "encoder, and (2) it is the `config_source` a single-file transformer load needs, because "
         "diffusers' infer_diffusers_model_type has no Qwen branch on the pinned version. DATA "
         "only — never FS-checked here (Pitfall 1).",
+    )
+
+
+class Ltx25Config(_Base):
+    """LTX-2.5 split-checkpoint tunables (issue #53 Stage 1 / LTX25_STAGE1_DESIGN.md §1).
+
+    Every field defaulted, so every ``ltx_generation == '2.3'`` config (i.e. every config that
+    exists today) loads byte-identically. Only meaningful when ``model.ltx_generation == '2.5'`` —
+    NOT keyed off ``model.family`` (family stays ``'ltx'`` for both generations; see the design's
+    §0). ``SignetConfig._cross_field_checks`` carries the REVERSE guard: a non-default value here
+    while ``ltx_generation != '2.5'`` is refused at config load, the same lean-field-split
+    discipline as the h3/qwen_edit blocks, but keyed off a GENERATION field instead of family —
+    recorded here so a future reader does not assume every reverse-guard checks ``model.family``.
+    """
+
+    checkpoint_layout: Literal["monolith", "split"] = Field(
+        default="monolith",
+        description="Whether model.model_id names one monolithic .safetensors (transformer + "
+        "VAE + audio VAE packed together, the LTX-2.3 shape) or a split pack (transformer-only "
+        "file; VAE/audio-VAE/duration-head live in separate files named below). "
+        "[v1.2.0 verified] ltx_trainer.model_loader.load_model() gained optional "
+        "video_vae_path=/audio_vae_path= kwargs precisely for this split case; omitting them "
+        "on a split transformer-only checkpoint raises inside resolve_video_vae_path/"
+        "resolve_audio_vae_path (is_split_transformer() reads the checkpoint's own embedded "
+        "metadata to detect this — see LTX25_UPSTREAM_DIFF.md §C).",
+    )
+    video_vae_path: str | None = Field(
+        default=None,
+        description="Split layout ONLY: video-VAE .safetensors filename under WEIGHTS_DIR. "
+        "REQUIRED (fail-fast at config load, not at GPU runtime) when checkpoint_layout == "
+        "'split' — the upstream resolver raises ValueError on a split transformer-only "
+        "model_id with no override, and this design moves that failure off a metered "
+        "container. Refused (must stay None) when checkpoint_layout == 'monolith'.",
+    )
+    audio_vae_path: str | None = Field(
+        default=None,
+        description="Split layout ONLY, and a2v-on-2.5 is OUT OF SCOPE for Stage 1 — this field "
+        "exists so the config surface is forward-declared for Stage 2/3, not because Stage 1 "
+        "reads it. models.ltx25_loader.load_ltx25_components refuses with_audio_vae_encoder=True "
+        "outright (raises NotImplementedError) rather than silently omitting the split-path "
+        "resolution guard the standalone load_audio_vae_encoder was never extended with upstream "
+        "(LTX25_UPSTREAM_DIFF.md §A row 2 — a silent meta-device encoder otherwise).",
     )
 
 
@@ -2620,6 +2682,11 @@ class SignetConfig(_Base):
     # config loads byte-identically. Only meaningful when model.family == 'qwen_edit'; the REVERSE
     # guard in _cross_field_checks rejects a non-default value under any other family.
     qwen_edit: QwenEditConfig = Field(default_factory=QwenEditConfig)
+    # LTX-2.5 Stage 1 block (issue #53) — every field defaulted, so every ltx_generation == "2.3"
+    # config loads byte-identically. Only meaningful when model.ltx_generation == "2.5"; the
+    # REVERSE guard in _cross_field_checks rejects a non-default value under any other generation
+    # (keyed on ltx_generation, NOT model.family — family stays "ltx" for both generations).
+    ltx25: Ltx25Config = Field(default_factory=Ltx25Config)
 
     # top-level scalars mirrored from native config.
     seed: int = Field(default=42)
@@ -2832,6 +2899,75 @@ class SignetConfig(_Base):
                     f"model.family == 'qwen_edit' (lean field-split — no silently-ignored config "
                     f"block). Remove them or set model.family: qwen_edit."
                 )
+        # LTX-2.5 Stage 1 REVERSE guard #1 (issue #53) — same bidirectional lean-field-split shape
+        # and the SAME pristine-instance technique as the h3/qwen_edit guards above (refutation
+        # MUST-FIX: the field-DEFAULT comparison a first draft of this guard used would silently
+        # stop covering a later default_factory field on Ltx25Config; the pristine instance covers
+        # it automatically). Keyed on `model.ltx_generation`, NOT `model.family` — family stays
+        # "ltx" for both generations (see Ltx25Config's docstring / the design's §0), so this is
+        # deliberately NOT the same predicate shape as the h3/qwen_edit guards even though the
+        # TECHNIQUE is identical.
+        if self.model.ltx_generation != "2.5":
+            pristine_ltx25 = Ltx25Config()
+            nondefault_ltx25 = [
+                name
+                for name in Ltx25Config.model_fields
+                if getattr(self.ltx25, name) != getattr(pristine_ltx25, name)
+            ]
+            if nondefault_ltx25:
+                raise ValueError(
+                    f"ltx25 field(s) {nondefault_ltx25} set while model.ltx_generation is "
+                    f"{self.model.ltx_generation!r}: the ltx25 block is only valid when "
+                    f"model.ltx_generation == '2.5' (lean field-split — no silently-ignored config "
+                    f"block). Remove them or set model.ltx_generation: '2.5'."
+                )
+        # LTX-2.5 Stage 1 REVERSE guard #2 — a non-default ltx_generation makes no sense outside
+        # family 'ltx' (ltx_generation is a sub-discriminator of the ltx backend, not a standalone
+        # knob other families could coherently read).
+        if self.model.family != "ltx" and self.model.ltx_generation != "2.3":
+            raise ValueError(
+                f"model.ltx_generation is {self.model.ltx_generation!r} while model.family is "
+                f"{self.model.family!r}: ltx_generation is only meaningful under family 'ltx'. "
+                f"Remove it or set model.family: ltx."
+            )
+        # LTX-2.5 Stage 1 — split-layout fail-fast (moves a certain upstream ValueError off a
+        # metered container, LTX25_UPSTREAM_DIFF.md §C: resolve_video_vae_path/
+        # is_split_transformer raise with no override on a split transformer-only checkpoint).
+        if (
+            self.model.ltx_generation == "2.5"
+            and self.ltx25.checkpoint_layout == "split"
+            and self.ltx25.video_vae_path is None
+        ):
+            raise ValueError(
+                "model.ltx_generation is '2.5' and ltx25.checkpoint_layout is 'split' but "
+                "ltx25.video_vae_path is unset: a split transformer-only checkpoint has no VAE "
+                "inside it, and ltx_trainer.model_loader.resolve_video_vae_path raises ValueError "
+                "with no override (LTX25_UPSTREAM_DIFF.md §C). Set ltx25.video_vae_path or "
+                "checkpoint_layout: monolith."
+            )
+        # LTX-2.5 Stage 1 — in-loop sampling refusal (issue #53 D1 deferred to Stage 2). A
+        # config-load-time refusal, not just an entrypoint gap, because validation.in_loop_sampling
+        # is read purely from config with no separate CLI mode.
+        if self.model.ltx_generation == "2.5" and self.validation.in_loop_sampling:
+            raise ValueError(
+                "model.ltx_generation is '2.5' and validation.in_loop_sampling is True: in-loop "
+                "sampling goes through inference/sampler.py's run_sampler, built against "
+                "ltx_trainer.validation_sampler.{GenerationConfig,ValidationSampler} — REMOVED "
+                "upstream at v1.2.0 (LTX25_UPSTREAM_DIFF.md §A). This is Stage 2 scope (issue #53 "
+                "D1). Set validation.in_loop_sampling: false for a Stage-1 LTX-2.5 train run."
+            )
+        # LTX-2.5 Stage 1 — two_stage_upscale refusal (refutation LOW finding: the distilled-variant
+        # two-stage upscaler is Stage-2/sampling scope, built against the SAME removed
+        # ValidationSampler/ICLoraPipeline call shapes as in_loop_sampling above). Mirrors the
+        # in_loop_sampling guard's shape exactly.
+        if self.model.ltx_generation == "2.5" and self.validation.two_stage_upscale:
+            raise ValueError(
+                "model.ltx_generation is '2.5' and validation.two_stage_upscale is True: the "
+                "two-stage distilled + spatial-upscaler render goes through "
+                "inference/upscale.py's TI2VidTwoStagesPipeline wrapper (Stage-2/inference scope, "
+                "issue #53 D1) — not touched by Stage 1. Set validation.two_stage_upscale: false "
+                "for a Stage-1 LTX-2.5 train run."
+            )
         # Family #4 REVERSE guard (slice A) — the multi-source block. Same bidirectional
         # lean-field-split shape as the h3 / qwen_edit guards above, with one difference worth
         # stating: those blocks are UNIMPLEMENTED-elsewhere, whereas ``data.sources`` is a coherent
@@ -3317,7 +3453,19 @@ class SignetConfig(_Base):
         # run_sampler flow) would silently render the wrong substrate on a metered GPU. Fail fast at
         # config load: a distilled base REQUIRES the distilled inference path. (model_id already
         # switches dev/distilled by filename — cross-field, so it lives here, not on ConditioningConfig.)
-        if "distilled" in self.model.model_id and not self.validation.two_stage_upscale:
+        # LTX-2.5 EXEMPTION (issue #53 Stage 1): this D-7-BASEVAR pairing is a fact about the
+        # LTX-2.3 dev/distilled inference paths specifically (ValidationSampler single-stage vs
+        # TI2VidTwoStagesPipeline two-stage) — both REMOVED/rebuilt upstream at v1.2.0
+        # (LTX25_UPSTREAM_DIFF.md §A). A 2.5 "distilled"-named checkpoint, if one exists, would
+        # pair with Stage-2 machinery this design does not touch; forcing two_stage_upscale: true
+        # on it would only trip the guard directly above (refused outright for gen 2.5). Scoping
+        # this check to gen 2.3 — rather than exempting a 2.5 distilled filename from BOTH guards
+        # silently — keeps the 2.3 law exact and lets the 2.5 guard be the one that speaks for 2.5.
+        if (
+            self.model.ltx_generation == "2.3"
+            and "distilled" in self.model.model_id
+            and not self.validation.two_stage_upscale
+        ):
             raise ValueError(
                 f"invalid pairing: model.model_id {self.model.model_id!r} is the DISTILLED base "
                 f"variant but validation.two_stage_upscale is False (the dev single-stage sample "

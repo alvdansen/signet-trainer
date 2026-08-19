@@ -71,3 +71,36 @@ def validate_mode_config(cfg: SignetConfig, mode: str | None) -> None:
             "(scripts/_stage_multi_frame_refs.py, 06-07) and list them as conditioning_items "
             "(image / frame_index / strength) in the run config."
         )
+
+    # LTX-2.5 Stage 1 (issue #53) -- ALL SIX KNOWN_MODES explicitly dispositioned for
+    # model.ltx_generation == "2.5", per the two refuter verdicts on LTX25_STAGE1_DESIGN.md.
+    # This is the ONE shared CPU-pure home for every mode-conditional refusal (the module
+    # docstring's WR-04 hoist) -- putting the ltx25 refusals here, rather than only inside a
+    # modal/entrypoint.py-local gap function, means the dry-run CLI, the entrypoint's pre-dispatch
+    # run_dryrun(cfg, mode=...) call, AND the container bodies all get the SAME refusal for free.
+    #
+    #   * train / preprocess -- ALLOWED. ltx25_train / ltx25_preprocess exist for exactly these.
+    #   * sample -- REFUSED. There is deliberately no ltx25_sample function to route to (Stage 1
+    #     is train-only; rendering needs the removed-and-rebuilt ValidationSampler/ValidationRunner
+    #     surface, issue #53 D1, Stage 2).
+    #   * fuse -- REFUSED. modal/fuse.py's EXPECTED_* integrity gate is built on LTX-2.3 arch
+    #     assumptions (fixed tensor names/shapes); LTX25_UPSTREAM_DIFF.md §C confirms a 2.5
+    #     checkpoint sets ff_bias=false, i.e. a DIFFERENT tensor-name set, so "fusing changes
+    #     values, never names/shapes" does not hold for it. A 2.5 config on --mode fuse would
+    #     otherwise silently ride the 2.3-pinned fuse arm.
+    #   * restore / backup -- explicitly CLEARED, not merely un-refused: both are checkpoint-file-
+    #     level Volume mirroring (a directory copy-back / a directory mirror-out) with no arch gate
+    #     and no dependency on which LTX generation produced the checkpoint -- generation-agnostic
+    #     by construction, so no refusal is needed or added for them.
+    if (
+        getattr(cfg.model, "ltx_generation", "2.3") == "2.5"
+        and cfg.model.family == "ltx"
+        and mode in ("sample", "fuse")
+    ):
+        raise ValueError(
+            f"[{mode}] model.ltx_generation is '2.5': --mode {mode} is Stage-2+ scope (issue #53 "
+            "D1), not implemented by this Stage-1 PR. There is no ltx25_sample function and "
+            "modal/fuse.py's integrity gate is built on LTX-2.3 arch assumptions (fixed tensor "
+            "names/shapes -- LTX25_UPSTREAM_DIFF.md §C confirms 2.5's ff_bias=false changes the "
+            "tensor-name set). Use --mode train or --mode preprocess for a Stage-1 LTX-2.5 run."
+        )
