@@ -28,6 +28,24 @@ the grid assembler is what joins the shared base column back onto each checkpoin
 falling back to ``"samples"``: a silent default is exactly how the LTX value would be re-applied to
 a future family and re-open this same hole. The LTX answers are unchanged and pinned by test.
 
+⛔ issue #45 PR-4 — LTX IS ALSO MODE-AWARE, NOT JUST FAMILY-AWARE. ``family == "ltx"`` alone picks
+the WRONG root for five of ``modal/fns.py``'s ``sample()`` branches: ``conditioning.mode`` selects
+between ``samples`` (mode ``"none"``, the historical default), ``samples_inpaint``, ``samples_a2v``,
+``samples_single_frame``, ``samples_multi_frame``, ``samples_ic_lora`` and ``samples_ic_lora_baseline``
+(the last selected by ``mode == "ic_lora"`` + ``validation.two_stage_upscale`` together — see
+``layout_mode``). A watcher bound to the family-only root lists an EMPTY or WRONG directory for any
+non-default mode, which reads as "nothing landed" and re-dispatches forever — the same phantom-spend
+shape, wearing a mode disguise instead of a checkpoint-vs-samples-dir one.
+
+``inpaint`` and ``audio_to_video`` additionally write STEP-KEYED render dirs
+(``samples_inpaint/<stem>/step_<N>.mp4``, ``samples_a2v/<stem>/step_<N>.mp4``) rather than a fresh
+UTC-stamped dir per render: the ``<stem>`` directory is STABLE across every checkpoint dispatched
+against this ``output_dir``/mode — only a new ``step_<N>.mp4`` FILE lands inside it per render. A
+watcher that treated the stem's mere existence as "landed" would see step 600 and step 1200 as the
+identical render the moment the FIRST one committed. ``landed_render_ids`` therefore returns
+step-BEARING ids (``"<stem>/step_<N>"``) for these two modes, never the stem alone — see
+``STEP_KEYED_LTX_MODES``.
+
 Import tier: **stdlib only, no package side effects** — the watcher imports this WITHOUT the modal
 SDK loaded, and a test that dragged ``modal`` into ``sys.modules`` would break the dry-run gate's
 Anti-Pattern-6 assertion for the whole session (the same reason ``inference/render_key.py`` exists).
@@ -43,12 +61,15 @@ from signet_trainer.inference.render_key import h3_base_render_key, h3_render_ke
 
 __all__ = [
     "SAMPLES_SUBDIR_BY_FAMILY",
+    "SAMPLES_SUBDIR_BY_LTX_MODE",
+    "STEP_KEYED_LTX_MODES",
     "committed_clip_names",
     "expected_h3_base_render_key",
     "expected_h3_render_key",
     "expected_qwen_edit_band_keys",
     "expected_qwen_edit_render_key",
     "landed_render_ids",
+    "layout_mode",
     "samples_root",
     "samples_subdir",
 ]
@@ -69,8 +90,35 @@ SAMPLES_SUBDIR_BY_FAMILY = {
     "qwen_edit": "samples_qwen_edit",
 }
 
+#: issue #45 PR-4 — every LTX ``conditioning.mode`` that writes somewhere OTHER than the family
+#: default (``SAMPLES_SUBDIR_BY_FAMILY["ltx"]`` == ``"samples"``, mode ``"none"``). Transcribed from
+#: ``modal/fns.py``'s per-mode ``sample()`` branches (never guessed): ``inpaint``, ``audio_to_video``,
+#: ``single_frame``, ``multi_frame``, ``ic_lora`` and ``ic_lora_baseline`` each ``mkdir`` their own
+#: named root. ``mode == "none"`` (and any mode not listed here) falls through to the family default
+#: in ``samples_subdir`` — it is deliberately absent from this table rather than redundantly mapped.
+SAMPLES_SUBDIR_BY_LTX_MODE = {
+    "inpaint": "samples_inpaint",
+    "audio_to_video": "samples_a2v",
+    "single_frame": "samples_single_frame",
+    "multi_frame": "samples_multi_frame",
+    "ic_lora": "samples_ic_lora",
+    "ic_lora_baseline": "samples_ic_lora_baseline",
+}
+
+#: issue #45 PR-4 — the subset of ``SAMPLES_SUBDIR_BY_LTX_MODE`` whose render dir is a STABLE
+#: ``<stem>`` directory (named after the held-out test clip, ``modal/fns.py``'s ``slug(stem)``)
+#: rather than a fresh UTC-stamped dir per render. Every checkpoint dispatched against the same
+#: output_dir/mode writes into the SAME stem dir, adding one ``step_<N>.mp4`` — so "did THIS render
+#: land" can never be answered by the stem's existence alone (see ``landed_render_ids``).
+STEP_KEYED_LTX_MODES = frozenset({"inpaint", "audio_to_video"})
+
 #: A LTX render dir is a UTC wall-clock stamp: ``samples/20260805T154357Z/``.
 _LTX_STAMP_RE = re.compile(r"(\d{8}T\d{6}Z)")
+
+#: A step-keyed LTX render FILE (``modal/fns.py``'s inpaint/a2v branches: ``f"step_{step}.mp4"``).
+#: Matched against the LAST path segment only — ``landed_render_ids`` anchors the STEM to the first
+#: segment after the render root, so this never needs to see the stem itself.
+_LTX_STEP_FILE_RE = re.compile(r"^step_(\d+)\.mp4$")
 
 #: An H3 render dir is an IDENTITY key:
 #: ``<checkpoint>_s<seed>_f<frames>_w<width>_h<height>_n<steps>_<ids>``. Anchored on the
@@ -89,14 +137,21 @@ _H3_KEY_RE = re.compile(
 )
 
 
-def samples_subdir(family: str) -> str:
-    """The render subdirectory ``family`` writes under ``output_dir``.
+def samples_subdir(family: str, mode: str | None = None) -> str:
+    """The render subdirectory ``family`` (and, for LTX, ``mode``) writes under ``output_dir``.
+
+    ``mode`` is ``conditioning.mode`` (issue #45 PR-4) — only consulted when ``family == "ltx"``
+    AND it names an entry in ``SAMPLES_SUBDIR_BY_LTX_MODE``. ``None`` (the default) and mode
+    ``"none"`` both fall through to the family default, so every call site that predates PR-4 (and
+    every non-LTX family, which has no mode axis at all) keeps its exact prior answer.
 
     Raises:
         ValueError: on an unrecognised family. Fail-loud is the money-safe direction — a default of
             ``"samples"`` would make a new family silently mis-verify every render and re-dispatch
             it, which is the phantom-spend failure this module exists to prevent.
     """
+    if family == "ltx" and mode in SAMPLES_SUBDIR_BY_LTX_MODE:
+        return SAMPLES_SUBDIR_BY_LTX_MODE[mode]
     try:
         return SAMPLES_SUBDIR_BY_FAMILY[family]
     except KeyError:
@@ -109,9 +164,23 @@ def samples_subdir(family: str) -> str:
         ) from None
 
 
-def samples_root(output_dir: str, family: str) -> str:
+def samples_root(output_dir: str, family: str, mode: str | None = None) -> str:
     """The Volume-relative render root, e.g. ``outputs/h3_embe_r1/samples_h3``."""
-    return f"{output_dir.rstrip('/')}/{samples_subdir(family)}"
+    return f"{output_dir.rstrip('/')}/{samples_subdir(family, mode)}"
+
+
+def layout_mode(*, conditioning_mode: str, two_stage_upscale: bool = False) -> str:
+    """The LTX layout key a render will ACTUALLY use — mirrors ``modal/fns.py``'s own dispatch so
+    the watcher and the render can never key differently (issue #45 PR-4).
+
+    ``conditioning.mode == "ic_lora"`` splits into two DIFFERENT render roots depending on
+    ``validation.two_stage_upscale``: the two-stage path is the separately-gated
+    ``ic_lora_baseline`` branch (``samples_ic_lora_baseline``), the single-stage path is
+    ``samples_ic_lora``. Every other mode maps to itself; there is nothing else to resolve.
+    """
+    if conditioning_mode == "ic_lora" and two_stage_upscale:
+        return "ic_lora_baseline"
+    return conditioning_mode
 
 
 def expected_h3_render_key(
@@ -260,13 +329,24 @@ def expected_qwen_edit_band_keys(
 _QWEN_EDIT_KEY_RE = re.compile(r"^(?P<ckpt>.+)_s(?P<seed>\d+)_c(?P<ids>.+)$")
 
 
-def landed_render_ids(listing: str, family: str) -> list[str]:
+def landed_render_ids(listing: str, family: str, mode: str | None = None) -> list[str]:
     """Every committed render identity visible in a ``modal volume ls`` listing, sorted.
 
     ``listing`` is raw CLI stdout (the watcher shells out; this stays a pure string function so it
     is testable with zero Modal and zero spend).
 
-      * ``ltx`` -> the UTC stamps, the historical behaviour, byte-for-byte.
+      * ``ltx`` (``mode`` in ``STEP_KEYED_LTX_MODES``, issue #45 PR-4) -> STEP-BEARING stem ids
+        (``"<stem>/step_<N>"``), never the stem alone — the stem dir is STABLE across every
+        checkpoint dispatched against this output_dir/mode (``modal/fns.py``'s inpaint/a2v
+        branches add one ``step_<N>.mp4`` per render into the SAME dir), so a bare stem id would
+        make a step-600 render and a step-1200 render indistinguishable the moment the first
+        landed. ``modal volume ls`` has no recursive listing (confirmed: no ``-r``/``--recursive``
+        flag), so the caller is expected to fold in each stem's own one-level listing — this
+        function tolerates that listing arriving at ANY depth past the render root, so long as
+        each committed file's line ends in its ``step_<N>.mp4`` filename; a bare stem-only line (no
+        step file visible yet) contributes no id, never a plausible-but-wrong stem-only one.
+      * ``ltx`` (every other mode, including ``"none"``) -> the UTC stamps, the historical
+        behaviour, byte-for-byte.
       * ``h3``  -> the identity keys, so two renders differing ONLY in reference condition or frame
         count are two distinct ids rather than one.
       * ``qwen_edit`` -> the identity keys, so two BAND members differing only in checkpoint are two
@@ -279,7 +359,22 @@ def landed_render_ids(listing: str, family: str) -> list[str]:
     "nothing landed", never marks the step rendered, and re-books the full per-render estimate on
     every poll (KNOWLEDGE.md 'watcher phantom-spend').
     """
-    subdir = samples_subdir(family)  # validates the family first — unknown families raise here
+    subdir = samples_subdir(family, mode)  # validates the family first — unknown families raise here
+    if family == "ltx" and mode in STEP_KEYED_LTX_MODES:
+        found: set[str] = set()
+        for raw in (listing or "").splitlines():
+            line = raw.strip().rstrip("/")
+            if not line:
+                continue
+            tail = line.split(f"{subdir}/")[-1]
+            parts = [p for p in tail.split("/") if p]
+            if len(parts) < 2:
+                continue  # a bare stem dir, no step file visible yet — no render identity to report
+            stem, fname = parts[0], parts[-1]
+            m = _LTX_STEP_FILE_RE.match(fname)
+            if m:
+                found.add(f"{stem}/step_{m.group(1)}")
+        return sorted(found)
     if family == "ltx":
         return sorted(set(_LTX_STAMP_RE.findall(listing or "")))
 
