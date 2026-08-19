@@ -183,3 +183,34 @@ def test_ltx_generation_25_sample_mode_is_refused_pre_dispatch(tmp_path, monkeyp
         raw_main(config=_write_config(tmp_path, _LTX25_CONFIG), approve=True, mode="sample")
 
     assert ltx25_like_rec.calls == [], "no dispatch may happen once the mode gate refuses"
+
+
+def test_ltx25_preprocess_uses_the_v120_audio_and_reference_call_shape() -> None:
+    """REGRESSION (house verify, HIGH): the first cut passed ``with_audio=``/``reference_column=``
+    to upstream ``preprocess_dataset`` — both REMOVED at v1.2.0 (audio became ``skip_audio`` with
+    auto-detection when False; references became convention-based column detection), so the call
+    raised TypeError inside the paid container. Pin the corrected shape: ``skip_audio=True`` (a2v
+    on 2.5 is Stage-1 out-of-scope, and False would silently encode audio on an audio-bearing
+    dataset), and neither removed kwarg present anywhere in ``ltx25_preprocess``.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).parent.parent / "src" / "signet_trainer" / "modal" / "fns.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(src)
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "ltx25_preprocess"
+    )
+    kwargs_used = {
+        kw.arg
+        for call in ast.walk(fn)
+        if isinstance(call, ast.Call)
+        and getattr(call.func, "id", getattr(call.func, "attr", "")) == "preprocess_dataset"
+        for kw in call.keywords
+    }
+    assert "skip_audio" in kwargs_used, "ltx25_preprocess must pass skip_audio explicitly"
+    assert "with_audio" not in kwargs_used, "with_audio was removed upstream at v1.2.0"
+    assert "reference_column" not in kwargs_used, "reference_column was removed upstream at v1.2.0"

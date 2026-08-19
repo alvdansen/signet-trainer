@@ -410,9 +410,12 @@ def ltx25_preprocess(
         model_path=checkpoint_path,
         text_encoder_path=text_encoder_path,
         device="cuda",
-        with_audio=False,  # a2v-on-2.5 is out of scope (§9)
+        # [v1.2.0 verified] with_audio/reference_column were REMOVED upstream: audio is now
+        # skip_audio (auto-detects audio columns when False — pass True or an audio-bearing
+        # dataset silently encodes audio) and references are convention-based column detection.
+        # a2v / ic_lora on 2.5 stay out of scope (§9), hence skip_audio=True.
+        skip_audio=True,
         overwrite=overwrite,
-        reference_column=None,  # ic_lora-on-2.5 is out of scope (§9)
         reference_downscale_factor=1,
         # [v1.2.0 verified] the split-layout kwargs preprocess_dataset gained upstream (delta 2) —
         # None on both keeps a monolith checkpoint's encode byte-identical to omitting them.
