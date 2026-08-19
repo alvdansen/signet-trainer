@@ -58,7 +58,9 @@ pure key/metadata logic (tests, CPU gates) needs stdlib only.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import struct
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -152,6 +154,10 @@ def build_fused_metadata(
     fused_marker: str = FUSED_MARKER,
     model_version: str = FUSED_MODEL_VERSION,
     require_config: bool = True,
+    strength: float | None = None,
+    lora_repo: str | None = None,
+    lora_filename: str | None = None,
+    lora_sha256: str | None = None,
 ) -> dict[str, str]:
     """Build the fused checkpoint's metadata, PRESERVING the base's ``meta['config']``.
 
@@ -160,12 +166,27 @@ def build_fused_metadata(
     video 4096 / audio 2048 dims). The provenance markers (``fused`` / ``model_version``) match
     the precedent's byte-for-byte.
 
+    Fuse provenance (PR-6 gap-fuse-3): the fuse is value-only, so two different fuses are
+    byte-indistinguishable at header level unless the artifact SAYS what produced it. When
+    provided, ``strength`` / ``lora_repo`` / ``lora_filename`` / ``lora_sha256`` are written as
+    string metadata (``fuse_strength`` etc.) so a re-fuse at a different strength or from a
+    drifted adapter revision is distinguishable from the artifact alone. ``n_changed`` /
+    ``n_expected_targets`` are known only after the fuse probe — the caller appends them.
+
     ``require_config=True`` ([house] fail-fast, deliberately STRICTER than the prior project's
     warn-and-continue): a base without embedded config would produce a 44GB fused file signet has
     no ``embed_config`` repair path for — raise BEFORE any heavy work instead. The prior project's own
     ``embed_config`` repair tool applied the same stop-if-missing guard to the dev base.
     """
     metadata = {"fused": fused_marker, "model_version": model_version}
+    if strength is not None:
+        metadata["fuse_strength"] = str(strength)
+    if lora_repo is not None:
+        metadata["lora_repo"] = lora_repo
+    if lora_filename is not None:
+        metadata["lora_filename"] = lora_filename
+    if lora_sha256 is not None:
+        metadata["lora_sha256"] = lora_sha256
     config = (base_metadata or {}).get("config")
     if config:
         metadata["config"] = config
@@ -199,6 +220,43 @@ def read_safetensors_header(path: str) -> tuple[dict[str, str], dict[str, dict]]
     return metadata, header
 
 
+def expected_safetensors_size(path: str) -> int:
+    """The on-disk byte size the file's OWN header implies: ``8 + header_len + payload end``.
+
+    Header-only like everything else here (PR-6 gap-fuse-0): safetensors writes the header FIRST,
+    so a file truncated anywhere in the ~44GB tensor payload still carries a complete, valid
+    header — every header-level assertion passes while ``load_file`` raises. The max
+    ``data_offsets`` end (relative to the payload start, right after the header) pins the exact
+    expected size, so ``os.path.getsize`` vs this value catches every truncation class for free.
+    """
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    payload_end = max((entry["data_offsets"][1] for entry in header.values()), default=0)
+    return 8 + header_len + payload_end
+
+
+def sha256_file(path: str, *, chunk_bytes: int = 1 << 20) -> str:
+    """Streaming sha256 hex digest (PR-6 gap-fuse-3 adapter provenance — the adapter is small)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(chunk_bytes):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_fused_base_filename(name: str) -> bool:
+    """True when a ``model.model_id`` names a fused-base artifact (the ``-fused`` naming contract).
+
+    Single source of truth for the consuming-side gate wiring (PR-6 gap-fuse-1): ``DEFAULT_FUSED_
+    FILENAME`` carries ``-fused`` by construction, and ``base_variant_of`` classifies the name as
+    the plain dev family — so this suffix check is the only signal train/sample have that the
+    checkpoint they are about to load is a fuse product that must pass ``verify_fused_metadata``.
+    """
+    return "-fused" in os.path.basename(str(name)).lower()
+
+
 def _audio_keys(tensor_names: Iterable[str]) -> set[str]:
     """The audio-branch weight keys ([precedent] prior-project make_vonly_base's 'audio' in k.lower())."""
     return {k for k in tensor_names if "audio" in k.lower()}
@@ -209,6 +267,7 @@ def verify_fused_metadata(
     base_path: str | None = None,
     *,
     require_audio: bool = True,
+    expected_marker: str | None = FUSED_MARKER,
 ) -> dict[str, Any]:
     """Pre-dispatch gate: assert the fused base is structurally sound. Header-only, CPU, ~free.
 
@@ -216,17 +275,34 @@ def verify_fused_metadata(
     fused file carries embedded config metadata before any metered dispatch" — signet has zero
     ``embed_config`` mitigation if it's missing). Asserts:
 
-      1. ``meta['config']`` present + non-empty ([precedent] prior-project BUGLOG #5 — the
+      1. Payload coverage: ``os.path.getsize`` matches the size the header itself implies (PR-6
+         gap-fuse-0 — the header is written first, so a truncated 44GB file otherwise passes
+         every header-level check while ``load_file`` raises mid-load on the metered A100).
+      2. ``meta['config']`` present + non-empty ([precedent] prior-project BUGLOG #5 — the
          3840-vs-2048/4096 connector crash).
-      2. Audio weights intact (do-NOT-audio-strip, [precedent] prior-project BUGLOG #6 meta-device
+      3. Audio weights intact (do-NOT-audio-strip, [precedent] prior-project BUGLOG #6 meta-device
          crash; disable via ``require_audio=False`` only for a deliberately video-only file).
-      3. When ``base_path`` is given: identical tensor NAMES + shapes + dtypes vs the base
+      4. The ``fused`` provenance marker matches ``expected_marker`` (PR-6 gap-fuse-3 — without
+         this the completely UNFUSED dev base verifies as a sound fused scaffold; pass
+         ``expected_marker=None`` only to inspect a non-fuse artifact deliberately).
+      5. When ``base_path`` is given: identical tensor NAMES + shapes + dtypes vs the base
          (fusing changes values only — this is what keeps signet's EXPECTED_* arch gate valid on
          the fused file), and the preserved ``config`` string matches the base's byte-for-byte.
 
     Returns a summary dict; raises ``RuntimeError`` naming the exact failure otherwise.
     """
     metadata, tensors = read_safetensors_header(fused_path)
+
+    expected_size = expected_safetensors_size(fused_path)
+    actual_size = os.path.getsize(fused_path)
+    if actual_size != expected_size:
+        raise RuntimeError(
+            f"[fuse][verify] {fused_path} is TRUNCATED or padded: on-disk size {actual_size} B "
+            f"!= {expected_size} B implied by its own header (8 + header + max data_offsets "
+            "end). The header survives a mid-write death, so header-level checks alone cannot "
+            "see this -- load_file would raise mid-load on a metered GPU. Re-fuse; do NOT "
+            "dispatch against this file."
+        )
 
     config = metadata.get("config")
     if not config:
@@ -244,12 +320,22 @@ def verify_fused_metadata(
             "meta-device-crashes the trainer (prior-project BUGLOG #6, do-NOT-audio-strip). Refusing."
         )
 
+    marker = metadata.get("fused")
+    if expected_marker is not None and marker != expected_marker:
+        raise RuntimeError(
+            f"[fuse][verify] {fused_path} carries fused marker {marker!r}, expected "
+            f"{expected_marker!r} -- this is NOT the fused scaffold (an unfused base, or a fuse "
+            "that died before its save). The gate must be able to tell 'fused' from 'not fused "
+            "at all'; refusing."
+        )
+
     summary: dict[str, Any] = {
         "fused_path": fused_path,
         "n_keys": len(tensors),
         "n_audio_keys": len(audio),
         "config_chars": len(config),
-        "fused_marker": metadata.get("fused"),
+        "fused_marker": marker,
+        "fuse_strength": metadata.get("fuse_strength"),
     }
 
     if base_path is not None:
@@ -326,15 +412,21 @@ def diff_changed_keys(
 def download_inoutpaint_lora(
     repo_id: str = IN_OUTPAINT_LORA_REPO,
     filename: str = IN_OUTPAINT_LORA_FILENAME,
+    revision: str | None = None,
 ) -> str:
     """Download the gated In-Outpainting adapter; returns the local path.
 
     Requires an HF token with accepted gated access in the environment (``HF_TOKEN`` — injected
     by the ``hf-gated-secret`` + ``my-huggingface-secret`` pair, [precedent] prior-project GATED).
+
+    ``revision=None`` (the default) fetches repo HEAD — the adapter-drift hazard PR-6 gap-fuse-2
+    names: a re-fuse can silently pick up a newer adapter under the identical filename. The
+    fused artifact's ``lora_sha256`` provenance makes such drift detectable after the fact; pin
+    ``revision`` to a commit SHA to prevent it up front.
     """
     from huggingface_hub import hf_hub_download  # noqa: PLC0415 — function-local heavy import
 
-    return hf_hub_download(repo_id, filename)
+    return hf_hub_download(repo_id, filename, revision=revision)
 
 
 def fuse_keycheck(
@@ -387,12 +479,17 @@ def fuse_inoutpaint(
     lora_repo: str = IN_OUTPAINT_LORA_REPO,
     lora_filename: str = IN_OUTPAINT_LORA_FILENAME,
     lora_path: str | None = None,
+    lora_revision: str | None = None,
     require_config: bool = True,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Fuse the In-Outpainting IC-LoRA into the dev base, PRESERVING ``meta['config']``.
 
     The ported patched prior-project fuse ([precedent] _FUSE_SCRIPT + fuse_inoutpaint), in order:
 
+      0. Refuse to clobber: an existing ``out_path`` raises unless ``overwrite=True`` (PR-6
+         gap-fuse-2 / house rule 6 — the fused base is THE frozen scaffold prior runs trained
+         against; a silent in-place re-fuse destroys their provenance).
       1. Header-only pre-checks BEFORE any heavy load: build the config-preserving metadata
          (fail-fast on a config-less base, [house]) + the fuse_keycheck key-space probe.
       2. Load the adapter, prepend ``model.`` to its ``diffusion_model.*`` keys.
@@ -401,14 +498,27 @@ def fuse_inoutpaint(
       4. ``apply_loras`` at ``strength`` ([canonical] ltx_core.loader at pin d6053703).
       5. Probe: assert N > 0 target tensors ACTUALLY changed vs the base (catches a silent
          no-op merge; the prior project's single-probe check, widened to every expected target).
-      6. ``save_file`` WITH the base's ``meta['config']`` preserved (prior-project BUGLOG #5).
-      7. Self-check the written file with ``verify_fused_metadata`` (config + audio + value-only
-         vs the base) so a broken artifact can never look done.
+      6. STAGED ``save_file`` to ``out_path + '.tmp-fuse'`` WITH the base's ``meta['config']``
+         preserved (prior-project BUGLOG #5) plus the fuse provenance (strength / adapter
+         identity / sha256 / probe counts — PR-6 gap-fuse-3).
+      7. Self-check the TEMP file with ``verify_fused_metadata`` (payload coverage + config +
+         audio + marker + value-only vs the base), then ``os.replace`` it onto ``out_path`` —
+         the canonical path is never observably partial and a crash mid-save can never leave a
+         half-file where a good one was (PR-6 gap-fuse-0).
 
     Returns a summary dict. The CALLER commits the Volume (``weights_vol.commit()``) — this
     module never imports modal. NO metered dispatch here: this is a plain function the
     entrypoint-gated integrator wiring invokes.
     """
+    # ── (0) overwrite guard FIRST — before any heavy import/load, so a refused re-fuse is free ──
+    if os.path.exists(out_path) and not overwrite:
+        raise RuntimeError(
+            f"[fuse] {out_path} already EXISTS -- refusing to overwrite the fused scaffold in "
+            "place (house rule 6: never auto-delete artifacts; prior runs trained against this "
+            "exact file). Re-fuse deliberately with overwrite=True (fuse.allow_overwrite in the "
+            "run config), or move the existing file aside first."
+        )
+
     # Function-local heavy imports (Anti-Pattern-6 exception style, models/loader.py).
     import torch  # noqa: PLC0415
     from safetensors.torch import load_file, save_file  # noqa: PLC0415
@@ -426,7 +536,13 @@ def fuse_inoutpaint(
 
     # ── (1) header-only pre-checks BEFORE the heavy loads (fail-fast, zero wasted RAM/time) ─────
     base_metadata, _base_header = read_safetensors_header(base_path)
-    fused_metadata = build_fused_metadata(base_metadata, require_config=require_config)
+    fused_metadata = build_fused_metadata(
+        base_metadata,
+        require_config=require_config,
+        strength=strength,
+        lora_repo=lora_repo,
+        lora_filename=lora_filename,
+    )
     if "config" in fused_metadata:
         print(
             f"[fuse] preserving base config metadata ({len(fused_metadata['config'])} chars) — "
@@ -437,7 +553,10 @@ def fuse_inoutpaint(
         print("[fuse] WARNING: base carries no 'config' metadata to preserve!", flush=True)
 
     if lora_path is None:
-        lora_path = download_inoutpaint_lora(lora_repo, lora_filename)
+        lora_path = download_inoutpaint_lora(lora_repo, lora_filename, lora_revision)
+    # Adapter identity provenance (PR-6 gap-fuse-3): the download is unpinned by default, so the
+    # digest is the only durable record of WHICH adapter bytes went into this scaffold.
+    fused_metadata["lora_sha256"] = sha256_file(lora_path)
     keycheck = fuse_keycheck(base_path, lora_path)
     hits = keycheck["hits"]
 
@@ -474,17 +593,24 @@ def fuse_inoutpaint(
             flush=True,
         )
 
-    # ── (6) save WITH the preserved config metadata (the BUGLOG-#5 fix) ─────────────────────────
-    print(f"[fuse] saving fused base -> {out_path}", flush=True)
-    save_file(fused.sd, out_path, metadata=fused_metadata)
+    # ── (6) STAGED save WITH the preserved config metadata (the BUGLOG-#5 fix) + probe counts ───
+    fused_metadata["n_changed"] = str(len(changed))
+    fused_metadata["n_expected_targets"] = str(len(hits))
+    tmp_path = out_path + ".tmp-fuse"
+    print(f"[fuse] saving fused base -> {tmp_path} (staged; promoted only after verify)", flush=True)
+    save_file(fused.sd, tmp_path, metadata=fused_metadata)
 
-    # ── (7) self-verify the written artifact (config + audio intact + value-only vs base) ───────
-    verification = verify_fused_metadata(out_path, base_path=base_path)
+    # ── (7) self-verify the TEMP artifact, then promote atomically (PR-6 gap-fuse-0: a crash ────
+    # anywhere above leaves out_path untouched; a truncated tmp file fails the coverage check).
+    verification = verify_fused_metadata(tmp_path, base_path=base_path)
+    os.replace(tmp_path, out_path)
+    verification["fused_path"] = out_path  # the verified bytes now live at the canonical path
     print(f"[fuse] FUSED_DONE -> {out_path} | verify: {verification}", flush=True)
 
     return {
         "out_path": out_path,
         "strength": strength,
+        "lora_sha256": fused_metadata["lora_sha256"],
         "n_base_keys": len(base_raw),
         "n_lora_keys": len(lora_renamed),
         "n_expected_targets": len(hits),

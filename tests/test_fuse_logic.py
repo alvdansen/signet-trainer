@@ -28,10 +28,14 @@ from signet_trainer.modal.fuse import (
     FUSED_MODEL_VERSION,
     build_fused_metadata,
     diff_changed_keys,
+    expected_safetensors_size,
+    fuse_inoutpaint,
     fuse_keycheck,
+    is_fused_base_filename,
     lora_target_weight_keys,
     prepend_model_prefix,
     read_safetensors_header,
+    sha256_file,
     split_fuse_targets,
     verify_fused_metadata,
 )
@@ -227,7 +231,9 @@ def test_verify_fused_metadata_audio_stripped_raises(tmp_path: Path) -> None:
 
 def test_verify_fused_metadata_audio_check_can_be_opted_out(tmp_path: Path) -> None:
     fused = _write_checkpoint(
-        tmp_path / "vonly.safetensors", metadata={"config": SYNTHETIC_CONFIG}, with_audio=False
+        tmp_path / "vonly.safetensors",
+        metadata={"config": SYNTHETIC_CONFIG, "fused": FUSED_MARKER},
+        with_audio=False,
     )
     summary = verify_fused_metadata(fused, require_audio=False)
     assert summary["n_audio_keys"] == 0
@@ -239,7 +245,9 @@ def test_verify_fused_metadata_shape_change_vs_base_raises(tmp_path: Path) -> No
         tmp_path / "base.safetensors", metadata={"config": SYNTHETIC_CONFIG}, q_shape=(4, 4)
     )
     fused = _write_checkpoint(
-        tmp_path / "fused.safetensors", metadata={"config": SYNTHETIC_CONFIG}, q_shape=(8, 8)
+        tmp_path / "fused.safetensors",
+        metadata={"config": SYNTHETIC_CONFIG, "fused": FUSED_MARKER},
+        q_shape=(8, 8),
     )
     with pytest.raises(RuntimeError, match="shape"):
         verify_fused_metadata(fused, base_path=base)
@@ -256,7 +264,9 @@ def test_verify_fused_metadata_key_set_drift_vs_base_raises(tmp_path: Path) -> N
         "model.diffusion_model.audio_transformer_blocks.0.attn1.to_q.weight": torch.zeros(2, 2),
     }
     fused = tmp_path / "fused.safetensors"
-    save_file(fused_tensors, str(fused), metadata={"config": SYNTHETIC_CONFIG})
+    save_file(
+        fused_tensors, str(fused), metadata={"config": SYNTHETIC_CONFIG, "fused": FUSED_MARKER}
+    )
     with pytest.raises(RuntimeError, match="NAME set"):
         verify_fused_metadata(str(fused), base_path=base)
 
@@ -267,7 +277,9 @@ def test_verify_fused_metadata_config_drift_vs_base_raises(tmp_path: Path) -> No
         tmp_path / "base.safetensors", metadata={"config": SYNTHETIC_CONFIG}
     )
     fused = _write_checkpoint(
-        tmp_path / "fused.safetensors", metadata={"config": '{"video_dim": 3840}'}, q_value=2.0
+        tmp_path / "fused.safetensors",
+        metadata={"config": '{"video_dim": 3840}', "fused": FUSED_MARKER},
+        q_value=2.0,
     )
     with pytest.raises(RuntimeError, match="DIFFERS"):
         verify_fused_metadata(fused, base_path=base)
@@ -322,3 +334,115 @@ def test_diff_changed_keys_zero_changes_is_the_no_op_signature() -> None:
     base_sd = {"a.weight": torch.ones(2, 2)}
     fused_sd = {"a.weight": torch.ones(2, 2)}
     assert diff_changed_keys(base_sd, fused_sd, ["a.weight"]) == []
+
+
+# --------------------------------------------------------------------------------------------------
+# PR-6 audit fixes — truncation coverage (gap-fuse-0), overwrite guard (gap-fuse-2), and fuse
+# provenance + marker assertion (gap-fuse-3). The truncation and unfused-base tests FAIL on the
+# pre-fix verify_fused_metadata (which passed both).
+# --------------------------------------------------------------------------------------------------
+
+
+def _write_sound_fused_pair(tmp_path: Path) -> tuple[str, str]:
+    base = _write_checkpoint(
+        tmp_path / "base.safetensors", metadata={"config": SYNTHETIC_CONFIG}, q_value=1.0
+    )
+    fused = _write_checkpoint(
+        tmp_path / "fused.safetensors",
+        metadata={"config": SYNTHETIC_CONFIG, "fused": FUSED_MARKER, "model_version": "2.3"},
+        q_value=2.0,
+    )
+    return base, fused
+
+
+def test_expected_safetensors_size_matches_a_complete_file(tmp_path: Path) -> None:
+    _, fused = _write_sound_fused_pair(tmp_path)
+    assert expected_safetensors_size(fused) == Path(fused).stat().st_size
+
+
+def test_verify_fused_metadata_truncated_payload_raises(tmp_path: Path) -> None:
+    """gap-fuse-0 regression: safetensors writes the header FIRST, so a file cut mid-payload
+
+    still carries a complete valid header and (pre-fix) passed every gate assertion while
+    load_file raised on the real consumer. The payload-coverage check must refuse it.
+    """
+    base, fused = _write_sound_fused_pair(tmp_path)
+    full = Path(fused).read_bytes()
+    header_len = int.from_bytes(full[:8], "little")
+    payload = len(full) - 8 - header_len
+    Path(fused).write_bytes(full[: 8 + header_len + payload // 2])  # header intact, payload cut
+    # Header-only reads still succeed on the truncated file — that is exactly the trap.
+    metadata, _ = read_safetensors_header(fused)
+    assert metadata["config"] == SYNTHETIC_CONFIG
+    with pytest.raises(RuntimeError, match="TRUNCATED"):
+        verify_fused_metadata(fused, base_path=base)
+
+
+def test_verify_fused_metadata_rejects_the_unfused_base(tmp_path: Path) -> None:
+    """gap-fuse-3 regression: the plain dev base (no 'fused' marker) must never verify as a
+
+    sound fused scaffold — pre-fix it PASSED with fused_marker None, even with base comparison.
+    """
+    base, _ = _write_sound_fused_pair(tmp_path)
+    with pytest.raises(RuntimeError, match="marker"):
+        verify_fused_metadata(base, base_path=base)
+
+
+def test_verify_fused_metadata_marker_assert_can_be_opted_out(tmp_path: Path) -> None:
+    base, _ = _write_sound_fused_pair(tmp_path)
+    summary = verify_fused_metadata(base, expected_marker=None)
+    assert summary["fused_marker"] is None
+
+
+def test_verify_fused_metadata_surfaces_fuse_strength(tmp_path: Path) -> None:
+    fused = _write_checkpoint(
+        tmp_path / "fused.safetensors",
+        metadata={"config": SYNTHETIC_CONFIG, "fused": FUSED_MARKER, "fuse_strength": "1.0"},
+    )
+    summary = verify_fused_metadata(fused)
+    assert summary["fuse_strength"] == "1.0"
+
+
+def test_build_fused_metadata_records_provenance() -> None:
+    """gap-fuse-3: strength + adapter identity ride INTO the artifact, as str->str metadata."""
+    meta = build_fused_metadata(
+        {"config": SYNTHETIC_CONFIG},
+        strength=1.0,
+        lora_repo="Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting",
+        lora_filename="adapter.safetensors",
+        lora_sha256="ab" * 32,
+    )
+    assert meta["fuse_strength"] == "1.0"
+    assert meta["lora_repo"].endswith("In-Outpainting")
+    assert meta["lora_filename"] == "adapter.safetensors"
+    assert meta["lora_sha256"] == "ab" * 32
+    assert all(isinstance(v, str) for v in meta.values())  # safetensors metadata is str->str
+
+
+def test_sha256_file_matches_hashlib(tmp_path: Path) -> None:
+    import hashlib
+
+    payload = b"adapter-bytes" * 100
+    p = tmp_path / "adapter.bin"
+    p.write_bytes(payload)
+    assert sha256_file(str(p)) == hashlib.sha256(payload).hexdigest()
+
+
+def test_is_fused_base_filename_naming_contract() -> None:
+    assert is_fused_base_filename("ltx-2.3-22b-inoutpaint-fused.safetensors")
+    assert is_fused_base_filename("weights/ltx-2.3-22b-inoutpaint-fused.safetensors")
+    assert not is_fused_base_filename("ltx-2.3-22b-dev.safetensors")
+    assert not is_fused_base_filename("ltx-2.3-22b-distilled.safetensors")
+    # A directory component carrying '-fused' must not classify a non-fused file.
+    assert not is_fused_base_filename("some-fused-dir/ltx-2.3-22b-dev.safetensors")
+
+
+def test_fuse_inoutpaint_refuses_to_overwrite_existing_scaffold(tmp_path: Path) -> None:
+    """gap-fuse-2 regression: an existing fused base is an artifact prior runs trained against —
+
+    a re-dispatch must raise (house rule 6), BEFORE any heavy import/load, unless explicitly
+    opted in. Pre-fix, save_file overwrote it in place with no warning.
+    """
+    base, fused = _write_sound_fused_pair(tmp_path)
+    with pytest.raises(RuntimeError, match="overwrite"):
+        fuse_inoutpaint(base_path=base, out_path=fused)
