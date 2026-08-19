@@ -1551,3 +1551,80 @@ def test_the_four_h3_sources_are_registered_and_the_five_ltx_ones_are_untouched(
     assert len(set(keys.values())) == len(keys), (
         "two sources mapping to the same output key would have one silently overwrite the other"
     )
+
+
+# ==================================================================================================
+# FRAME-COUNT BUCKETING — ``_row_frames``'s refusal paths
+# ==================================================================================================
+#
+# ``_row_frames`` is a closure NESTED inside ``h3_preprocess`` (not a top-level def), so it cannot be
+# imported the way ``_h3_resolve_references`` is in test_h3_reference_descriptors.py. Its body is
+# pure stdlib (no torch, no modal) and closes over only ``target_frames`` / ``declared`` / ``multi``,
+# so it is extracted out of the PARSED source (never re-typed) and exec'd standalone with those three
+# names pre-seeded as globals — proving the real code, not a restatement of it.
+
+
+def _row_frames_fn(*, target_frames: int, declared: tuple[int, ...], multi: bool):
+    import ast
+
+    tree = ast.parse(_FNS.read_text(encoding="utf-8"))
+    h3_preprocess = next(
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "h3_preprocess"
+    )
+    row_frames_def = next(
+        n
+        for n in ast.walk(h3_preprocess)
+        if isinstance(n, ast.FunctionDef) and n.name == "_row_frames"
+    )
+    module = ast.Module(body=[row_frames_def], type_ignores=[])
+    namespace: dict = {
+        "target_frames": target_frames,
+        "declared": declared,
+        "multi": multi,
+    }
+    exec(compile(ast.fix_missing_locations(module), "<fns-row-frames-slice>", "exec"), namespace)  # noqa: S102
+    return namespace["_row_frames"]
+
+
+def test_row_frames_defaults_to_training_dims_f_in_single_bucket_mode() -> None:
+    """No ``target_frames`` key, one declared bucket -> the row silently takes the default."""
+    row_frames = _row_frames_fn(target_frames=22, declared=(22,), multi=False)
+    assert row_frames({}, 0) == 22
+
+
+def test_row_frames_refuses_a_missing_key_under_more_than_one_bucket() -> None:
+    """The whole point of the guard: no silent default once >1 bucket is declared."""
+    row_frames = _row_frames_fn(target_frames=22, declared=(5, 22), multi=True)
+    with pytest.raises(KeyError, match="names no 'target_frames'"):
+        row_frames({}, 17)
+    # The message must name the row INDEX (a mixed-length manifest can be hundreds of rows long)
+    # and the declared bucket set (so the operator knows what a row is allowed to say).
+    try:
+        row_frames({}, 17)
+    except KeyError as exc:
+        assert "17" in str(exc)
+        assert "(5, 22)" in str(exc)
+    else:
+        raise AssertionError("expected KeyError")
+
+
+def test_row_frames_refuses_an_undeclared_explicit_value() -> None:
+    """A row that DOES name a count, but not one this run declared, is a staging error too."""
+    row_frames = _row_frames_fn(target_frames=22, declared=(5, 22), multi=True)
+    with pytest.raises(ValueError, match="not a declared bucket"):
+        row_frames({"target_frames": 49}, 3)
+
+
+def test_row_frames_accepts_every_declared_value_explicitly_under_multi_bucket() -> None:
+    """The positive control for the guard above: a row naming a REAL bucket is never refused."""
+    row_frames = _row_frames_fn(target_frames=22, declared=(5, 22), multi=True)
+    assert row_frames({"target_frames": 5}, 0) == 5
+    assert row_frames({"target_frames": 22}, 1) == 22
+
+
+def test_row_frames_still_validates_an_explicit_value_in_single_bucket_mode() -> None:
+    """Naming your own count is always legal — even in single-bucket mode — as long as it agrees."""
+    row_frames = _row_frames_fn(target_frames=22, declared=(22,), multi=False)
+    assert row_frames({"target_frames": 22}, 0) == 22
+    with pytest.raises(ValueError, match="not a declared bucket"):
+        row_frames({"target_frames": 5}, 0)

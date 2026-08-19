@@ -531,7 +531,129 @@ def test_reference_latent_grid_agrees_with_the_geometry_row_count() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# 7. Import confinement — Anti-Pattern 6, the CONFINED tier
+# 7. FRAME-COUNT BUCKETING — H3PositionIdsBuilder.resolve_bucket / audio_rows_for
+# --------------------------------------------------------------------------------------------------
+
+
+def test_resolve_bucket_returns_the_right_grid_and_audio_rows_for_each_declared_bucket() -> None:
+    """Each declared bucket resolves to its OWN grid/audio-row count, keyed by measured rows."""
+    from signet_trainer.conditioning.h3_geometry import (
+        h3_audio_rows,
+        h3_latent_frames,
+        resolve_canvas_size,
+        rows_of,
+    )
+
+    fn = _fn(target_frames=(5, 22))
+    canvas_h, canvas_w = resolve_canvas_size(16, 9)
+    rows_per_latent_frame = rows_of(canvas_h, canvas_w)
+
+    for frames in (5, 22):
+        n_target_video = h3_latent_frames(frames) * rows_per_latent_frame
+        bucket = fn.resolve_bucket(n_target_video)
+        assert bucket["target_frames"] == frames
+        assert bucket["target_grid"][0] == h3_latent_frames(frames)
+        assert bucket["n_target_video_rows"] == n_target_video
+        assert bucket["n_target_audio_rows"] == h3_audio_rows(frames)
+        assert fn.audio_rows_for(n_target_video) == h3_audio_rows(frames)
+
+
+def test_resolve_bucket_refuses_a_row_count_matching_no_declared_bucket() -> None:
+    """Picking the nearest bucket would train against coordinates the latents do not have."""
+    fn = _fn(target_frames=(5, 22))
+    with pytest.raises(ValueError, match="matches NO declared frame bucket") as excinfo:
+        fn.resolve_bucket(1)
+    # The refusal must name EVERY declared bucket, not just the one that almost matched.
+    assert "F=5" in str(excinfo.value)
+    assert "F=22" in str(excinfo.value)
+
+
+def test_audio_rows_for_refuses_the_same_undeclared_row_count() -> None:
+    fn = _fn(target_frames=(5, 22))
+    with pytest.raises(ValueError, match="matches NO declared frame bucket"):
+        fn.audio_rows_for(1)
+
+
+def test_a_multi_bucket_builder_exposes_no_single_target_frames_scalar() -> None:
+    """Absent is better than wrong: a stale scalar would price one bucket for every sample."""
+    fn = _fn(target_frames=(5, 22))
+    assert fn.target_frames is None
+    assert not hasattr(fn, "n_target_audio_rows"), (
+        "H3RefStrategy._absent_target_audio_rows falls back to this attribute via getattr — if it "
+        "existed on a bucketed builder it would silently price the WRONG bucket's audio rows for "
+        "some sample"
+    )
+
+
+def test_a_single_bucket_sequence_builder_is_byte_identical_to_the_scalar_constructor() -> None:
+    """Back-compat regression: passing ``(22,)`` must behave EXACTLY like passing ``22``.
+
+    This is what makes frame-count bucketing additive rather than a rewrite of the single-bucket
+    (pre-bucketing) path every existing H3 config already exercises.
+    """
+    scalar_fn = _fn(target_frames=22)
+    tuple_fn = _fn(target_frames=(22,))
+
+    assert tuple_fn.target_frames == scalar_fn.target_frames == 22
+    assert tuple_fn.target_grid == scalar_fn.target_grid
+    assert tuple_fn.n_target_video_rows == scalar_fn.n_target_video_rows
+    assert tuple_fn.n_target_audio_rows == scalar_fn.n_target_audio_rows
+
+    refs = (_Ref(1024, 1536), _Ref(1440, 800, kind="environment"))
+    n_cond_video = sum(
+        _rows(h3_latent_grid_of_reference(r.width, r.height, 896, PATCH)) for r in refs
+    )
+    kwargs = dict(
+        n_text=N_TEXT,
+        references=refs,
+        n_cond_video=n_cond_video,
+        n_cond_audio=0,
+        n_target_audio=scalar_fn.n_target_audio_rows,
+        n_target_video=scalar_fn.n_target_video_rows,
+        seq_len=N_TEXT + n_cond_video + scalar_fn.n_target_audio_rows + scalar_fn.n_target_video_rows,
+    )
+    assert torch.equal(scalar_fn(**kwargs), tuple_fn(**kwargs))
+
+
+def test_the_factory_builds_coordinates_for_every_declared_bucket_in_the_same_run() -> None:
+    """The end-to-end multi-bucket case: one builder serves samples from EITHER declared bucket."""
+    fn = _fn(target_frames=(5, 22))
+    refs = (_Ref(1024, 1536), _Ref(1440, 800, kind="environment"))
+    n_cond_video = sum(
+        _rows(h3_latent_grid_of_reference(r.width, r.height, 896, PATCH)) for r in refs
+    )
+    from signet_trainer.conditioning.h3_geometry import (
+        h3_audio_rows,
+        h3_latent_frames,
+        resolve_canvas_size,
+        rows_of,
+    )
+
+    canvas_h, canvas_w = resolve_canvas_size(16, 9)
+    rows_per_latent_frame = rows_of(canvas_h, canvas_w)
+    for frames in (5, 22):
+        n_target_video = h3_latent_frames(frames) * rows_per_latent_frame
+        n_target_audio = h3_audio_rows(frames)
+        seq = N_TEXT + n_cond_video + n_target_audio + n_target_video
+        ids = fn(
+            n_text=N_TEXT,
+            references=refs,
+            n_cond_video=n_cond_video,
+            n_cond_audio=0,
+            n_target_audio=n_target_audio,
+            n_target_video=n_target_video,
+            seq_len=seq,
+        )
+        assert ids.shape == (seq, 3)
+
+
+def test_the_builder_refuses_an_empty_bucket_set() -> None:
+    with pytest.raises(ValueError, match="target_frames is empty"):
+        _fn(target_frames=())
+
+
+# --------------------------------------------------------------------------------------------------
+# 8. Import confinement — Anti-Pattern 6, the CONFINED tier
 # --------------------------------------------------------------------------------------------------
 
 

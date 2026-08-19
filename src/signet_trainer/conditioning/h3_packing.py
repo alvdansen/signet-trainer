@@ -470,13 +470,44 @@ class H3PositionIdsBuilder:
     def __init__(
         self,
         *,
-        target_frames: int,
+        target_frames: int | Sequence[int],
         target_aspect: tuple[int, int],
         reference_short_edge: int,
         patch_size: tuple[int, int, int],
         audio_channels: int = H3_AUDIO_CHANNELS,
     ) -> None:
-        self.target_frames = int(target_frames)
+        """``target_frames`` is a single count OR a sequence of declared FRAME BUCKETS.
+
+        FRAME-COUNT BUCKETING. A run may mix target lengths — e.g. F=5 (one still, staged as a
+        5-frame freeze) alongside F=22 (11 drawings held on twos) — so a corpus of uneven shot
+        lengths can contribute stills from short shots and sequences from long ones in the SAME
+        run. Each declared bucket is priced here once and the SAMPLE's own bucket is resolved
+        per call from the row counts the strategy measured off the real tensors.
+
+        ⛔ Buckets are keyed by LATENT-FRAME COUNT, never by target ROW count. Row count is
+        injective in F only while the canvas is fixed; across canvases it collides (F=56 on
+        768x768 gives 17*576 = 9,792 rows and F=39 on 768x1088 gives 12*816 = 9,792 — both legal
+        under ``resolve_canvas_size``). Aspect bucketing is a separate change and keying by rows
+        would hand it a silent wrong-geometry selection. The constructor also ASSERTS injectivity
+        so that change trips an error instead of inheriting the bug.
+        """
+        if isinstance(target_frames, int):
+            buckets = (int(target_frames),)
+        else:
+            buckets = tuple(sorted({int(f) for f in target_frames}))
+        if not buckets:
+            raise ValueError(
+                "target_frames is empty: a builder must know at least one declared frame count. "
+                "Pass an int for a single-bucket run or the declared bucket set for a "
+                "frame-bucketed one."
+            )
+        self.target_frames_buckets: tuple[int, ...] = buckets
+        # The scalar spelling survives ONLY in single-bucket mode. In a bucketed run there is no
+        # one campaign frame count, and exposing a stale scalar is exactly how a consumer that
+        # falls back to it (H3RefStrategy._absent_target_audio_rows reads
+        # `position_ids_fn.n_target_audio_rows` via getattr) would silently price one bucket's
+        # audio rows for another sample. Absent is better than wrong.
+        self.target_frames: int | None = buckets[0] if len(buckets) == 1 else None
         self.target_aspect = (int(target_aspect[0]), int(target_aspect[1]))
         self.reference_short_edge = int(reference_short_edge)
         self.patch_size = tuple(int(p) for p in patch_size)  # type: ignore[assignment]
@@ -486,15 +517,65 @@ class H3PositionIdsBuilder:
         # frame law and the audio-row count are all read from there, never re-derived here.
         canvas_height, canvas_width = resolve_canvas_size(*self.target_aspect)
         ratio = H3_CANVAS_MULTIPLE // self.patch_size[2]
-        self.target_grid: tuple[int, int, int] = (
-            h3_latent_frames(self.target_frames),
-            canvas_height // ratio,
-            canvas_width // ratio,
-        )
-        self.n_target_video_rows: int = h3_latent_frames(self.target_frames) * rows_of(
-            canvas_height, canvas_width
-        )
-        self.n_target_audio_rows: int = h3_audio_rows(self.target_frames)
+        rows_per_latent_frame = rows_of(canvas_height, canvas_width)
+
+        self._by_latent_frames: dict[int, dict[str, Any]] = {}
+        for frames in buckets:
+            latent_frames = h3_latent_frames(frames)   # re-validates the 17n+5 law per bucket
+            if latent_frames in self._by_latent_frames:
+                raise ValueError(
+                    f"frame buckets {buckets} are not injective in latent-frame count: "
+                    f"{frames} collides with "
+                    f"{self._by_latent_frames[latent_frames]['target_frames']}. Two buckets that "
+                    f"resolve to the same latent grid cannot be told apart from a batch."
+                )
+            self._by_latent_frames[latent_frames] = {
+                "target_frames": frames,
+                "target_grid": (latent_frames, canvas_height // ratio, canvas_width // ratio),
+                "n_target_video_rows": latent_frames * rows_per_latent_frame,
+                "n_target_audio_rows": h3_audio_rows(frames),
+            }
+        self._rows_per_latent_frame = rows_per_latent_frame
+        self._by_target_video_rows: dict[int, dict[str, Any]] = {
+            int(spec["n_target_video_rows"]): spec for spec in self._by_latent_frames.values()
+        }
+
+        single = self._by_latent_frames[h3_latent_frames(buckets[0])]
+        self.target_grid: tuple[int, int, int] = single["target_grid"]
+        self.n_target_video_rows: int = int(single["n_target_video_rows"])
+        if len(buckets) == 1:
+            self.n_target_audio_rows: int = int(single["n_target_audio_rows"])
+
+    def resolve_bucket(self, n_target_video: int) -> dict[str, Any]:
+        """The sample's own bucket, from the target-video rows the strategy measured.
+
+        Loud on an undeclared count, and the message names every declared bucket — a sample whose
+        cache was encoded at a frame count this run does not declare is a staging error, and
+        picking the nearest bucket would train against coordinates for a geometry the latents do
+        not have.
+        """
+        spec = self._by_target_video_rows.get(int(n_target_video))
+        if spec is None:
+            declared = ", ".join(
+                f"F={s['target_frames']} -> {s['n_target_video_rows']} rows"
+                for s in self._by_latent_frames.values()
+            )
+            raise ValueError(
+                f"H3 RoPE geometry disagreement on the TARGET video rows: the batch carries "
+                f"{n_target_video} row(s), which matches NO declared frame bucket at "
+                f"h3.target_aspect={self.target_aspect} ({declared}). The cached target latents "
+                f"were encoded at a different canvas or frame count than this config declares."
+            )
+        return spec
+
+    def audio_rows_for(self, n_target_video: int) -> int:
+        """Target-audio rows for the bucket this sample belongs to.
+
+        ``H3RefStrategy`` calls this when a sample carries no audio stream and the rows have to be
+        synthesized as noise. It is a METHOD rather than the ``n_target_audio_rows`` scalar
+        precisely because a bucketed run has no single answer.
+        """
+        return int(self.resolve_bucket(n_target_video)["n_target_audio_rows"])
 
     def __call__(
         self,
@@ -540,18 +621,15 @@ class H3PositionIdsBuilder:
                 f"payload are not the sizes that were encoded. Refusing to build coordinates for a "
                 f"geometry the latents do not have."
             )
-        if int(n_target_video) != self.n_target_video_rows:
+        # Resolve THIS sample's frame bucket from the rows the strategy measured off the real
+        # tensors. In single-bucket mode this is the same assertion as before, phrased against a
+        # set of one; the derivation is still PROVEN against the batch rather than assumed.
+        bucket = self.resolve_bucket(int(n_target_video))
+        if int(n_target_audio) != int(bucket["n_target_audio_rows"]):
             raise ValueError(
-                f"H3 RoPE geometry disagreement on the TARGET video rows: h3.target_aspect="
-                f"{self.target_aspect} with {self.target_frames} frames re-derives to "
-                f"{self.n_target_video_rows} row(s), but the batch carries {n_target_video}. The "
-                f"cached target latents were encoded at a different canvas or frame count than "
-                f"this config declares."
-            )
-        if int(n_target_audio) != self.n_target_audio_rows:
-            raise ValueError(
-                f"H3 RoPE geometry disagreement on the TARGET audio rows: {self.target_frames} "
-                f"frames re-derive to {self.n_target_audio_rows} row(s) "
+                f"H3 RoPE geometry disagreement on the TARGET audio rows: this sample's "
+                f"{bucket['target_frames']} frames re-derive to "
+                f"{bucket['n_target_audio_rows']} row(s) "
                 f"(conditioning/h3_geometry.h3_audio_rows), but the batch carries {n_target_audio}."
             )
         if int(n_target_audio) % self.audio_channels:
@@ -563,7 +641,11 @@ class H3PositionIdsBuilder:
         position_ids = build_h3_ref2va_position_ids(
             int(n_text),
             grids,
-            self.target_grid,
+            # THIS SAMPLE's grid, not the builder's first bucket. Using `self.target_grid` here
+            # would emit coordinates for the wrong number of latent frames on every sample outside
+            # the first declared bucket — at a row count that still matches, so the seq_len check
+            # below would pass and the run would train against silently wrong RoPE.
+            bucket["target_grid"],
             int(n_target_audio) // self.audio_channels,
             self.patch_size,
             audio_channels=self.audio_channels,
@@ -579,7 +661,7 @@ class H3PositionIdsBuilder:
 
 def make_h3_position_ids_fn(
     *,
-    target_frames: int,
+    target_frames: int | Sequence[int],
     target_aspect: tuple[int, int],
     reference_short_edge: int,
     patch_size: tuple[int, int, int],

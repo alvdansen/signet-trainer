@@ -276,7 +276,13 @@ def test_the_guard_would_go_red_on_a_mutated_stage_body() -> None:
     is precisely the edit that shipped D-10-DEF-1.
     """
     source = _FNS.read_text(encoding="utf-8")
-    mutated = source.replace("config.training_dims[2],", "config.data.frame_count,", 1)
+    # Re-targeted for FRAME-COUNT BUCKETING: h3_train's RoPE target_frames is now the declared-bucket
+    # helper call ``_h3_frame_buckets(config)``, not a bare attribute chain, so the old
+    # ``config.training_dims[2],`` anchor no longer appears there. The audio-rows default under
+    # single-bucket mode still reads ``config.training_dims[2]`` directly — that is the anchor now.
+    mutated = source.replace(
+        "int(config.training_dims[2])", "int(config.data.frame_count)", 1
+    )
     assert mutated != source, "the mutation anchor no longer matches — re-target it"
 
     tree = ast.parse(mutated)
@@ -311,16 +317,32 @@ def _position_ids_target_frames(path: Path, function: str) -> list[str]:
     return found
 
 
-def _pre_encode_target_frames() -> str:
-    """The expression ``_h3_encode_params`` threads into ``h3_preprocess(target_frames=...)``."""
+def _pre_encode_frame_buckets() -> str:
+    """The expression ``_h3_encode_params`` threads into ``h3_preprocess(frame_buckets=...)``.
+
+    FRAME-COUNT BUCKETING (re-point, 2026-08): the pre-encode's single source of "what frame counts
+    this run declares" is ``frame_buckets``, not the ``target_frames`` scalar — that scalar is only
+    the SINGLE-bucket-mode default for a manifest row that names none of its own
+    (``fns.py::_row_frames``). The RoPE builder in ``h3_train``/``h3_sample`` needs every declared
+    bucket, so that is the seam this guard must follow.
+    """
     node = _function_node(_ENTRYPOINT, "_h3_encode_params")
     for dict_node in ast.walk(node):
         if not isinstance(dict_node, ast.Dict):
             continue
         for key, value in zip(dict_node.keys, dict_node.values, strict=False):
-            if isinstance(key, ast.Constant) and key.value == "target_frames":
+            if isinstance(key, ast.Constant) and key.value == "frame_buckets":
                 return ast.unparse(value)
-    raise AssertionError("_h3_encode_params supplies no 'target_frames' — the seam moved")
+    raise AssertionError("_h3_encode_params supplies no 'frame_buckets' — the seam moved")
+
+
+def _frame_buckets_helper_body() -> str:
+    """The expression ``fns.py::_h3_frame_buckets`` returns — the RoPE builder's own source."""
+    node = _function_node(_FNS, "_h3_frame_buckets")
+    for stmt in ast.walk(node):
+        if isinstance(stmt, ast.Return) and stmt.value is not None:
+            return ast.unparse(stmt.value)
+    raise AssertionError("_h3_frame_buckets has no return — the seam moved")
 
 
 def _without_root(expression: str) -> str:
@@ -328,46 +350,82 @@ def _without_root(expression: str) -> str:
     return re.sub(rf"^(?:{'|'.join(_CONFIG_ROOTS)})\.", "", expression)
 
 
+def _without_any_root(expression: str) -> str:
+    """Like ``_without_root``, but strips ``cfg.``/``config.`` wherever they occur, not just at the
+    start — needed to diff two INDEPENDENT re-derivations of the same formula (``entrypoint.py``'s
+    inline computation and ``fns.py::_h3_frame_buckets``'s body), which necessarily bind the config
+    to different local names and are not import-linked (``entrypoint.py`` must not import
+    ``modal/fns.py`` — that eagerly builds the Modal app graph).
+    """
+    return re.sub(rf"\b(?:{'|'.join(_CONFIG_ROOTS)})\.", "", expression)
+
+
 @pytest.mark.parametrize("function", ["h3_train", "h3_sample"])
-def test_both_h3_stages_derive_target_frames_from_the_same_source_as_the_pre_encode(
+def test_both_h3_stages_derive_target_frames_from_the_declared_bucket_helper(
     function: str,
 ) -> None:
-    """The RoPE geometry must agree with the CACHE, and the cache's frame count has one home.
+    """Both H3 stages hand the RoPE builder the DECLARED BUCKET SET, via one named helper.
 
-    ``H3PositionIdsBuilder`` re-derives the target latent grid and refuses any batch whose measured
-    rows disagree, so a stage handed a different frame count than the pre-encode used cannot train —
-    it aborts naming two numbers. ``config.validation.frame_count`` resolves perfectly well and is
-    still wrong here: it is a RENDER field, ``configs/h3_embe_r1.yaml`` does not set it, and the
-    schema default is 49 against a 22-frame cache.
-
-    Both sides are re-derived from the real sources and diffed rather than restated, so this fails
-    if EITHER moves.
+    Under frame-count bucketing ``H3PositionIdsBuilder`` no longer takes the single frame count the
+    cache was encoded at — it takes every bucket the run declared and proves each sample's own frame
+    count against it (``resolve_bucket``). ``_h3_frame_buckets(config)`` is that single helper; a
+    stage that instead handed it ``config.training_dims[2]`` (the pre-bucketing shape) would price
+    one bucket for every sample and make the builder raise on the first sample of any other bucket,
+    mid-run on a metered container — the same class of defect as D-10-DEF-1, one call earlier.
     """
-    expected = _without_root(_pre_encode_target_frames())
     supplied = _position_ids_target_frames(_FNS, function)
     assert supplied, f"{function}() no longer builds a position_ids fn — re-target this guard"
     for expression in supplied:
-        assert _without_root(expression) == expected, (
-            f"{function}() builds H3 RoPE for {expression!r} but the pre-encode encoded "
-            f"{_pre_encode_target_frames()!r}. The position-ids builder proves its derivation "
-            "against rows measured off the CACHED tensors, so these two must name one source."
+        assert expression == "_h3_frame_buckets(config)", (
+            f"{function}() builds H3 RoPE for {expression!r}, not the declared-bucket helper "
+            "'_h3_frame_buckets(config)'. Under bucketing the builder must be handed every declared "
+            "bucket, never a single scalar."
         )
 
 
-def test_the_target_frames_agreement_check_would_report_a_divergence() -> None:
+def test_the_declared_bucket_helper_and_the_pre_encode_derive_it_from_one_formula() -> None:
+    """The helper's body and the pre-encode's inline copy must be the SAME formula.
+
+    They cannot share one function call (``entrypoint.py`` does not import ``modal/fns.py``), so each
+    re-derives ``sorted({validate_h3_resolution_bucket(b)[2] for b in <cfg>.data.resolution_buckets})``
+    independently. Diffing the two bodies (root name stripped) is what proves they cannot silently
+    drift apart into two different bucket sets for the same config.
+    """
+    helper = _without_any_root(_frame_buckets_helper_body())
+    pre_encode = _without_any_root(_pre_encode_frame_buckets())
+    assert helper == pre_encode, (
+        f"fns.py::_h3_frame_buckets computes {helper!r} but entrypoint.py's frame_buckets= computes "
+        f"{pre_encode!r}. Both must derive the declared bucket set from data.resolution_buckets by "
+        "the SAME formula, or the pre-encode and the training-time RoPE builder can disagree about "
+        "which buckets a run declared."
+    )
+
+
+def test_the_bucket_formula_agreement_check_would_report_a_divergence() -> None:
     """Negative control for the comparison above — a mismatch must not compare equal."""
-    assert _without_root("config.validation.frame_count") != _without_root("cfg.training_dims[2]")
-    assert _without_root("config.training_dims[2]") == _without_root("cfg.training_dims[2]")
+    assert _without_any_root("cfg.data.resolution_buckets") == _without_any_root(
+        "config.data.resolution_buckets"
+    )
+    assert _without_any_root("cfg.validation.frame_count") != _without_any_root(
+        "config.data.resolution_buckets"
+    )
 
 
 def test_the_render_frame_count_stays_a_separate_read() -> None:
     """The RENDER count is a different decision from the training geometry — keep both.
 
-    ``h3_sample`` legitimately reads BOTH: ``training_dims[2]`` for the delta batch it builds out of
-    the precomputed training cache, and ``validation.frame_count`` for the clips it renders.
-    Collapsing them into one read would be a plausible-looking "cleanup" that silently re-times
-    either the eval clips or the adapter-delta geometry.
+    ``h3_sample`` legitimately reads ``validation.frame_count`` for the clips it renders, which stays
+    a plain config chain this file's resolver sees directly. The adapter-delta geometry it builds out
+    of the precomputed training cache is a SEPARATE decision — under bucketing it no longer comes from
+    a bare ``training_dims`` chain (see ``test_both_h3_stages_derive_target_frames_from_the_declared_
+    bucket_helper``); it comes from ``_h3_frame_buckets(config)``, a call this AST-chain resolver
+    cannot see by design (it walks attribute chains, not calls). Collapsing the render count into the
+    training geometry would be a plausible-looking "cleanup" that silently re-times the eval clips.
     """
     chains = {chain for chain, _ in _config_chains(_function_node(_FNS, "h3_sample"))}
     assert ("validation", "frame_count") in chains, "the render count must still come from validation"
-    assert ("training_dims",) in chains, "the delta batch's geometry must come from training_dims"
+    supplied = _position_ids_target_frames(_FNS, "h3_sample")
+    assert supplied == ["_h3_frame_buckets(config)"], (
+        "the delta batch's geometry must come from the declared-bucket helper, not a bare "
+        "training_dims chain"
+    )

@@ -726,3 +726,108 @@ def test_environment_references_at_two_slots_are_fine() -> None:
     )
     assert h3.references_per_sample == 2
     assert len(h3.environment_reference_sizes) == 1
+
+
+# ======================================================================================
+# FRAME-COUNT BUCKETING — the three back-compat guards ``_cross_field_checks`` enforces
+# once ``data.resolution_buckets`` becomes LOAD-BEARING on the H3 path.
+# ======================================================================================
+
+
+def test_a_valid_multi_bucket_h3_config_loads() -> None:
+    """The positive control: two buckets, same canvas, training_dims F declared among them."""
+    cfg = SignetConfig.model_validate(
+        _h3_payload(
+            data={
+                "preprocessed_data_root": "/data/h3_preprocessed",
+                "batch_size": 1,
+                "resolution_buckets": ["1344x768x22", "1344x768x5"],
+            },
+        )
+    )
+    assert cfg.data.resolution_buckets == ["1344x768x22", "1344x768x5"]
+
+
+def test_a_bucket_declaring_a_different_canvas_is_refused() -> None:
+    """Aspect bucketing is out of scope (issue #1) — every bucket must assert the RUN's own canvas."""
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(
+            _h3_payload(
+                data={
+                    "preprocessed_data_root": "/data/h3_preprocessed",
+                    "batch_size": 1,
+                    # 1152x768 is a legal H3 canvas (a different aspect), not h3.target_aspect's
+                    # 16:9 -> 1344x768.
+                    "resolution_buckets": ["1344x768x22", "1152x768x5"],
+                },
+            )
+        )
+    msg = str(exc.value)
+    assert "1152x768" in msg
+    assert "1344x768" in msg
+
+
+def test_a_single_bucket_disagreeing_with_training_dims_f_is_refused() -> None:
+    """Back-compat: these strings used to be decorative. One declared bucket must now AGREE."""
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(
+            _h3_payload(
+                training_dims=[1344, 768, 22],
+                data={
+                    "preprocessed_data_root": "/data/h3_preprocessed",
+                    "batch_size": 1,
+                    "resolution_buckets": ["1344x768x5"],
+                },
+            )
+        )
+    msg = str(exc.value)
+    assert "F=5" in msg
+    assert "training_dims F=22" in msg
+
+
+def test_training_dims_f_must_be_among_the_declared_buckets() -> None:
+    """Under >1 bucket, training_dims F is the SINGLE-bucket default — it must still be legal."""
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(
+            _h3_payload(
+                # 39 is a VALID H3 count (17*2+5) and satisfies the frame law, so this exercises
+                # the bucket-membership guard specifically rather than the frame-law pre-screen.
+                training_dims=[1344, 768, 39],
+                data={
+                    "preprocessed_data_root": "/data/h3_preprocessed",
+                    "batch_size": 1,
+                    "resolution_buckets": ["1344x768x22", "1344x768x5"],
+                },
+            )
+        )
+    msg = str(exc.value)
+    assert "training_dims F=39" in msg
+    assert "[5, 22]" in msg
+
+
+def test_multi_bucket_budget_prices_the_largest_declared_bucket() -> None:
+    """VRAM peak is set by the LONGEST target any sample may carry, not the default bucket.
+
+    A short default bucket (F=5) alongside a long one (F=124) must still be priced at 124 — a
+    reference-free config makes this unambiguous because there is exactly one layout per frame
+    count, so the refusal's row count pins WHICH bucket the gate actually priced.
+    """
+    payload = _h3_payload(
+        training_dims=[1344, 768, 5],
+        data={
+            "preprocessed_data_root": "/data/h3_preprocessed",
+            "batch_size": 1,
+            "resolution_buckets": ["1344x768x5", "1344x768x124"],
+        },
+    )
+    # #31 finding 1's mirror-direction guard (already merged) refuses references_per_sample != 0
+    # with BOTH size lists empty — declare 0 explicitly (NO-REFERENCE) rather than relying on the
+    # h3 block's all-default references_per_sample=2, so this config exercises ONLY the bucketing
+    # budget path under test, not the unrelated reference-corpus guard. h3_packed_seq_len's
+    # reference-free branch below takes an empty tuple either way, so the priced row count (and
+    # this test's point — the largest bucket is priced) is unchanged.
+    payload["h3"] = {"references_per_sample": 0}
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(payload)
+    msg = str(exc.value)
+    assert "37806" in msg, "the refusal must price the F=124 bucket, not the F=5 default"

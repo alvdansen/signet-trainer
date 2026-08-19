@@ -156,12 +156,19 @@ class H3DryrunBudget:
     a nominal one. ``references`` is that pair itself, so the synthetic batch exercises the most
     expensive shape the dataloader can serve rather than the cheapest. ``worst_pair_label`` is what a
     refusal (and the OK banner) names; it is ``""`` only when no reference corpus is declared.
+
+    ``priced_frames`` is the ONE frame count ``layout`` was actually priced at — the single source
+    both ``assert_h3_seq_len_budget``'s coherence check and ``_h3_ok_banner`` must read, rather than
+    each re-deriving its own (that split is exactly how the budget-incoherence defect shipped: this
+    struct priced the largest declared bucket while its sibling asserted against ``training_dims[2]``
+    and the two disagreed on any multi-bucket config whose default bucket was not the largest).
     """
 
     layout: H3PackedLayout
     worst_pair_label: str
     references: tuple[H3Reference, ...]
     ceiling_rows: int
+    priced_frames: int
 
     @property
     def headroom_rows(self) -> int:
@@ -209,7 +216,22 @@ def _h3_worst_case_budget(cfg: SignetConfig) -> H3DryrunBudget:
     CPU-pure: geometry ints only, no ``torch``, no ``ltx_core``, no ``modal``.
     """
     h3 = cfg.h3
-    target_frames = cfg.training_dims[2]
+    # FRAME-COUNT BUCKETING: price the LARGEST declared bucket, not training_dims F. This gate's
+    # whole justification is "the run would have been caught locally" — pricing the default bucket
+    # would leave a longer declared one unproven all the way to a metered OOM.
+    from signet_trainer.config.validators import validate_h3_resolution_bucket  # noqa: PLC0415
+
+    declared_max = max(
+        validate_h3_resolution_bucket(b)[2] for b in cfg.data.resolution_buckets
+    )
+    # ⛔ SINGLE SOURCE (fix for the budget-incoherence defect): also fold in ``training_dims[2]``
+    # rather than trusting it is always <= declared_max. A schema-loaded config CANNOT diverge here
+    # (the schema guard requires training_dims F to be a declared bucket), but this function is
+    # called on any ``SignetConfig`` object, including one mutated AFTER load — the dry-run gate is
+    # the SECOND line of defence against exactly that drift, and it must price whichever number is
+    # actually larger so ``assert_h3_seq_len_budget`` and ``_h3_ok_banner`` can both read this one
+    # field instead of two that can disagree.
+    target_frames = max(declared_max, cfg.training_dims[2])
     ceiling = max_packed_rows_for_budget(h3.gpu_usable_gib, h3.resident_gib, h3.mib_per_packed_row)
 
     if h3.character_reference_sizes or h3.environment_reference_sizes:
@@ -243,6 +265,7 @@ def _h3_worst_case_budget(cfg: SignetConfig) -> H3DryrunBudget:
         worst_pair_label=label,
         references=references,
         ceiling_rows=ceiling,
+        priced_frames=target_frames,
     )
 
 
@@ -1901,9 +1924,13 @@ def assert_h3_seq_len_budget(cfg: SignetConfig) -> H3DryrunBudget:
     if budget.references:
         # THE refusal, in its single home. It re-enumerates the same domain from the same geometry
         # module; the coherence assert below turns that second call from a duplicate into a proof
-        # that the banner's numbers and the refusal's numbers cannot diverge.
+        # that the banner's numbers and the refusal's numbers cannot diverge. ``target_frames`` is
+        # ``budget.priced_frames`` — the SAME frame count ``_h3_worst_case_budget`` already priced
+        # ``budget.layout`` at — never re-derived from ``cfg.training_dims[2]`` directly, which is
+        # exactly the split that made this assert falsely fire on a multi-bucket config whose default
+        # bucket was not the largest declared one.
         priced = validate_h3_reference_budget(
-            target_frames=cfg.training_dims[2],
+            target_frames=budget.priced_frames,
             aspect=h3.target_aspect,
             character_references=h3.character_reference_sizes,
             environment_references=h3.environment_reference_sizes,
@@ -1935,7 +1962,9 @@ def _h3_ok_banner(cfg: SignetConfig, budget: H3DryrunBudget) -> str:
     ceiling — the operator's next move is to change THAT pair's fidelity, and a bare "N rows of M"
     does not say which one to change.
     """
-    frames = cfg.training_dims[2]
+    # ``budget.priced_frames`` — never ``cfg.training_dims[2]`` directly — so the banner cannot
+    # describe a geometry nobody priced (see ``H3DryrunBudget.priced_frames``).
+    frames = budget.priced_frames
     canvas_height, canvas_width = resolve_canvas_size(*cfg.h3.target_aspect)
     aspect_w, aspect_h = cfg.h3.target_aspect
     if budget.worst_pair_label:
