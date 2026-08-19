@@ -40,9 +40,11 @@ import json
 
 import pytest
 
-# hourly_rate_usd(1.0) * est_hours(2.0) = $2.00 projected -- small and exact, easy to reason about
-# against the cap figures each test below chooses.
-_PROJECTED_USD = 2.0
+# issue #45 PR-2: the gate now prices the WORST-CASE authorized ceiling, not one container life.
+# hourly_rate_usd(1.0) * (est_hours(2.0) * timeout_margin(1.0, pinned below to keep this arithmetic
+# a single clean multiplier)) * lives(11, train's retries=10) = $22.00 projected -- small and exact,
+# easy to reason about against the cap figures each test below chooses.
+_PROJECTED_USD = 22.0
 
 
 class _RecordingCall:
@@ -56,12 +58,25 @@ class _RecordingFn:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
+    def with_options(self, **_kwargs) -> "_RecordingFn":
+        # issue #45 PR-2 retired train()'s 24h exemption — it now dispatches via
+        # train.with_options(timeout=...).spawn(...) like every other GPU arm.
+        return self
+
     def spawn(self, *args, **kwargs) -> _RecordingCall:
         self.calls.append((args, kwargs))
         return _RecordingCall()
 
 
-def _write_config(tmp_path, *, session_cap_usd: float, ledger_path) -> str:
+def _write_config(
+    tmp_path,
+    *,
+    session_cap_usd: float,
+    ledger_path,
+    hourly_rate_usd: float = 1.0,
+    est_hours: float = 2.0,
+    cost_guardrail_usd: float = 50.0,
+) -> str:
     cfg_path = tmp_path / "run.yaml"
     cfg_path.write_text(
         f"""
@@ -71,9 +86,12 @@ data:
 training:
   max_steps: 10
 modal:
-  hourly_rate_usd: 1.0
-  est_hours: 2.0
-  cost_guardrail_usd: 50.0
+  hourly_rate_usd: {hourly_rate_usd}
+  est_hours: {est_hours}
+  # Pinned to 1.0 (schema default 1.5) so bounded_hours == est_hours and every test's arithmetic
+  # stays a single clean multiplier: hourly_rate_usd * est_hours * lives (issue #45 PR-2).
+  timeout_margin: 1.0
+  cost_guardrail_usd: {cost_guardrail_usd}
   session_cap_usd: {session_cap_usd}
   session_spend_ledger_path: "{str(ledger_path).replace(chr(92), '/')}"
 """,
@@ -104,7 +122,7 @@ def test_within_cap_dispatches_with_raw_approve_and_books_the_ledger(tmp_path, m
     ledger_path = tmp_path / "SESSION-STATE.json"
 
     raw_main(
-        config=_write_config(tmp_path, session_cap_usd=10.0, ledger_path=ledger_path),
+        config=_write_config(tmp_path, session_cap_usd=25.0, ledger_path=ledger_path),
         approve=True,
         mode="train",
     )
@@ -123,7 +141,7 @@ def test_over_cap_disables_approve_but_a_present_operator_still_proceeds(tmp_pat
     entrypoint, raw_main = _raw_main()
     monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _stub_train(monkeypatch)
-    # cap 1.0 < projected 2.0 -> over cap even against a fresh (spend-0.0) ledger.
+    # cap 1.0 < projected 22.0 -> over cap even against a fresh (spend-0.0) ledger.
     ledger_path = tmp_path / "SESSION-STATE.json"
     prompts: list[str] = []
 
@@ -176,19 +194,19 @@ def test_session_cap_usd_override_in_ledger_file_takes_priority_over_config(tmp_
     monkeypatch.setattr(builtins, "input", lambda *a, **k: (_ for _ in ()).throw(EOFError()))
     ledger_path = tmp_path / "SESSION-STATE.json"
     # The setup gate writes session_cap_usd into the ledger; here it OVERRIDES the config's
-    # generous 10.0 cap down to 0.5 -- projected $2.00 must now be refused non-interactively.
+    # generous 25.0 cap down to 0.5 -- projected $22.00 must now be refused non-interactively.
     ledger_path.write_text(json.dumps({"session_cap_usd": 0.5, "spend": []}), encoding="utf-8")
 
     with pytest.raises(SystemExit):
         raw_main(
-            config=_write_config(tmp_path, session_cap_usd=10.0, ledger_path=ledger_path),
+            config=_write_config(tmp_path, session_cap_usd=25.0, ledger_path=ledger_path),
             approve=True,
             mode="train",
         )
 
     assert rec.calls == [], (
         "the ledger's session_cap_usd override (0.5) must be enforced instead of the config "
-        "default (10.0) -- a stale, high config default must not silently widen the live cap"
+        "default (25.0) -- a stale, high config default must not silently widen the live cap"
     )
 
 
@@ -198,9 +216,17 @@ def test_cumulative_spend_across_two_dispatches_trips_the_cap(tmp_path, monkeypa
     monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _stub_train(monkeypatch)
     ledger_path = tmp_path / "SESSION-STATE.json"
-    # cap 3.0: the first $2.00 dispatch fits (cumulative 2.0 <= 3.0); a second $2.00 dispatch would
-    # make cumulative 4.0 > 3.0 -- refused non-interactively.
-    config = _write_config(tmp_path, session_cap_usd=3.0, ledger_path=ledger_path)
+    # A smaller per-dispatch basis than _PROJECTED_USD so the cap figure stays a readable small
+    # number: hourly_rate_usd(0.1) * est_hours(1.0) * lives(11) = $1.10 per dispatch. cap 2.0: the
+    # first $1.10 dispatch fits (cumulative 1.10 <= 2.0); a second $1.10 dispatch would make
+    # cumulative 2.20 > 2.0 -- refused non-interactively.
+    config = _write_config(
+        tmp_path,
+        session_cap_usd=2.0,
+        ledger_path=ledger_path,
+        hourly_rate_usd=0.1,
+        est_hours=1.0,
+    )
 
     raw_main(config=config, approve=True, mode="train")
     assert len(rec.calls) == 1, "the first, under-cap dispatch must succeed"

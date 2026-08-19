@@ -35,40 +35,76 @@ def estimate_cost(hourly_rate_usd: float, est_hours: float) -> float:
 
 @dataclass(frozen=True)
 class GuardrailDecision:
-    """The result of a guardrail check — never auto-launches when ``allowed`` is False."""
+    """The result of a guardrail check — never auto-launches when ``allowed`` is False.
+
+    ``lives`` / ``per_life_hours`` record the worst-case basis (issue #45 PR-2) when the caller
+    priced the retry multiplier; the single-life defaults keep legacy callers byte-identical.
+    """
 
     allowed: bool
     est_usd: float
     guardrail_usd: float
     reason: str
+    lives: int = 1
+    per_life_hours: float | None = None
 
 
 def guardrail_check(
     hourly_rate_usd: float,
     est_hours: float,
     cost_guardrail_usd: float = DEFAULT_COST_GUARDRAIL_USD,
+    *,
+    lives: int = 1,
+    bounded_hours: float | None = None,
 ) -> GuardrailDecision:
     """Estimate cost and decide whether a launch is within budget (MODL-03).
 
     ``est_usd <= cost_guardrail_usd`` -> allowed; otherwise blocked. Exactly-at-budget is allowed.
     The caller MUST honor ``allowed=False`` and refuse the ``.remote()`` dispatch.
+
+    issue #45 PR-2 — price what the launch actually AUTHORIZES, not one container life. Server-side
+    ``retries`` on the dispatched arm let Modal re-run a preempted container up to ``max_retries``
+    times, each life with its own full timeout, so the authorized metered ceiling is
+    ``hourly_rate_usd * bounded_hours * lives``:
+
+    * ``lives`` — container lives the arm's decorator authorizes (``max_retries + 1``; default 1,
+      the legacy single-life behavior — see ``retry_policy.ARM_MAX_RETRIES``).
+    * ``bounded_hours`` — the PER-LIFE hour bound the arm actually dispatches with (the
+      ``.with_options(timeout=est_hours * timeout_margin)`` product every GPU arm dispatches with).
+      Default ``None`` prices ``est_hours`` per life, the legacy basis (CPU arms carry no such
+      bound — their decorator timeout is a fixed literal unrelated to ``est_hours``).
     """
-    est_usd = estimate_cost(hourly_rate_usd, est_hours)
+    if lives < 1:
+        raise ValueError(f"lives must be >= 1 (a launch is at least one container life), got {lives}")
+    per_life_hours = est_hours if bounded_hours is None else bounded_hours
+    est_usd = estimate_cost(hourly_rate_usd, per_life_hours) * lives
+    # Name the worst-case basis in the reason whenever it differs from the legacy single-life
+    # estimate — the operator authorizes on this line, so the multiplier must be visible on it.
+    breakdown = (
+        f" (worst case = ${hourly_rate_usd:.2f}/hr x {per_life_hours:.2f}h/life x "
+        f"{lives} container life(s) incl. server-side retries)"
+        if (lives > 1 or bounded_hours is not None)
+        else ""
+    )
     if est_usd <= cost_guardrail_usd:
         return GuardrailDecision(
             allowed=True,
             est_usd=est_usd,
             guardrail_usd=cost_guardrail_usd,
-            reason=f"estimate ${est_usd:.2f} within guardrail ${cost_guardrail_usd:.2f}",
+            reason=f"estimate ${est_usd:.2f} within guardrail ${cost_guardrail_usd:.2f}{breakdown}",
+            lives=lives,
+            per_life_hours=per_life_hours,
         )
     return GuardrailDecision(
         allowed=False,
         est_usd=est_usd,
         guardrail_usd=cost_guardrail_usd,
         reason=(
-            f"estimate ${est_usd:.2f} exceeds cost guardrail ${cost_guardrail_usd:.2f} — "
-            "launch BLOCKED (over budget); raise cost_guardrail_usd or lower est_hours"
+            f"estimate ${est_usd:.2f} exceeds cost guardrail ${cost_guardrail_usd:.2f}{breakdown}"
+            " — launch BLOCKED (over budget); raise cost_guardrail_usd or lower est_hours"
         ),
+        lives=lives,
+        per_life_hours=per_life_hours,
     )
 
 

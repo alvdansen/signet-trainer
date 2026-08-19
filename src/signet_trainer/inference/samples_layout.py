@@ -112,8 +112,25 @@ SAMPLES_SUBDIR_BY_LTX_MODE = {
 #: land" can never be answered by the stem's existence alone (see ``landed_render_ids``).
 STEP_KEYED_LTX_MODES = frozenset({"inpaint", "audio_to_video"})
 
-#: A LTX render dir is a UTC wall-clock stamp: ``samples/20260805T154357Z/``.
+#: A LTX render dir used to be a UTC wall-clock stamp: ``samples/20260805T154357Z/``. issue #45
+#: PR-2 replaced the wall clock with an IDENTITY key (``inference.render_key.ltx_render_key``) for
+#: every non-step-keyed mode, so this now matches only OLD renders already committed before that
+#: change landed — kept so a listing spanning both eras (a Volume that has not been fully re-run)
+#: still reports them as landed, never as "nothing here yet".
 _LTX_STAMP_RE = re.compile(r"(\d{8}T\d{6}Z)")
+
+#: issue #45 PR-2 — the CURRENT LTX render dir for every non-step-keyed mode: an IDENTITY key,
+#: ``<checkpoint>_s<seed>_f<frames>_w<width>_h<height>_n<steps>_g<guidance>_st<stg>_<condition>``
+#: (``inference.render_key.ltx_render_key``). Anchored on the ``_s<d>_f<d>_w<d>_h<d>_n<d>_g...`` tail,
+#: mirroring ``_H3_KEY_RE``'s anchoring discipline, so a greedy checkpoint head cannot mis-split.
+#: Before this pattern existed, ``sample()`` wrote a fresh UTC-stamped dir per render — a watcher that
+#: only knew ``_LTX_STAMP_RE`` would see EVERY post-PR-2 render as "nothing landed" and re-dispatch a
+#: metered A100 over a render that already committed (the same phantom-spend shape H3's identity key
+#: exists to prevent — issue #45's own PR-2 must-fix list named this exact regression).
+_LTX_RENDER_KEY_RE = re.compile(
+    r"^(?P<ckpt>.+)_s(?P<seed>\d+)_f(?P<frames>\d+)_w(?P<width>\d+)_h(?P<height>\d+)_"
+    r"n(?P<steps>\d+)_g(?P<guidance>[0-9.]+)_st(?P<stg>[0-9.]+)_(?P<condition>.+)$"
+)
 
 #: A step-keyed LTX render FILE (``modal/fns.py``'s inpaint/a2v branches: ``f"step_{step}.mp4"``).
 #: Matched against the LAST path segment only — ``landed_render_ids`` anchors the STEM to the first
@@ -345,8 +362,11 @@ def landed_render_ids(listing: str, family: str, mode: str | None = None) -> lis
         function tolerates that listing arriving at ANY depth past the render root, so long as
         each committed file's line ends in its ``step_<N>.mp4`` filename; a bare stem-only line (no
         step file visible yet) contributes no id, never a plausible-but-wrong stem-only one.
-      * ``ltx`` (every other mode, including ``"none"``) -> the UTC stamps, the historical
-        behaviour, byte-for-byte.
+      * ``ltx`` (every other mode, including ``"none"``) -> the IDENTITY keys (issue #45 PR-2,
+        ``inference.render_key.ltx_render_key``) PLUS any legacy UTC stamps still present in the
+        listing (a Volume that has not been fully re-run under the new key carries both eras) — the
+        two patterns are mutually exclusive by construction so this is a straightforward union,
+        never a merge that could conflate one render with another.
       * ``h3``  -> the identity keys, so two renders differing ONLY in reference condition or frame
         count are two distinct ids rather than one.
       * ``qwen_edit`` -> the identity keys, so two BAND members differing only in checkpoint are two
@@ -376,7 +396,17 @@ def landed_render_ids(listing: str, family: str, mode: str | None = None) -> lis
                 found.add(f"{stem}/step_{m.group(1)}")
         return sorted(found)
     if family == "ltx":
-        return sorted(set(_LTX_STAMP_RE.findall(listing or "")))
+        # issue #45 PR-2: sample() now writes an IDENTITY-keyed dir for every non-step-keyed mode
+        # (never a wall-clock stamp), so a listing of post-PR-2 renders matches ZERO stamps — a
+        # watcher that only knew _LTX_STAMP_RE would see every one of them as "nothing landed" and
+        # re-dispatch a metered A100 over a render that already committed. Union both patterns:
+        # legacy stamps (renders committed before this change) and the current identity key.
+        found: set[str] = set(_LTX_STAMP_RE.findall(listing or ""))
+        for raw in (listing or "").splitlines():
+            name = raw.strip().rstrip("/").split(f"{subdir}/")[-1].split("/")[-1]
+            if name and _LTX_RENDER_KEY_RE.match(name):
+                found.add(name)
+        return sorted(found)
 
     key_re = _QWEN_EDIT_KEY_RE if family == "qwen_edit" else _H3_KEY_RE
     found: set[str] = set()

@@ -53,6 +53,11 @@ class _RecordingFn:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
+    def with_options(self, **_kwargs) -> "_RecordingFn":
+        # issue #45 PR-2 retired train()'s 24h exemption — it now dispatches via
+        # train.with_options(timeout=...).spawn(...) like every other GPU arm.
+        return self
+
     def spawn(self, *args, **kwargs) -> _RecordingCall:
         self.calls.append((args, kwargs))
         return _RecordingCall()

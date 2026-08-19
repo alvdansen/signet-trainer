@@ -39,6 +39,7 @@ from signet_trainer.modal.app import (
     app,
 )
 from signet_trainer.modal.cost import format_cost_line, guardrail_check
+from signet_trainer.modal.retry_policy import ARM_MAX_RETRIES, resolve_arm
 from signet_trainer.modal.session_cap import append_spend, read_ledger, session_cap_check
 
 # Register the @app.function stubs (train / preprocess / download_weights / sample / ...) on the app
@@ -1381,12 +1382,23 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
     # CPU backup at the guardrail. For those modes derive the estimate from the CPU rate instead
     # (config-first, D-NOHARDCODE) and print an explicit CPU-only line. The approval gate below is
     # UNCHANGED — CPU modes still print a cost AND require the same approval flow (no silent free path).
+    # issue #45 PR-2 (dispatch-arms-0): the estimate must be the quantity the launch actually
+    # AUTHORIZES. The dispatched arm's decorator grants server-side retries (fns.py; single source:
+    # retry_policy.ARM_MAX_RETRIES, weld-tested against the shipped decorators), and each retry is a
+    # FRESH container with its own full timeout — so the metered ceiling is
+    # rate * bounded_hours * (max_retries + 1), NOT rate * est_hours. A pre-PR-2 LTX train dispatch
+    # printed a single-life estimate while authorizing 11x that behind the decorator's retries=10.
+    # The guardrail, the printed line and the harness ledger (training-run SKILL projected_usd) all
+    # carry the worst-case ceiling now. CPU arms (fuse/restore/backup_sync) carry no retries today
+    # (lives resolves to 1), so their print is unchanged in value — only in provenance.
+    lives = ARM_MAX_RETRIES[resolve_arm(mode, cfg.model.family)] + 1
     cpu_only_mode = mode in ("fuse", "restore", "backup")
     if cpu_only_mode:
         decision = guardrail_check(
             hourly_rate_usd=cfg.modal.cpu_hourly_rate_usd,
             est_hours=cfg.modal.est_hours,
             cost_guardrail_usd=cfg.modal.cost_guardrail_usd,
+            lives=lives,
         )
         if mode == "fuse":
             # Issue #24: "~near-zero cost" is honest for restore/backup (default Modal resources) but
@@ -1411,6 +1423,12 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             hourly_rate_usd=cfg.modal.hourly_rate_usd,
             est_hours=cfg.modal.est_hours,
             cost_guardrail_usd=cfg.modal.cost_guardrail_usd,
+            lives=lives,
+            # The SAME est_hours * timeout_margin product every GPU arm dispatches with via
+            # .with_options(timeout=...) below (issue #45 PR-2 retired train()'s 24h-decorator
+            # exemption so this is now uniform across all six GPU arms) — the guardrail must price
+            # the bound that is actually dispatched, not a smaller number that reads more flattering.
+            bounded_hours=cfg.modal.est_hours * cfg.modal.timeout_margin,
         )
     # The one mode whose WORK is knowable before dispatch: a render grid is
     # ``modes x (base + band) x held-out inputs`` images at a known step count, all declared. Printed
@@ -1870,13 +1888,19 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
     else:
         from signet_trainer.modal.fns import train
 
+        # issue #45 PR-2: train()'s 24h-decorator exemption is RETIRED — it now dispatches with the
+        # SAME config-derived timeout bound (est_hours * timeout_margin) every other GPU arm above
+        # uses, computed HERE, strictly after _require_approval (MODL-02), and matching the SAME
+        # bounded_hours the guardrail_check call above priced this arm's worst case against. Without
+        # this the printed/guardrailed estimate would price a bound the dispatch never actually used.
+        train_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
         print(
             "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
             "Dispatching train.spawn() (gated); checkpoints commit to "
             "signe-trainer-checkpoints. Phase 2's download/smoke/encode runs are driven manually "
             "through this same gate."
         )
-        fc = train.spawn(config_text)
+        fc = train.with_options(timeout=train_timeout_s).spawn(config_text)
         _watch_dispatch(
             fc,
             cfg.modal.dispatch_watch_seconds,

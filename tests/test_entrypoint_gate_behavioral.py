@@ -55,10 +55,20 @@ class _RecordingCall:
 
 
 class _RecordingFn:
-    """Stand-in for a Modal Function — ``.spawn(...)`` records the call instead of dispatching."""
+    """Stand-in for a Modal Function — ``.spawn(...)`` records the call instead of dispatching.
+
+    ``with_options(...)`` returns ``self`` unrecorded — issue #45 PR-2 retired train()'s 24h
+    exemption, so it (like every other GPU arm already did) now dispatches via
+    ``train.with_options(timeout=...).spawn(...)`` rather than a bare ``.spawn(...)``. Tests that
+    care about the ``with_options`` kwargs use ``_RecordingWithOptionsFn`` below instead; this stub
+    stays a drop-in for call-COUNT tests that dispatch through either shape.
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+
+    def with_options(self, **kwargs) -> "_RecordingFn":
+        return self
 
     def spawn(self, *args, **kwargs) -> _RecordingCall:
         self.calls.append((args, kwargs))
@@ -69,6 +79,114 @@ def _write_config(tmp_path) -> str:
     cfg_path = tmp_path / "run.yaml"
     cfg_path.write_text(_MINIMAL_CONFIG, encoding="utf-8")
     return str(cfg_path)
+
+
+class _RecordingWithOptionsFn:
+    """Stand-in for a Modal Function whose dispatch goes through ``.with_options(timeout=...)``
+    (issue #45 PR-2: train() now dispatches this way like every other GPU arm) — records BOTH the
+    timeout kwarg and the eventual ``.spawn()`` call, so a test can weld them to the printed
+    cost line instead of trusting a source regex that the two expressions merely LOOK alike.
+    """
+
+    def __init__(self) -> None:
+        self.with_options_calls: list[dict] = []
+        self.spawn_calls: list[tuple] = []
+
+    def with_options(self, **kwargs):
+        self.with_options_calls.append(kwargs)
+        return self
+
+    def spawn(self, *args, **kwargs) -> _RecordingCall:
+        self.spawn_calls.append((args, kwargs))
+        return _RecordingCall()
+
+
+def _write_train_config(tmp_path, *, hourly_rate_usd: float, est_hours: float, cost_guardrail_usd: float) -> str:
+    cfg_path = tmp_path / "run.yaml"
+    cfg_path.write_text(
+        f"""
+training_dims: [768, 352, 25]
+data:
+  preprocessed_data_root: "precomputed"
+training:
+  max_steps: 10
+modal:
+  hourly_rate_usd: {hourly_rate_usd}
+  est_hours: {est_hours}
+  cost_guardrail_usd: {cost_guardrail_usd}
+""",
+        encoding="utf-8",
+    )
+    return str(cfg_path)
+
+
+def test_retry_priced_guardrail_blocks_before_any_dispatch(tmp_path, monkeypatch) -> None:
+    """REGRESSION (fails on pre-PR-2 code): a launch whose SINGLE-life cost fits the guardrail but
+    whose WORST-CASE (retries=10 -> 11 lives, timeout_margin 1.5) does not must be BLOCKED before
+    any dispatch. 1.64/hr x 2h = $3.28 (single-life, fits $50); 1.64 x (2 x 1.5) x 11 = $54.12
+    (worst case, exceeds $50) — the pre-PR-2 gate priced only the former and would have dispatched.
+    """
+    entrypoint, raw_main = _raw_main()
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
+    rec = _stub_train(monkeypatch)
+
+    config = _write_train_config(tmp_path, hourly_rate_usd=1.64, est_hours=2.0, cost_guardrail_usd=50.0)
+    with pytest.raises(SystemExit):
+        raw_main(config=config, approve=True, mode="train")
+
+    assert rec.calls == [], (
+        "the worst-case authorized ceiling ($54.12) exceeds the $50 guardrail — no dispatch, even "
+        "though the single-life estimate ($3.28) would have fit"
+    )
+
+
+def test_approved_dispatch_prices_the_same_bounded_hours_the_with_options_timeout_uses(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Weld test (issue #45 PR-2 must-fix): the printed/guardrailed estimate and the ACTUAL
+    dispatched ``.with_options(timeout=...)`` bound must agree — not merely read alike in source.
+
+    Drives a REAL approved train dispatch with a stub that records the ``.with_options`` kwargs,
+    then cross-checks: ``timeout_seconds / 3600 == bounded_hours`` used to price ``decision.est_usd``
+    (recovered from the printed ``[signet-cost] est $...`` line), and ``est_usd == hourly_rate_usd *
+    bounded_hours * lives`` for train's 11 lives (retries=10). A regex over entrypoint.py's source
+    could pass with these two numbers silently diverging at runtime; this cannot.
+    """
+    import re
+
+    from signet_trainer.modal import fns
+
+    entrypoint, raw_main = _raw_main()
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
+    monkeypatch.setattr(entrypoint, "append_spend", lambda *a, **k: None)  # anti-pollution
+    rec = _RecordingWithOptionsFn()
+    monkeypatch.setattr(fns, "train", rec)
+
+    hourly_rate_usd, est_hours, timeout_margin = 1.0, 2.0, 1.5
+    # cost_guardrail_usd generous enough to allow the worst case (1.0 x 3.0 x 11 = 33.0) through.
+    config = _write_train_config(
+        tmp_path, hourly_rate_usd=hourly_rate_usd, est_hours=est_hours, cost_guardrail_usd=40.0
+    )
+
+    raw_main(config=config, approve=True, mode="train")
+
+    assert len(rec.with_options_calls) == 1, "train must dispatch via .with_options (PR-2 retired its 24h exemption)"
+    assert len(rec.spawn_calls) == 1
+    dispatched_hours = rec.with_options_calls[0]["timeout"] / 3600.0
+    assert dispatched_hours == pytest.approx(est_hours * timeout_margin)
+
+    out = capsys.readouterr().out
+    m = re.search(r"\[signet-cost\] est \$(\d+\.\d+)", out)
+    assert m is not None, "the cost line must be printed before dispatch"
+    printed_est_usd = float(m.group(1))
+
+    lives = 11  # train's retries=10 -> 11 container lives.
+    expected_est_usd = hourly_rate_usd * dispatched_hours * lives
+    assert printed_est_usd == pytest.approx(expected_est_usd), (
+        "the printed/guardrailed estimate must price the SAME bounded_hours the dispatched "
+        ".with_options(timeout=...) call actually used — a mismatch means the gate authorized a "
+        "number smaller than what was really dispatched"
+    )
 
 
 def _raw_main():

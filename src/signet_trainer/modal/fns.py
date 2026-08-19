@@ -320,7 +320,11 @@ def preprocess(
     image=gpu_image,  # the heavy image (torch/ltx-core/peft/bnb) — the code-only default has no torch.
     volumes={**WEIGHTS_MOUNT, **DATASET_MOUNT, **CHECKPOINTS_MOUNT},
     secrets=[huggingface_secret, wandb_secret],
-    timeout=TWENTY_FOUR_HOURS,  # the long-running training call; do NOT use a short default.
+    # issue #45 PR-2: the AUTHORITATIVE timeout now comes from the entrypoint's
+    # .with_options(timeout=est_hours*timeout_margin) (the exemption below used to keep this arm on
+    # the bare 24h decorator ceiling — retired so the cost gate's bounded_hours pricing matches what
+    # is actually dispatched). This decorator value is only the ceiling for a direct/untimed call.
+    timeout=TWENTY_FOUR_HOURS,
     # F9 fix (operator-approved 2026-07-12): Modal's preemption auto-restart was observed 0/2
     # (r1_mf @2400, r2 @1000) — server-side retries make the long round self-heal without a
     # local re-dispatch. Safe because train resumes in-dir from the latest committed checkpoint
@@ -937,9 +941,12 @@ def train(config_yaml: str) -> None:
     # .with_options(timeout=est_hours*margin) (09.1-04 Task 1); this decorator value is only the
     # ceiling for a direct call. Do NOT tune it here.
     # AUDIT-#1 (d): mirror train()'s server-side retries so a Modal PREEMPTION of a detached render
-    # self-heals without a local re-dispatch (a preempted render was otherwise a total loss). Safe
-    # because sample writes a FRESH timestamp samples dir per render (no half-written collision on
-    # retry) and pairs with 09.1-03's artifact-freshness liveness gate.
+    # self-heals without a local re-dispatch (a preempted render was otherwise a total loss). issue
+    # #45 PR-2: safe because every render branch now keys its samples dir on the RENDER IDENTITY
+    # (inference/render_key.py's ltx_render_key, never the wall clock), skips a clip already
+    # complete on the Volume, and commits per clip — a retry RESUMES the render instead of
+    # restarting it into a fresh dir (the pre-PR-2 shape re-rendered every clip per retry and
+    # stranded each attempt's output; pairs with 09.1-03's artifact-freshness liveness gate).
     retries=modal.Retries(max_retries=3, initial_delay=60.0, backoff_coefficient=2.0),
 )
 def sample(config_yaml: str) -> None:
@@ -967,8 +974,6 @@ def sample(config_yaml: str) -> None:
     (Pitfall 5 OOM guard). NO ``keep_warm`` / ``min_containers`` (D-10). Does NOT construct an
     offloader (standalone path — the offloader-suspend seam is the in-loop ``train`` path).
     """
-    import datetime  # noqa: PLC0415
-
     # ── (1) COLD-PATH IMPORT PROBE — fail BEFORE any model load / sustained spend (T-03-63) ─────
     # No installs here (T-03-SC supply-chain): we VERIFY presence; a missing dep means the
     # pinned-SHA gpu_image must add it (re-gated by the Phase-2 supply-chain discipline).
@@ -1001,6 +1006,13 @@ def sample(config_yaml: str) -> None:
     from signet_trainer.inference.lora_load import (  # noqa: PLC0415
         ADAPTER_FILENAME,
         load_lora_onto_transformer,
+    )
+    # issue #45 PR-2 resume: the render-directory identity + the per-clip resume predicate. Stdlib-
+    # only module (same placement rationale as h3_render_key — a test reaching it must never have
+    # to import this modal-bound module).
+    from signet_trainer.inference.render_key import (  # noqa: PLC0415
+        clip_already_rendered,
+        ltx_render_key,
     )
     from signet_trainer.inference.sampler import build_generation_config, run_sampler  # noqa: PLC0415
     from signet_trainer.models.loader import load_ltxv_components  # noqa: PLC0415
@@ -1151,6 +1163,14 @@ def sample(config_yaml: str) -> None:
 
     fps = config.validation.frame_rate
 
+    # issue #45 PR-2 resume: one skip-guard for every render branch below (mirrors h3_sample's
+    # in-dir resume, ``_render``'s own guard in section (3b) further down). A clip already COMPLETE
+    # on the Volume is skipped — the expensive render never re-runs on a server-side retry (this
+    # decorator's ``retries=3``) or a manual re-dispatch. Delegates to ``clip_already_rendered``
+    # (never a re-implementation) so the predicate a behavioral test exercises is the SAME one this
+    # function's every call site runs.
+    _clip_done = clip_already_rendered
+
     # ── (3b') INPAINT masked-render branch (Phase 9, GATE-SPEC rev 2 item 6) ─────────────────────
     # Render each validation.samples entry — a held-out TEST clip masked + regenerated through the
     # LATEST trained adapter (the operator's parallel-testing venue: the watcher dispatches this per new
@@ -1224,6 +1244,13 @@ def sample(config_yaml: str) -> None:
                 _input_src = CHECKPOINTS_DIR / video_rel
                 if not _input_copy.exists() and _input_src.exists():
                     shutil.copyfile(_input_src, _input_copy)
+                # issue #45 PR-2 resume: the step-keyed layout is already identity-stable, so a
+                # retry of a preempted dispatch skips the clips that already landed instead of
+                # re-paying every render.
+                fname = f"step_{step}.mp4"
+                if _clip_done(stem_dir / fname):
+                    print(f"[sample][inpaint] SKIP {stem_dir.name}/{fname} (already on the Volume - resume)")
+                    continue
                 video, _audio = run_mask_condition_sampler(
                     components,
                     render_model,
@@ -1234,8 +1261,8 @@ def sample(config_yaml: str) -> None:
                     cached_embeddings=cached,
                     prompt=s.prompt,
                 )
-                fname = f"step_{step}.mp4"
                 save_video(video, str(stem_dir / fname), fps=fps)
+                checkpoints_vol.commit()  # per-clip durability (PR-2) — a preemption loses at most one clip.
                 n_rendered += 1
                 print(f"[sample][inpaint] wrote {stem_dir.name}/{fname}")
         checkpoints_vol.commit()  # commit-or-vanish — uncommitted renders vanish on exit.
@@ -1305,6 +1332,12 @@ def sample(config_yaml: str) -> None:
                 audio_rel = plan_audio_condition(cond)
                 stem_dir = out_root / slug(_P(audio_rel).stem)
                 stem_dir.mkdir(parents=True, exist_ok=True)
+                # issue #45 PR-2 resume: step-keyed layout is identity-stable — skip clips that
+                # already landed.
+                fname = f"step_{step}.mp4"
+                if _clip_done(stem_dir / fname):
+                    print(f"[sample][a2v] SKIP {stem_dir.name}/{fname} (already on the Volume - resume)")
+                    continue
                 video, _audio = run_audio_condition_sampler(
                     components,
                     render_model,
@@ -1314,8 +1347,8 @@ def sample(config_yaml: str) -> None:
                     cached_embeddings=cached,
                     prompt=s.prompt,
                 )
-                fname = f"step_{step}.mp4"
                 save_video(video, str(stem_dir / fname), fps=fps)
+                checkpoints_vol.commit()  # per-clip durability (PR-2) — a preemption loses at most one clip.
                 n_rendered += 1
                 print(f"[sample][a2v] wrote {stem_dir.name}/{fname}")
         checkpoints_vol.commit()  # commit-or-vanish — uncommitted renders vanish on exit.
@@ -1398,8 +1431,22 @@ def sample(config_yaml: str) -> None:
                 "the BASE, not a trained adapter. Run train first."
             )
 
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        sf_root = CHECKPOINTS_DIR / config.output_dir / "samples_single_frame" / ts
+        # issue #45 PR-2 resume: key the render dir on WHAT is rendered, never the wall clock — a
+        # server-side retry (or re-dispatch) lands in the SAME dir, skips completed clips, resumes.
+        sf_root = CHECKPOINTS_DIR / config.output_dir / "samples_single_frame" / ltx_render_key(
+            checkpoint=latest_ckpt.name if latest_ckpt is not None else (
+                "adapter" if adapter_path.exists() else "base"
+            ),
+            seed=seed,
+            frame_count=config.validation.frame_count,
+            width=config.validation.width,
+            height=config.validation.height,
+            num_inference_steps=config.validation.num_inference_steps,
+            guidance_scale=config.validation.guidance_scale,
+            stg_scale=config.validation.stg_scale,
+            condition=config.conditioning.mode,
+        )
+        print(f"[sample][single_frame] render dir {sf_root.name} (identity-keyed - a retry RESUMES).")
         ref_thumb_dir = sf_root / "reference"
         ref_on_dir = sf_root / "ref_on"
         ref_off_dir = sf_root / "ref_off"
@@ -1433,23 +1480,33 @@ def sample(config_yaml: str) -> None:
                 row["reference_img"] = f"reference/{thumb_name}"
 
                 # ref-ON: condition on frame0 (CONTRADICTION #1 — GenerationConfig.condition_image).
-                on_cfg = build_generation_config(
-                    config, prompt=prompt, seed=seed, condition_image=condition_image
-                )
-                on_video, _a = run_sampler(
-                    components, render_model, on_cfg, device=device, cached_embeddings=cached
-                )
                 on_name = f"{slug(prompt)}_s{seed}_on.mp4"
-                save_video(on_video, str(ref_on_dir / on_name), fps=fps)
+                if _clip_done(ref_on_dir / on_name):
+                    print(f"[sample][single_frame] SKIP {on_name} (already on the Volume - resume)")
+                else:
+                    on_cfg = build_generation_config(
+                        config, prompt=prompt, seed=seed, condition_image=condition_image
+                    )
+                    on_video, _a = run_sampler(
+                        components, render_model, on_cfg, device=device, cached_embeddings=cached
+                    )
+                    save_video(on_video, str(ref_on_dir / on_name), fps=fps)
+                    checkpoints_vol.commit()  # per-clip durability (PR-2).
                 row["ref_on_mp4"] = f"ref_on/{on_name}"
 
             # ref-OFF control: condition_image=None, SAME prompt+seed — the SC#3 divergence signal.
-            off_cfg = build_generation_config(config, prompt=prompt, seed=seed, condition_image=None)
-            off_video, _a = run_sampler(
-                components, render_model, off_cfg, device=device, cached_embeddings=cached
-            )
             off_name = f"{slug(prompt)}_s{seed}_off.mp4"
-            save_video(off_video, str(ref_off_dir / off_name), fps=fps)
+            if _clip_done(ref_off_dir / off_name):
+                print(f"[sample][single_frame] SKIP {off_name} (already on the Volume - resume)")
+            else:
+                off_cfg = build_generation_config(
+                    config, prompt=prompt, seed=seed, condition_image=None
+                )
+                off_video, _a = run_sampler(
+                    components, render_model, off_cfg, device=device, cached_embeddings=cached
+                )
+                save_video(off_video, str(ref_off_dir / off_name), fps=fps)
+                checkpoints_vol.commit()  # per-clip durability (PR-2).
             row["ref_off_mp4"] = f"ref_off/{off_name}"
 
             rows.append(row)
@@ -1507,8 +1564,59 @@ def sample(config_yaml: str) -> None:
         # Read the latest committed keyframe reference images from the checkpoints Volume.
         checkpoints_vol.reload()
 
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        sf_root = CHECKPOINTS_DIR / config.output_dir / "samples_multi_frame" / ts
+        # REF-LOAD (D-8-REFLOAD, Pitfall 5): LOAD THE LATEST TRAINED ADAPTER before the render loop.
+        # issue #45 PR-2: resolved HERE — before the render dir — because the dir is identity-keyed
+        # on the checkpoint (ltx_render_key): a new checkpoint must land in a NEW dir, never resume
+        # into an old one. Without this every column (including the no-reference control) renders on
+        # the RAW BASE transformer while the grid banner claims lora_scale 1.0 — so a
+        # convergence/quality verdict off this grid would validate the base model, NOT the trained
+        # LoRA (a wrong verdict from a metered run). Mirror the ic_lora branch (§3e) + base-vs-LoRA
+        # tail (§5): resolve the highest-step checkpoint via find_latest() (the CheckpointManager
+        # writes per-STEP dirs, NEVER a flat file — do not glob by hand), then PEFT-wrap the
+        # transformer. ALL columns render through this SAME trained adapter. If no adapter exists yet
+        # (wiring mode), fall back to the base and say so loudly so the verdict stays honest.
+        from signet_trainer.train.checkpoint import CheckpointManager  # noqa: PLC0415 — import-light
+
+        ckpt_root = CHECKPOINTS_DIR / config.output_dir
+        latest_ckpt = CheckpointManager(ckpt_root).find_latest()
+        adapter_path = (latest_ckpt / ADAPTER_FILENAME) if latest_ckpt is not None else (
+            ckpt_root / ADAPTER_FILENAME
+        )
+        if adapter_path.exists():
+            render_model = load_lora_onto_transformer(
+                components.transformer, adapter_path, lora_scale=1.0
+            )
+            mf_lora_scale: float | str = 1.0
+            print(
+                f"[sample][multi_frame] loaded trained adapter {adapter_path.name} onto the "
+                "transformer — all columns render WITH the adapter."
+            )
+        else:
+            render_model = components.transformer
+            mf_lora_scale = "none"
+            print(
+                f"[sample][multi_frame] WARNING: no trained adapter at {adapter_path} — rendering "
+                "on the BASE transformer (wiring mode); a quality/convergence verdict would validate "
+                "the BASE, not a trained adapter. Run train first."
+            )
+
+        # issue #45 PR-2 resume: identity-keyed render dir (checkpoint + seed + frames + geometry +
+        # conditioning axis), never the wall clock — a server-side retry lands in the SAME dir and
+        # resumes.
+        sf_root = CHECKPOINTS_DIR / config.output_dir / "samples_multi_frame" / ltx_render_key(
+            checkpoint=latest_ckpt.name if latest_ckpt is not None else (
+                "adapter" if adapter_path.exists() else "base"
+            ),
+            seed=seed,
+            frame_count=config.validation.frame_count,
+            width=config.validation.width,
+            height=config.validation.height,
+            num_inference_steps=config.validation.num_inference_steps,
+            guidance_scale=config.validation.guidance_scale,
+            stg_scale=config.validation.stg_scale,
+            condition=config.conditioning.mode,
+        )
+        print(f"[sample][multi_frame] render dir {sf_root.name} (identity-keyed - a retry RESUMES).")
         ref_thumb_dir = sf_root / "reference"
         video_dir = sf_root / "videos"
         for d in (ref_thumb_dir, video_dir):
@@ -1539,39 +1647,8 @@ def sample(config_yaml: str) -> None:
                 "gate (2b) must run for conditioning.mode == 'multi_frame'."
             )
 
-        # REF-LOAD (D-8-REFLOAD, Pitfall 5): LOAD THE LATEST TRAINED ADAPTER before the render loop.
-        # Without this every column (including the no-reference control) renders on the RAW BASE
-        # transformer while the grid banner claims lora_scale 1.0 — so a convergence/quality verdict
-        # off this grid would validate the base model, NOT the trained LoRA (a wrong verdict from a
-        # metered run). Mirror the ic_lora branch (§3e) + base-vs-LoRA tail (§5): resolve the highest-
-        # step checkpoint via find_latest() (the CheckpointManager writes per-STEP dirs, NEVER a flat
-        # file — do not glob by hand), then PEFT-wrap the transformer. ALL columns render through this
-        # SAME trained adapter. If no adapter exists yet (wiring mode), fall back to the base and say
-        # so loudly so the verdict stays honest.
-        from signet_trainer.train.checkpoint import CheckpointManager  # noqa: PLC0415 — import-light
-
-        ckpt_root = CHECKPOINTS_DIR / config.output_dir
-        latest_ckpt = CheckpointManager(ckpt_root).find_latest()
-        adapter_path = (latest_ckpt / ADAPTER_FILENAME) if latest_ckpt is not None else (
-            ckpt_root / ADAPTER_FILENAME
-        )
-        if adapter_path.exists():
-            render_model = load_lora_onto_transformer(
-                components.transformer, adapter_path, lora_scale=1.0
-            )
-            mf_lora_scale: float | str = 1.0
-            print(
-                f"[sample][multi_frame] loaded trained adapter {adapter_path.name} onto the "
-                "transformer — all columns render WITH the adapter."
-            )
-        else:
-            render_model = components.transformer
-            mf_lora_scale = "none"
-            print(
-                f"[sample][multi_frame] WARNING: no trained adapter at {adapter_path} — rendering "
-                "on the BASE transformer (wiring mode); a quality/convergence verdict would validate "
-                "the BASE, not a trained adapter. Run train first."
-            )
+        # (REF-LOAD moved above — the adapter now resolves BEFORE the identity-keyed render dir,
+        # issue #45 PR-2: the checkpoint name is a key axis, so it must exist before the dir is named.)
 
         # The ordered SC#3 grid columns (N=2 / N=3 / strength-lo / strength-hi / no-reference).
         # PURE/CPU column plan — all strengths flow from config (conditioning_strength_range).
@@ -1602,18 +1679,22 @@ def sample(config_yaml: str) -> None:
                 col_config.conditioning.conditioning_items = col_items
                 col_config.validation.prompts = [prompt]
 
-                video, _audio = run_multi_condition_sampler(
-                    components,
-                    render_model,
-                    col_config,
-                    device=device,
-                    cached_embeddings=cached_by_prompt[prompt],
-                )
                 # column.row_key is one of n2_mp4/n3_mp4/strength_lo_mp4/strength_hi_mp4/no_ref_mp4;
                 # strip the _mp4 suffix for the on-disk filename stem.
                 stem = column.row_key[: -len("_mp4")]
                 fname = f"{slug(prompt)}_{stem}_s{seed}.mp4"
-                save_video(video, str(video_dir / fname), fps=fps)
+                if _clip_done(video_dir / fname):
+                    print(f"[sample][multi_frame] SKIP {fname} (already on the Volume - resume)")
+                else:
+                    video, _audio = run_multi_condition_sampler(
+                        components,
+                        render_model,
+                        col_config,
+                        device=device,
+                        cached_embeddings=cached_by_prompt[prompt],
+                    )
+                    save_video(video, str(video_dir / fname), fps=fps)
+                    checkpoints_vol.commit()  # per-clip durability (PR-2).
                 row[column.row_key] = f"videos/{fname}"
                 # Config-driven column label into the gallery row (WR-01): the planner's label
                 # carries the ACTUAL swept strengths (conditioning_strength_range endpoints) —
@@ -1719,8 +1800,23 @@ def sample(config_yaml: str) -> None:
         # Read the latest committed seg-map reference videos from the checkpoints Volume.
         checkpoints_vol.reload()
 
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        sf_root = CHECKPOINTS_DIR / config.output_dir / "samples_ic_lora_baseline" / ts
+        # issue #45 PR-2 resume: identity-keyed render dir. The checkpoint axis is the OFFICIAL
+        # adapter's filename stem (this branch never renders a trained signet checkpoint), so a
+        # baseline re-run against a different official adapter can never resume into this one's clips.
+        sf_root = CHECKPOINTS_DIR / config.output_dir / "samples_ic_lora_baseline" / ltx_render_key(
+            checkpoint=OFFICIAL_IC_LORA_BASELINE_FILENAME.rsplit(".", 1)[0],
+            seed=seed,
+            frame_count=config.validation.frame_count,
+            width=config.validation.width,
+            height=config.validation.height,
+            num_inference_steps=config.validation.num_inference_steps,
+            guidance_scale=config.validation.guidance_scale,
+            stg_scale=config.validation.stg_scale,
+            condition=f"{config.conditioning.mode}_baseline",
+        )
+        print(
+            f"[sample][ic_lora_baseline] render dir {sf_root.name} (identity-keyed - a retry RESUMES)."
+        )
         seg_dir = sf_root / "reference"
         video_dir = sf_root / "videos"
         for d in (seg_dir, video_dir):
@@ -1753,23 +1849,27 @@ def sample(config_yaml: str) -> None:
 
             # The official-adapter baseline output: reference enters via video_conditioning; the pipeline
             # loads its own distilled base + upscaler + Gemma (OffloadMode.CPU). seed 42 (house A/B rule).
-            reskin_video, _audio = run_ic_lora_baseline(
-                prompt=prompt,
-                seed=seed,
-                height=v.height,
-                width=v.width,
-                num_frames=v.frame_count,
-                frame_rate=fps,
-                distilled_checkpoint_path=distilled_ckpt_path,
-                spatial_upsampler_path=upscaler_ckpt_path,
-                gemma_root=gemma_root,
-                official_adapter_path=official_adapter_path,
-                reference_video_path=str(seg_src),
-                reference_downscale_factor=ref_downscale,
-                device=device,
-            )
             reskin_name = f"{slug(prompt)}_baseline_s{seed}.mp4"
-            save_video(reskin_video, str(video_dir / reskin_name), fps=fps)
+            if _clip_done(video_dir / reskin_name):
+                print(f"[sample][ic_lora_baseline] SKIP {reskin_name} (already on the Volume - resume)")
+            else:
+                reskin_video, _audio = run_ic_lora_baseline(
+                    prompt=prompt,
+                    seed=seed,
+                    height=v.height,
+                    width=v.width,
+                    num_frames=v.frame_count,
+                    frame_rate=fps,
+                    distilled_checkpoint_path=distilled_ckpt_path,
+                    spatial_upsampler_path=upscaler_ckpt_path,
+                    gemma_root=gemma_root,
+                    official_adapter_path=official_adapter_path,
+                    reference_video_path=str(seg_src),
+                    reference_downscale_factor=ref_downscale,
+                    device=device,
+                )
+                save_video(reskin_video, str(video_dir / reskin_name), fps=fps)
+                checkpoints_vol.commit()  # per-clip durability (PR-2).
             row["ic_lora_mp4"] = f"videos/{reskin_name}"
 
             # Surface the seg-map reference the official adapter sees (col: what steers the output).
@@ -1905,8 +2005,23 @@ def sample(config_yaml: str) -> None:
                 "BASE model's reference-following, NOT a trained adapter. Run train first."
             )
 
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        sf_root = CHECKPOINTS_DIR / config.output_dir / "samples_ic_lora" / ts
+        # issue #45 PR-2 resume: identity-keyed render dir (checkpoint + seed + frames + geometry +
+        # conditioning axis), never the wall clock — a server-side retry lands in the SAME dir and
+        # resumes.
+        sf_root = CHECKPOINTS_DIR / config.output_dir / "samples_ic_lora" / ltx_render_key(
+            checkpoint=latest_ckpt.name if latest_ckpt is not None else (
+                "adapter" if adapter_path.exists() else "base"
+            ),
+            seed=seed,
+            frame_count=config.validation.frame_count,
+            width=config.validation.width,
+            height=config.validation.height,
+            num_inference_steps=config.validation.num_inference_steps,
+            guidance_scale=config.validation.guidance_scale,
+            stg_scale=config.validation.stg_scale,
+            condition=config.conditioning.mode,
+        )
+        print(f"[sample][ic_lora] render dir {sf_root.name} (identity-keyed - a retry RESUMES).")
         seg_dir = sf_root / "reference"
         video_dir = sf_root / "videos"
         for d in (seg_dir, video_dir):
@@ -1939,16 +2054,20 @@ def sample(config_yaml: str) -> None:
                 # col 3 — IC-LoRA re-skin: condition on the FULL clean seg-map reference prefix at
                 # seed 42 (the SAME seed as the col-4 control — house A/B rule). The V2V sampler
                 # VAE-encodes the whole seg-map clip to a reference latent and prepends it.
-                reskin_video, _audio = run_reference_video_sampler(
-                    components,
-                    reskin_model,  # CR-02: the TRAINED adapter (or base in wiring mode), NOT raw base.
-                    row_config,
-                    seg_rel,
-                    device=device,
-                    cached_embeddings=cached,
-                )
                 reskin_name = f"{slug(prompt)}_reskin_s{seed}.mp4"
-                save_video(reskin_video, str(video_dir / reskin_name), fps=fps)
+                if _clip_done(video_dir / reskin_name):
+                    print(f"[sample][ic_lora] SKIP {reskin_name} (already on the Volume - resume)")
+                else:
+                    reskin_video, _audio = run_reference_video_sampler(
+                        components,
+                        reskin_model,  # CR-02: the TRAINED adapter (or base in wiring mode), NOT raw base.
+                        row_config,
+                        seg_rel,
+                        device=device,
+                        cached_embeddings=cached,
+                    )
+                    save_video(reskin_video, str(video_dir / reskin_name), fps=fps)
+                    checkpoints_vol.commit()  # per-clip durability (PR-2).
                 row["ic_lora_mp4"] = f"videos/{reskin_name}"
 
                 # col 2 — surface the seg-map reference video into the grid folder (what the adapter
@@ -1979,16 +2098,20 @@ def sample(config_yaml: str) -> None:
             # col 4 — no-reference control: SAME prompt + seed, NO reference prefix, but STILL through
             # the trained adapter (CR-02): the SC#3 divergence signal is ref-vs-no-ref, BOTH on the
             # adapter — a base-model control would confound "adapter effect" with "reference effect".
-            control_cfg = build_generation_config(row_config, prompt=prompt, seed=seed)
-            control_video, _audio = run_sampler(
-                components,
-                reskin_model,  # CR-02: same trained adapter as col-3 (or base in wiring mode).
-                control_cfg,
-                device=device,
-                cached_embeddings=cached,
-            )
             control_name = f"{slug(prompt)}_noref_s{seed}.mp4"
-            save_video(control_video, str(video_dir / control_name), fps=fps)
+            if _clip_done(video_dir / control_name):
+                print(f"[sample][ic_lora] SKIP {control_name} (already on the Volume - resume)")
+            else:
+                control_cfg = build_generation_config(row_config, prompt=prompt, seed=seed)
+                control_video, _audio = run_sampler(
+                    components,
+                    reskin_model,  # CR-02: same trained adapter as col-3 (or base in wiring mode).
+                    control_cfg,
+                    device=device,
+                    cached_embeddings=cached,
+                )
+                save_video(control_video, str(video_dir / control_name), fps=fps)
+                checkpoints_vol.commit()  # per-clip durability (PR-2).
             row["base_no_ref_mp4"] = f"videos/{control_name}"
 
             rows.append(row)
@@ -2020,9 +2143,41 @@ def sample(config_yaml: str) -> None:
         )
         return
 
-    # Output layout (RESEARCH A4): /checkpoints/<output_dir>/samples/<ts>/{base,lora}/*.mp4 + index.html.
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    samples_root = CHECKPOINTS_DIR / config.output_dir / "samples" / ts
+    # Resolve the latest committed adapter FIRST (moved up from section (5), issue #45 PR-2): the
+    # render dir below is identity-keyed on the checkpoint name, so it must be known before the dir
+    # is named — a NEW checkpoint's grid must never resume into an OLD checkpoint's clips. Reload so
+    # we read the latest committed Phase-3 adapter. The CheckpointManager writes adapters into
+    # per-step dirs (output_dir/checkpoint-step-NNNNN-loss-X/adapter_model.safetensors), NOT a flat
+    # file; resolve the highest-step checkpoint via the same helper resume() uses, with a flat-path
+    # fallback.
+    from signet_trainer.train.checkpoint import CheckpointManager  # noqa: PLC0415 — local, import-light
+
+    checkpoints_vol.reload()
+    ckpt_root = CHECKPOINTS_DIR / config.output_dir
+    latest_ckpt = CheckpointManager(ckpt_root).find_latest()
+    adapter_path = (latest_ckpt / ADAPTER_FILENAME) if latest_ckpt is not None else (
+        ckpt_root / ADAPTER_FILENAME
+    )
+
+    # Output layout (RESEARCH A4): /checkpoints/<output_dir>/samples/<render-key>/{base,lora}/*.mp4
+    # + index.html. issue #45 PR-2 resume: the dir is keyed on the RENDER IDENTITY
+    # (render_key.ltx_render_key), never the wall clock, so a server-side retry (decorator
+    # retries=3) or a re-dispatch RESUMES — it skips the clips already committed instead of
+    # restarting all of them into a fresh ts dir.
+    samples_root = CHECKPOINTS_DIR / config.output_dir / "samples" / ltx_render_key(
+        checkpoint=latest_ckpt.name if latest_ckpt is not None else (
+            "adapter" if adapter_path.exists() else "base"
+        ),
+        seed=seed,
+        frame_count=config.validation.frame_count,
+        width=config.validation.width,
+        height=config.validation.height,
+        num_inference_steps=config.validation.num_inference_steps,
+        guidance_scale=config.validation.guidance_scale,
+        stg_scale=config.validation.stg_scale,
+        condition=config.conditioning.mode,
+    )
+    print(f"[sample] render dir {samples_root.name} (identity-keyed - a retry RESUMES).")
     base_dir = samples_root / "base"
     lora_dir = samples_root / "lora"
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -2066,39 +2221,35 @@ def sample(config_yaml: str) -> None:
     # ── (4) BASE column — raw transformer, seed 42, all prompts ─────────────────────────────────
     base_mp4s: dict[str, str] = {}
     for prompt in prompts:
-        cfg = build_generation_config(config, prompt=prompt, seed=seed)
-        cached = cached_by_prompt[prompt] if cached_by_prompt is not None else None
-        video, _audio = _render(components.transformer, cfg, cached)
         fname = f"{slug(prompt)}_s{seed}.mp4"
-        save_video(video, str(base_dir / fname), fps=fps)
+        if _clip_done(base_dir / fname):
+            print(f"[sample] SKIP base/{fname} (already on the Volume - resume)")
+        else:
+            cfg = build_generation_config(config, prompt=prompt, seed=seed)
+            cached = cached_by_prompt[prompt] if cached_by_prompt is not None else None
+            video, _audio = _render(components.transformer, cfg, cached)
+            save_video(video, str(base_dir / fname), fps=fps)
+            checkpoints_vol.commit()  # per-clip durability (PR-2).
         base_mp4s[prompt] = f"base/{fname}"  # relative to index.html (portable folder).
     print(f"[sample] BASE column: {len(base_mp4s)} clips at seed {seed}.")
 
     # ── (5) LoRA column — ONE 22B load, sequential (Open-Q1 (a)): PEFT-wrap the SAME transformer ─
-    # Reload the checkpoints Volume first so we read the latest committed Phase-3 adapter.
-    checkpoints_vol.reload()
-    # The CheckpointManager writes adapters into per-step dirs
-    # (output_dir/checkpoint-step-NNNNN-loss-X/adapter_model.safetensors), NOT a flat file.
-    # Resolve the highest-step checkpoint via the same helper resume() uses; fall back to a flat
-    # adapter path for compatibility.
-    from signet_trainer.train.checkpoint import CheckpointManager  # noqa: PLC0415 — local, import-light
-
-    ckpt_root = CHECKPOINTS_DIR / config.output_dir
-    latest_ckpt = CheckpointManager(ckpt_root).find_latest()
-    adapter_path = (latest_ckpt / ADAPTER_FILENAME) if latest_ckpt is not None else (
-        ckpt_root / ADAPTER_FILENAME
-    )
+    # (The adapter itself resolved ABOVE, before the identity-keyed render dir was named — PR-2.)
     lora_mp4s: dict[str, str] = {}
     if adapter_path.exists():
         lora_dir.mkdir(parents=True, exist_ok=True)
         lora_model = load_lora_onto_transformer(components.transformer, adapter_path, lora_scale=1.0)
         tail_lora_scale: float | str = 1.0
         for prompt in prompts:
-            cfg = build_generation_config(config, prompt=prompt, seed=seed)
-            cached = cached_by_prompt[prompt] if cached_by_prompt is not None else None
-            video, _audio = _render(lora_model, cfg, cached)
             fname = f"{slug(prompt)}_s{seed}.mp4"
-            save_video(video, str(lora_dir / fname), fps=fps)
+            if _clip_done(lora_dir / fname):
+                print(f"[sample] SKIP lora/{fname} (already on the Volume - resume)")
+            else:
+                cfg = build_generation_config(config, prompt=prompt, seed=seed)
+                cached = cached_by_prompt[prompt] if cached_by_prompt is not None else None
+                video, _audio = _render(lora_model, cfg, cached)
+                save_video(video, str(lora_dir / fname), fps=fps)
+                checkpoints_vol.commit()  # per-clip durability (PR-2).
             lora_mp4s[prompt] = f"lora/{fname}"
         print(f"[sample] LoRA column: {len(lora_mp4s)} clips from adapter {adapter_path.name}.")
     else:
