@@ -131,6 +131,11 @@ def test_fuse_cost_print_names_the_128gib_reservation(tmp_path, monkeypatch, cap
     # issue #45: main() now threads the dispatch mode through (`run_dryrun(cfg, mode=mode)`, gap-
     # dryrun-ltx-0) so the mode-conditional refusals fire pre-approval — the stub must accept it.
     monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
+    # #73: main() books every approved dispatch into the session-spend ledger. Neutralize it here
+    # the same way the dispatch-count test above does — without this, the test writes the DEFAULT
+    # project-relative ledger (.planning/harness/SESSION-STATE.json), un-skipping the live-harness
+    # lints for every later suite run in the same clone (caught: a polluted second run went +21 red).
+    monkeypatch.setattr(entrypoint, "append_spend", lambda *a, **k: None)
     rec = _RecordingFn()
     monkeypatch.setattr(fns, "fuse", rec)
 
