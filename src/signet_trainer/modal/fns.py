@@ -2729,6 +2729,16 @@ hf_gated_secret = modal.Secret.from_name(HF_GATED_SECRET_NAME)
 # as the secret names above (`@app.function` binds `gpu=` at IMPORT time, so this must be read here,
 # not inside the function body): export BEFORE `modal run` to move the render leg to an H200 without
 # a code edit. Default is byte-identical to today — this changes nothing until the env var is set.
+#
+# RULING (bundle PR-5 rework, config-coherence-0): `h3.modal_gpu` (config/schema.py) is a LATER,
+# SEPARATE lever that governs the TRAIN-tier stages (`h3_preprocess` / `h3_train`) only — threaded
+# by the entrypoint via `.with_options(gpu=...)`, coherence-checked against the budget triple and
+# `modal.hourly_rate_usd`. It deliberately does NOT extend to `h3_sample`: `.with_options(gpu=...)`
+# always wins over this decorator's value, so threading `cfg.h3.modal_gpu` here too would silently
+# override an operator's exported `SIGNET_H3_SAMPLE_GPU` with that field's own default on every run
+# that has not also escalated `modal_gpu` — regressing this fix by composition. The two levers stay
+# independent: this env var for the sample-side OOM mitigation, `h3.modal_gpu` for the train-tier
+# VRAM-budget escalation.
 H3_SAMPLE_GPU = _os.environ.get("SIGNET_H3_SAMPLE_GPU", "A100-80GB")
 
 # Fuse timeout: the prior project's fuse ran well under an hour on big-RAM CPU; 4h is a generous ceiling
@@ -3875,6 +3885,11 @@ def _h3_frame_buckets(config: Any) -> tuple[int, ...]:
     # The MiniMax-H3 family image (H3-07): diffusers at the pinned DIFFUSERS_SHA, NOT the LTX
     # ltx-core/ltx-trainer stack. A gpu= with the code-only default image boots an A100 and dies at
     # ``import torch`` (tests/test_modal_gpu_image.py).
+    #
+    # This decorator gpu= is only the import-time DEFAULT: the gated entrypoint overrides it at
+    # every dispatch with cfg.h3.modal_gpu (TRAIN-tier booking, coherence-checked against the
+    # budget triple and modal.hourly_rate_usd) via .with_options(gpu=...), so the booked card is a
+    # config decision, never this literal.
     gpu="A100-80GB",
     image=h3_gpu_image,
     volumes={**WEIGHTS_MOUNT, **DATASET_MOUNT},
@@ -4682,7 +4697,9 @@ def _h3_check_acceptance_marker(config: Any) -> None:
 @app.function(
     # Same H3 family image + memory request as ``h3_preprocess``: diffusers at the pinned
     # DIFFUSERS_SHA, NOT the LTX ltx-core/ltx-trainer stack, and the 80 GiB RAM the P10-1 probe
-    # required for the 61.7 GiB load.
+    # required for the 61.7 GiB load. The gpu= here is only the import-time DEFAULT — the gated
+    # entrypoint overrides it per-dispatch with cfg.h3.modal_gpu (TRAIN-tier booking) via
+    # .with_options(gpu=...).
     gpu="A100-80GB",
     image=h3_gpu_image,
     volumes={**WEIGHTS_MOUNT, **DATASET_MOUNT, **CHECKPOINTS_MOUNT},
