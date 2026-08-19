@@ -618,3 +618,96 @@ def test_this_gate_imports_no_modal() -> None:
         assert not re.match(r"\s*(import\s+modal\b|from\s+modal\b)", line), (
             f"line {lineno} imports modal — this gate is a source scan and must never need the SDK"
         )
+
+
+# --------------------------------------------------------------------------------------------------
+# (6) The BOOKED GPU, TRAIN-tier only — the escalation lever must move the hardware, not just the
+# safety rail (audit finding config-coherence-0, bundle PR-5 rework)
+# --------------------------------------------------------------------------------------------------
+#
+# Audit finding config-coherence-0: the budget triple was documented as THE H200-escalation lever
+# while all three H3 stages hardcoded gpu="A100-80GB" in their decorators — so editing the triple
+# only widened the local packed-row ceiling (disarming the sole pre-dispatch OOM refusal) and the
+# run still booted an A100 and CUDA-OOM'd after the 61.7 GiB load. The fix threads the booking from
+# the config (cfg.h3.modal_gpu) into the two TRAIN-tier dispatches via .with_options(gpu=...); these
+# tests pin that seam so the decorator literal can never silently become the booking again.
+#
+# RULING (documented at length in conditioning/h3_geometry.H3_DEFAULT_MODAL_GPU and at the
+# h3_sample dispatch arm itself): h3_sample is deliberately EXCLUDED from this threading — it keeps
+# its own pre-existing SIGNET_H3_SAMPLE_GPU env override (#55), an orthogonal fix. Threading
+# cfg.h3.modal_gpu into h3_sample too would let .with_options(gpu=...) silently override an
+# operator's exported env var with this field's default whenever modal_gpu has not ALSO been
+# escalated — regressing #55 by composition. Section (5) above already pins h3_sample's positive
+# behavior (SIGNET_H3_SAMPLE_GPU-overridable); this section pins the NEGATIVE — no gpu=h3_gpu
+# threading on h3_sample's dispatch.
+
+_H3_TRAIN_TIER_DISPATCHES = ("h3_train", "h3_preprocess")
+
+
+@pytest.mark.parametrize("fn", _H3_TRAIN_TIER_DISPATCHES)
+def test_every_train_tier_h3_dispatch_threads_the_booked_gpu(fn: str) -> None:
+    """Each TRAIN-tier H3 dispatch (h3_preprocess / h3_train) must carry ``gpu=h3_gpu`` inside its
+    ``.with_options(...)``.
+
+    Without this the fns.py decorator literal is the real booking and ``h3.modal_gpu`` is a
+    silently-ignored config field — the exact lean-field-split anti-pattern, on the one knob whose
+    silence costs a paid CUDA-OOM.
+    """
+    code = _entrypoint_code()
+    pattern = re.compile(
+        rf"(?<![\w.]){re.escape(fn)}\.with_options\([^)]*\bgpu\s*=\s*h3_gpu\b[^)]*\)\.spawn\s*\("
+    )
+    assert pattern.search(code), (
+        f"{fn} must dispatch via {fn}.with_options(timeout=..., gpu=h3_gpu).spawn(...) — the "
+        f"booked GPU comes from cfg.h3.modal_gpu, never from the fns.py decorator literal, or an "
+        f"H200 escalation edits a knob the dispatch does not read."
+    )
+
+
+def test_h3_sample_does_not_thread_modal_gpu() -> None:
+    """⛔ NAMED REGRESSION GUARD for the ruling above: ``h3_sample``'s ``.with_options(...)`` must
+    NOT carry ``gpu=h3_gpu`` (or any ``cfg.h3.modal_gpu`` read at all). If it did,
+    ``.with_options(gpu=...)`` would silently override an operator's exported
+    ``SIGNET_H3_SAMPLE_GPU`` with ``h3.modal_gpu``'s own default on every run that has not also
+    escalated ``modal_gpu`` — regressing #55 (the house-audit OOM mitigation) by composition.
+    """
+    code = _entrypoint_code()
+    sample_dispatch = re.search(
+        r"(?<![\w.])h3_sample\.with_options\([^)]*\)\.spawn\s*\(", code
+    )
+    assert sample_dispatch is not None, "expected an h3_sample.with_options(...).spawn( dispatch"
+    assert "gpu" not in sample_dispatch.group(0), (
+        f"h3_sample's dispatch ({sample_dispatch.group(0)!r}) must not pass gpu= at all — it "
+        f"keeps its own SIGNET_H3_SAMPLE_GPU env override (#55), independent of h3.modal_gpu "
+        f"(TRAIN-tier only)."
+    )
+
+
+def test_the_booked_gpu_local_reads_the_config_field_in_both_train_tier_arms() -> None:
+    """The ``h3_gpu`` local each TRAIN-tier dispatch passes must be bound from
+    ``cfg.h3.modal_gpu`` — one binding per arm, config-first (D-NOHARDCODE), never a string literal
+    at the dispatch. Exactly two bindings: h3_sample does not get one (ruling above).
+    """
+    code = _entrypoint_code()
+    bindings = re.findall(r"h3_gpu\s*=\s*cfg\.h3\.modal_gpu", code)
+    assert len(bindings) == 2, (
+        f"expected the h3_gpu = cfg.h3.modal_gpu binding in exactly the h3_preprocess and "
+        f"h3_train arms (h3_sample deliberately excluded — see the ruling), found "
+        f"{len(bindings)} — a dispatch passing anything else has re-hardcoded the booking, or "
+        f"h3_sample has been wired in by mistake."
+    )
+    assert not re.search(r"with_options\([^)]*gpu\s*=\s*['\"]", code), (
+        "a dispatch passes a GPU string literal to with_options — the booking is cfg.h3.modal_gpu"
+    )
+
+
+def test_the_booked_gpu_is_computed_after_the_approval_pause() -> None:
+    """MODL-02 extends to every with_options input: the ``h3_gpu`` reads sit strictly after the
+    blocking ``_require_approval`` pause, exactly like the derived timeouts."""
+    code = _entrypoint_code()
+    approval = _last_index(code, r"_require_approval\s*\(")
+    first_binding = re.search(r"h3_gpu\s*=\s*cfg\.h3\.modal_gpu", code)
+    assert first_binding is not None and first_binding.start() > approval, (
+        "the h3_gpu binding must appear AFTER _require_approval (MODL-02) — no dispatch input is "
+        "computed before the operator says yes."
+    )

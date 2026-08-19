@@ -40,6 +40,7 @@ from signet_trainer.config.validators import (
     H3_A100_80GB_USABLE_GIB,
     H3_CAMPAIGN_ASPECT,
     H3_CANVAS_MULTIPLE,
+    H3_DEFAULT_MODAL_GPU,
     H3_LORA_TARGET_REGEX,
     H3_MIB_PER_PACKED_ROW,
     H3_NOMINAL_PROMPT_TOKENS,
@@ -56,6 +57,7 @@ from signet_trainer.config.validators import (
     h3_packed_seq_len,
     h3_renderable_frame_bounds,
     max_packed_rows_for_budget,
+    normalize_h3_modal_gpu,
     qwen_edit_packed_layout,
     resolve_canvas_size,
     validate_a2v_lora_targets,
@@ -63,6 +65,8 @@ from signet_trainer.config.validators import (
     validate_conditioning_items,
     validate_conditioning_mode,
     validate_h3_frames,
+    validate_h3_gpu_budget_coherence,
+    validate_h3_gpu_rate_coherence,
     validate_h3_reference_budget,
     validate_h3_resolution_bucket,
     validate_h3_resolution_buckets,
@@ -481,8 +485,14 @@ class H3Config(_Base):
 
     D-NOHARDCODE: none of these may ever be a literal in code. Each one is documented, defaulted to
     the decided value, and fail-fast validated BEFORE any GPU is touched. The measured budget triple
-    (``gpu_usable_gib`` / ``resident_gib`` / ``mib_per_packed_row``) is config-first precisely so an
-    H200 escalation is a YAML edit rather than a code change.
+    (``gpu_usable_gib`` / ``resident_gib`` / ``mib_per_packed_row``) is config-first, and TOGETHER
+    with ``modal_gpu`` — the TRAIN-tier booking the entrypoint threads to ``h3_preprocess`` /
+    ``h3_train`` — an H200 escalation is a YAML edit rather than a code change. Editing the triple
+    ALONE is refused at config load (``validate_h3_gpu_budget_coherence``): it would only disarm
+    the local OOM refusal while the stages still boot the default A100-80GB. Escalating the
+    booking ALONE, with ``modal.hourly_rate_usd`` left at its A100 default, is also refused
+    (``validate_h3_gpu_rate_coherence``): the pre-approval cost print would price the escalated
+    card at A100 money.
 
     Only meaningful when ``model.family == 'h3'``; ``SignetConfig`` carries the bidirectional lean
     field-split REVERSE guard that rejects a non-default value under any other family, so this block
@@ -581,11 +591,46 @@ class H3Config(_Base):
         "entangled through all 50 blocks). Target audio rows stay PRESENT and NOISED, matching the "
         "inference regime, and merely stay OUT of the loss. Do not teach the model to be silent.",
     )
+    # The BOOKING half of the escalation lever, TRAIN-tier only. The budget triple below prices the
+    # run; THIS is the card h3_preprocess / h3_train actually boot on — the entrypoint threads it
+    # via .with_options(gpu=...) at dispatch, overriding the fns.py decorator default. RULING
+    # (bundle PR-5 rework): h3_sample is deliberately NOT threaded from this field — it keeps its
+    # own pre-existing SIGNET_H3_SAMPLE_GPU env override (#55), an orthogonal fix for a Qwen3-VL
+    # text-encode OOM on a 3-reference render leg. Threading this field's default into h3_sample's
+    # dispatch too would let .with_options(gpu=...) silently override an operator's exported env
+    # var on every run that has not also escalated modal_gpu — regressing #55 by composition. The
+    # two halves (this field + the budget triple) are coupled by validate_h3_gpu_budget_coherence
+    # in _cross_field_checks; the booking + modal.hourly_rate_usd are coupled by
+    # validate_h3_gpu_rate_coherence. normalize_h3_modal_gpu (field_validator below) canonicalizes
+    # the stored value (Modal uppercases the string itself before booking), enforces the
+    # single-GPU house rule (no ':<count>' / ',' fallback list), and shape-checks it against a
+    # known-GPU allowlist — all BEFORE the cost print and the operator's approval.
+    modal_gpu: str = Field(
+        default=H3_DEFAULT_MODAL_GPU,
+        min_length=1,
+        description="The Modal GPU h3_preprocess and h3_train are dispatched onto (threaded via "
+        ".with_options(gpu=...) at each gated dispatch, strictly after approval). ONE GPU string, "
+        "never a fallback list or ':<count>' suffix (single-GPU house rule — enforced at load, "
+        "not just documented here). h3_sample is NOT governed by this field; it keeps its own "
+        "SIGNET_H3_SAMPLE_GPU env override (#55). An H200 escalation sets this AND the "
+        "re-measured budget triple together — and modal.hourly_rate_usd must follow too, so the "
+        "cost print stays honest (both couplings are enforced at config load, not merely advised "
+        "here).",
+    )
+
+    @field_validator("modal_gpu")
+    @classmethod
+    def _normalize_modal_gpu(cls, v: str) -> str:
+        return normalize_h3_modal_gpu(v)
+
     gpu_usable_gib: float = Field(
         default=H3_A100_80GB_USABLE_GIB,
         gt=0.0,
-        description="MEASURED (P10-1b) usable VRAM on the target GPU. Config-first so an H200 "
-        "escalation is a YAML edit, not a code change.",
+        description="MEASURED (P10-1b) usable VRAM on the booked GPU (modal_gpu). Config-first so "
+        "an H200 escalation is a YAML edit, not a code change — but ONLY together with modal_gpu "
+        "(and modal.hourly_rate_usd): raising this alone on the default A100-80GB booking is "
+        "refused at config load (it would merely disarm the packed-seq_len OOM refusal, not move "
+        "the hardware).",
     )
     resident_gib: float = Field(
         default=H3_RESIDENT_GIB_RANK64,
@@ -2863,6 +2908,18 @@ class SignetConfig(_Base):
         # the h3 block, the ceiling on the h3 budget triple — the same reason the inpaint dims check
         # lives here.
         if self.model.family == "h3":
+            # GPU/budget/rate COHERENCE first, before the budget prices anything: a gpu_usable_gib
+            # raised above the measured A100 usable while modal_gpu still books an A100-80GB is
+            # the audited escalation trap — every check below would pass against a ceiling the
+            # booked card cannot honor, and the OOM would surface in a PAID container. The rate
+            # guard closes the sibling hole: an escalated booking with an unchanged A100 rate
+            # prints A100 money for hardware that is not an A100.
+            validate_h3_gpu_budget_coherence(self.h3.modal_gpu, self.h3.gpu_usable_gib)
+            validate_h3_gpu_rate_coherence(
+                self.h3.modal_gpu,
+                self.modal.hourly_rate_usd,
+                ModalConfig.model_fields["hourly_rate_usd"].default,
+            )
             validate_h3_frames(self.training_dims[2])
             validate_h3_resolution_buckets(self.data.resolution_buckets)
             # MIRROR DIRECTION (#31 finding 1, H3 audit @742b676) — H3Config._check_no_reference_

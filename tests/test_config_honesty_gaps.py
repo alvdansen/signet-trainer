@@ -199,7 +199,11 @@ def test_inband_training_length_prints_no_notice(capsys) -> None:
             validation={"frame_count": 124},
             # A 124f NO-REFERENCE campaign busts the measured 13,777-row ceiling (unrelated to
             # this test) — widen the budget so only the notice logic under test is exercised.
-            h3={"references_per_sample": 0, "gpu_usable_gib": 200.0},
+            # PR-5's GPU/budget/rate coherence guards refuse a widened budget on the untouched
+            # default A100-80GB booking + rate, so escalate both alongside it (unrelated to this
+            # test's own claim, same as the budget widening itself).
+            h3={"references_per_sample": 0, "modal_gpu": "H200", "gpu_usable_gib": 200.0},
+            modal={"hourly_rate_usd": 3.5},
         )
     )
     captured = capsys.readouterr()

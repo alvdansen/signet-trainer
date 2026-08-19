@@ -49,6 +49,7 @@ from signet_trainer.conditioning.h3_geometry import (
     H3_CAMPAIGN_ASPECT,
     H3_CAMPAIGN_TARGET_FRAMES,
     H3_CANVAS_MULTIPLE,
+    H3_DEFAULT_MODAL_GPU,
     H3_MEASURED_PASSING_PACKED_ROWS,
     H3_MEASURED_PASSING_PEAK_GIB,
     H3_MIB_PER_PACKED_ROW,
@@ -133,11 +134,16 @@ __all__ = [
     "validate_h3_resolution_buckets",
     "validate_h3_seq_len_budget",
     "validate_h3_reference_budget",
+    "validate_h3_gpu_budget_coherence",
+    "validate_h3_gpu_rate_coherence",
+    "normalize_h3_modal_gpu",
+    "H3_MODAL_GPU_ALLOWED_TYPES",
     # Re-exported H3 geometry (defined in conditioning/h3_geometry.py, NOT here).
     "H3_A100_80GB_USABLE_GIB",
     "H3_CAMPAIGN_ASPECT",
     "H3_CAMPAIGN_TARGET_FRAMES",
     "H3_CANVAS_MULTIPLE",
+    "H3_DEFAULT_MODAL_GPU",
     "H3_MEASURED_PASSING_PACKED_ROWS",
     "H3_MEASURED_PASSING_PEAK_GIB",
     "H3_MIB_PER_PACKED_ROW",
@@ -882,6 +888,147 @@ def validate_h3_reference_budget(
     )
     validate_h3_seq_len_budget(worst_layout.total, max_packed_rows, label=worst_label)
     return worst_layout
+
+
+# --------------------------------------------------------------------------------------------------
+# The GPU/budget/rate COHERENCE guards (bundle PR-5, audit finding config-coherence-0). The
+# budget triple is documented as the H200-escalation lever, but the actual booking is
+# ``h3.modal_gpu`` — threaded to every TRAIN-tier H3 dispatch via ``.with_options(gpu=...)``, never
+# the ``fns.py`` decorator literal. Editing the triple alone loads clean, widens
+# ``max_packed_rows_for_budget`` (disarming the sole local packed-seq_len OOM refusal), and the
+# container still boots the DEFAULT card and CUDA-OOMs after the 61.7 GiB load. These guards make
+# the two-edit rule (booking + budget, and booking + cost basis) load-bearing rather than advisory.
+# --------------------------------------------------------------------------------------------------
+
+#: Modal-recognized single-GPU type strings this house's H3 stages may book (must-fix 4, WR-05
+#: shape validation): a typo here must die at config load, BEFORE the cost print and the operator's
+#: approval — never discovered only inside a metered ``.spawn()`` call. No fallback-list / GPU-count
+#: syntax appears here; that shape is refused separately (single-GPU house rule, must-fix 2) so this
+#: allowlist only ever needs to hold bare type names.
+H3_MODAL_GPU_ALLOWED_TYPES: frozenset[str] = frozenset(
+    {"T4", "L4", "A10G", "A100", "A100-40GB", "A100-80GB", "L40S", "H100", "H200", "B200"}
+)
+
+
+def normalize_h3_modal_gpu(modal_gpu: str) -> str:
+    """Canonicalize + shape-check ``h3.modal_gpu`` BEFORE it can reach ``.spawn()``.
+
+    Wired as ``H3Config``'s ``field_validator`` on ``modal_gpu``, so the STORED value is already
+    canonical everywhere downstream reads it (the coherence guards below, the entrypoint's
+    ``.with_options(gpu=...)`` threading).
+
+    Three must-fix items from the PR-5 verifier list, all closed here:
+
+    1. **Normalization (must-fix 1).** Modal uppercases the GPU string itself
+       (``_utils/function_utils.py``'s ``value.upper()``) before booking, so ``"a100-80gb"`` and
+       ``"A100-80GB"`` are the SAME booking to Modal but were two different strings to a bare
+       ``==`` coherence check — the audited escalation trap, reachable again just by spelling.
+       ``strip().upper()`` here means every later comparison compares what Modal actually books.
+    2. **Single-GPU house rule (must-fix 2).** ``"A100-80GB:2"`` is a Modal GPU-COUNT suffix (books
+       2 cards against a cost print that assumes 1); ``"H100,A100-80GB"`` is a fallback list (the
+       booked card is non-deterministic at dispatch time). Both are refused outright — the field
+       description's single-GPU claim becomes a fact enforced here, not prose.
+    3. **Shape validation (must-fix 4).** ``"NOTAGPU"`` and blank/whitespace-only both used to load
+       clean and fail only inside ``.spawn()`` — AFTER the operator's approval. Checked against
+       ``H3_MODAL_GPU_ALLOWED_TYPES`` here, pre-approval, at config load.
+
+    Returns the canonical (stripped, uppercased) string on success.
+    """
+    canonical = modal_gpu.strip().upper()
+    if not canonical:
+        raise ValueError(
+            "h3.modal_gpu must not be blank or whitespace-only: name the single Modal GPU type "
+            "every TRAIN-tier H3 stage (h3_preprocess / h3_train) is dispatched onto, e.g. "
+            f"{H3_DEFAULT_MODAL_GPU!r}."
+        )
+    if ":" in canonical or "," in canonical:
+        raise ValueError(
+            f"h3.modal_gpu={modal_gpu!r} names more than one GPU (a ':<count>' suffix or a "
+            f"',' fallback list). The house rule is single-GPU only: this books exactly one card. "
+            f"A ':N' suffix would book N cards against a cost print that assumes one, and a "
+            f"fallback list would make the booked hardware non-deterministic at dispatch time. "
+            f"Name one GPU type, e.g. {H3_DEFAULT_MODAL_GPU!r} or 'H200'."
+        )
+    if canonical not in H3_MODAL_GPU_ALLOWED_TYPES:
+        raise ValueError(
+            f"h3.modal_gpu={modal_gpu!r} is not a Modal-recognized GPU type. Known types: "
+            f"{sorted(H3_MODAL_GPU_ALLOWED_TYPES)}. Left unchecked here, a typo loads clean, "
+            f"dry-runs clean, prints a cost, and only fails inside the metered .spawn() call — "
+            f"after the operator has already approved the launch."
+        )
+    return canonical
+
+
+def validate_h3_gpu_budget_coherence(modal_gpu: str, gpu_usable_gib: float) -> float:
+    """Refuse a budget triple that claims more VRAM than the GPU actually BOOKED for the H3 stages.
+
+    The audited failure this closes: ``gpu_usable_gib`` was documented as the H200-escalation
+    lever, but the hardware the TRAIN-tier H3 stages (``h3_preprocess`` / ``h3_train``) boot on is
+    ``h3.modal_gpu`` (threaded to ``.with_options(gpu=...)`` at every gated dispatch). Raising the
+    budget while the booking still says the default A100-80GB does not move the hardware — it only
+    widens ``max_packed_rows_for_budget``, i.e. it switches OFF the local packed-seq_len refusal
+    that is the sole pre-dispatch OOM guard. The config then loads clean, the dry-run reports
+    headroom, the cost print prints, and the container pays the 61.7 GiB load before CUDA-OOMing on
+    the first step (retryable, so up to 11 times).
+
+    ``modal_gpu`` is compared in its CANONICAL form (must-fix 1) so a differently-cased or
+    whitespace-padded default booking is not mistaken for an escalation: Modal itself uppercases
+    the string before booking, so the comparison must agree with what Modal actually does.
+
+    Only the DEFAULT booking is bounded here: ``H3_A100_80GB_USABLE_GIB`` is the measured usable
+    VRAM on that exact card, so exceeding it while still booking that card is dishonest by
+    construction. Any other booking is an operator-measured card — the triple's numbers are theirs
+    to declare (D-NOHARDCODE: every budget number still arrives as an argument).
+
+    Returns ``gpu_usable_gib`` unchanged on success.
+    """
+    canonical_gpu = modal_gpu.strip().upper()
+    if canonical_gpu == H3_DEFAULT_MODAL_GPU.upper() and gpu_usable_gib > H3_A100_80GB_USABLE_GIB:
+        raise ValueError(
+            f"h3.gpu_usable_gib {gpu_usable_gib} exceeds the measured "
+            f"{H3_A100_80GB_USABLE_GIB} GiB usable on the booked GPU (h3.modal_gpu = "
+            f"{modal_gpu!r}, the card every TRAIN-tier H3 stage dispatches onto). Raising the "
+            f"budget triple does NOT move the hardware — it only disarms the local "
+            f"packed-seq_len OOM refusal, and the container still CUDA-OOMs after paying the "
+            f"61.7 GiB load. An H200 escalation is BOTH edits together: set h3.modal_gpu (e.g. "
+            f"'H200') AND the re-measured budget triple, and update modal.hourly_rate_usd so the "
+            f"cost print stays honest."
+        )
+    return gpu_usable_gib
+
+
+def validate_h3_gpu_rate_coherence(
+    modal_gpu: str, hourly_rate_usd: float, default_hourly_rate_usd: float
+) -> float:
+    """Couple the cost BASIS to the booking (must-fix 3), same discipline as the budget guard above.
+
+    ``modal.hourly_rate_usd`` is documented as the A100-80GB $/hr guardrail constant and is the
+    SOLE input to the pre-approval cost print and the ``$50`` cost guardrail. Escalating
+    ``h3.modal_gpu`` away from the default A100-80GB while leaving ``hourly_rate_usd`` at its
+    untouched A100 default prints A100 money for hardware that is not an A100 — the guardrail and
+    the approval print are both computed against a rate that no longer describes what is booked.
+
+    Mirrors [WR-04]'s ``cpu_hourly_rate_usd`` split: a companion config edit is REQUIRED, not
+    merely advised in a docstring. Only the DEFAULT rate is bounded here — ``default_hourly_rate_usd``
+    is read from ``ModalConfig``'s own field default (never a second hardcoded copy, D-NOHARDCODE),
+    so this stays in sync with that field by construction. Once the operator has edited
+    ``hourly_rate_usd`` at all, the number is theirs to declare.
+
+    Returns ``hourly_rate_usd`` unchanged on success.
+    """
+    canonical_gpu = modal_gpu.strip().upper()
+    if canonical_gpu != H3_DEFAULT_MODAL_GPU.upper() and hourly_rate_usd == default_hourly_rate_usd:
+        raise ValueError(
+            f"h3.modal_gpu={modal_gpu!r} escalates away from the default "
+            f"{H3_DEFAULT_MODAL_GPU!r} booking, but modal.hourly_rate_usd is still "
+            f"{default_hourly_rate_usd} — the untouched A100-80GB $/hr guardrail constant. The "
+            f"pre-approval cost print and the cost guardrail would both price the escalated card "
+            f"at A100 money. An H200 (or any non-default) escalation is BOTH edits together: set "
+            f"h3.modal_gpu AND a re-measured modal.hourly_rate_usd for that card, mirroring "
+            f"[WR-04]'s cpu_hourly_rate_usd split — the cost basis must follow the booking, never "
+            f"stay silently pinned to the A100 rate."
+        )
+    return hourly_rate_usd
 
 
 # --------------------------------------------------------------------------------------------------

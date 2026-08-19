@@ -71,6 +71,10 @@ h3:
   prompt_tokens_estimate: 96
   target_aspect: [16, 9]
   audio_in_loss: false
+  # modal_gpu (omitted here -> default "A100-80GB") is the TRAIN-tier booking the entrypoint
+  # threads to h3_preprocess/h3_train. An H200 escalation is modal_gpu + this re-measured
+  # triple + modal.hourly_rate_usd TOGETHER (coherence-checked at config load) — editing the
+  # triple alone is refused.
   gpu_usable_gib: 79.25
   resident_gib: 62.97
   mib_per_packed_row: 1.21

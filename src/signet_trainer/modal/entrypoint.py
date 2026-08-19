@@ -303,7 +303,10 @@ def _h3_encode_params(cfg: object) -> dict[str, object] | None:
     the dry-run refusal. Unthreaded it defaults to ``None`` and that whole guard becomes dead code
     while every local gate still goes green; the ONLY remaining discovery channel would be an OOM in
     a metered A100 container. ``conditioning/h3_geometry.max_packed_rows_for_budget`` owns the
-    arithmetic (D-NOHARDCODE: an H200 escalation is then a YAML edit to the budget triple).
+    arithmetic (D-NOHARDCODE: an H200 escalation is then a YAML edit to the budget triple PLUS
+    ``h3.modal_gpu`` — the TRAIN-tier booking each of ``h3_preprocess`` / ``h3_train`` threads via
+    ``.with_options(gpu=...)``; the config-load coherence guards refuse the triple, or the
+    booking, edited alone).
 
     ``with_audio`` reads ``cfg.audio.with_audio`` — the one config field that means "the encode
     writes audio latents". For a ``family: h3`` config today it necessarily reads False: H3's
@@ -1532,6 +1535,15 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         from signet_trainer.modal.fns import h3_sample
 
         h3_sample_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
+        # RULING (bundle PR-5 rework, config-coherence-0): h3.modal_gpu is the TRAIN-tier booking
+        # lever (threaded into h3_preprocess / h3_train below) and is deliberately NOT threaded
+        # here. h3_sample keeps its own pre-existing SIGNET_H3_SAMPLE_GPU env override (#55/house
+        # audit PR#51), an orthogonal fix for a Qwen3-VL text-encode OOM on a 3-reference render
+        # leg — set at fns.py IMPORT time via the decorator's gpu=H3_SAMPLE_GPU. Passing
+        # gpu=cfg.h3.modal_gpu here would make .with_options(...) silently override that env var
+        # with this field's default ("A100-80GB") on every run that has not ALSO escalated
+        # modal_gpu, regressing #55 by composition. See h3_geometry.H3_DEFAULT_MODAL_GPU's
+        # docstring for the full rationale.
         print(
             "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
             "Dispatching h3_sample.spawn() (gated, family: h3); base+adapter mp4s, delta.json and "
@@ -1620,6 +1632,11 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         h3_params = _h3_encode_params(cfg)
         assert h3_params is not None  # family == "h3" was just checked by this arm's condition
         h3_preprocess_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
+        # The BOOKED GPU comes from the config (h3.modal_gpu, coherence-checked against the budget
+        # triple AND modal.hourly_rate_usd at load) — never the fns.py decorator literal, so an
+        # H200 escalation really is a YAML edit. Bound to a local, computed HERE, strictly after
+        # approval (MODL-02).
+        h3_gpu = cfg.h3.modal_gpu
         print(
             "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
             "Dispatching h3_preprocess.spawn() (gated, family: h3); the two-phase encode writes "
@@ -1627,7 +1644,9 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
             "requested) to the dataset Volume under cfg.data.preprocessed_data_root and commits it. "
             "The H3 arch gate fires inside the stage, before a single frame is decoded."
         )
-        fc = h3_preprocess.with_options(timeout=h3_preprocess_timeout_s).spawn(**h3_params)
+        fc = h3_preprocess.with_options(timeout=h3_preprocess_timeout_s, gpu=h3_gpu).spawn(
+            **h3_params
+        )
         _watch_dispatch(
             fc,
             cfg.modal.dispatch_watch_seconds,
@@ -1796,13 +1815,18 @@ def main(config: str, approve: bool = False, mode: str = "train") -> None:
         from signet_trainer.modal.fns import h3_train
 
         h3_train_timeout_s = int(cfg.modal.est_hours * cfg.modal.timeout_margin * 3600)
+        # Same booking rule as the h3_preprocess arm: the GPU is cfg.h3.modal_gpu (the
+        # coherence-checked half of the H200 escalation lever, against BOTH the budget triple and
+        # modal.hourly_rate_usd), not the fns.py decorator literal. Bound to a local, computed
+        # HERE, strictly after approval (MODL-02).
+        h3_gpu = cfg.h3.modal_gpu
         print(
             "[signet-entrypoint] APPROVED — config valid, dry-run passed, cost within guardrail. "
             "Dispatching h3_train.spawn() (gated, family: h3); checkpoints commit to "
             "signe-trainer-checkpoints under <output_dir>/. The H3 arch gate + the CPU preflight "
             "both fire inside the stage, before the 61.7 GiB load."
         )
-        fc = h3_train.with_options(timeout=h3_train_timeout_s).spawn(config_text)
+        fc = h3_train.with_options(timeout=h3_train_timeout_s, gpu=h3_gpu).spawn(config_text)
         _watch_dispatch(
             fc,
             cfg.modal.dispatch_watch_seconds,

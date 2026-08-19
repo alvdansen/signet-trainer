@@ -37,6 +37,7 @@ from signet_trainer.config.schema import (
     LTX_DEFAULT_LORA_TARGETS,
     H3Config,
     LoraConfig,
+    ModalConfig,
     ModelConfig,
     SignetConfig,
 )
@@ -159,6 +160,7 @@ def test_h3_config_carries_the_locked_d10_defaults() -> None:
     assert h3.prompt_tokens_estimate == 96
     assert h3.text_encoder_layer == 50  # Qwen3-VL hidden_states[50] of 64
     assert h3.audio_in_loss is False  # D-10-AUDIO — loss-MASKING, not arch-skipping
+    assert h3.modal_gpu == "A100-80GB"  # the booked card the budget triple was measured ON
     assert h3.gpu_usable_gib == pytest.approx(79.25)
     assert h3.resident_gib == pytest.approx(62.97)
     assert h3.mib_per_packed_row == pytest.approx(1.21)
@@ -242,6 +244,7 @@ def test_reference_sizes_are_split_lists_and_accept_labels() -> None:
         ("prompt_tokens_estimate", 128),
         ("text_encoder_layer", 63),
         ("audio_in_loss", True),
+        ("modal_gpu", "H200"),
         ("gpu_usable_gib", 139.0),
         ("resident_gib", 60.0),
         ("mib_per_packed_row", 1.5),
@@ -495,6 +498,239 @@ def test_a_reference_free_h3_config_is_still_budget_checked() -> None:
     # Positional again: 37,806 also appears in every refusal's remedy prose as the t2v-baseline
     # advisory, so a substring check would pass even if the budget had never been computed here.
     assert _extract_reported_rows(str(exc.value)) == "37806"
+
+
+# ======================================================================================
+# The GPU/budget/rate COHERENCE guards — the escalation lever must move the HARDWARE and the
+# COST BASIS, not just the safety rail (audit finding config-coherence-0, bundle PR-5 rework).
+# ======================================================================================
+
+
+def test_a_raised_budget_on_the_default_a100_booking_is_refused() -> None:
+    """⛔ NAMED REGRESSION: ``gpu_usable_gib`` was documented as THE H200-escalation lever while
+    every H3 stage booted an A100-80GB regardless. Editing the budget alone loaded clean, widened
+    the packed-row ceiling from 13,777 to 64,342 rows, and thereby switched OFF the only local OOM
+    refusal — the container then paid the 61.7 GiB load and CUDA-OOM'd. The escalation is honest
+    only as BOTH edits together, so the triple edited alone must die at config load.
+    """
+    payload = _h3_payload()
+    payload["h3"]["gpu_usable_gib"] = 139.0  # H200-class usable VRAM, A100-80GB still booked
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(payload)
+    msg = str(exc.value)
+    assert "modal_gpu" in msg, "the refusal must NAME the missing half of the escalation"
+    assert "A100-80GB" in msg, "the refusal must NAME the card actually booked"
+    assert "139.0" in msg and "79.25" in msg, "both numbers must be named (typed state)"
+    assert "hourly_rate_usd" in msg, "the remedy must keep the cost print honest too"
+
+
+def test_the_audited_scenario_a_widened_ceiling_never_passes_the_37806_row_config() -> None:
+    """The exact audited failure: training_dims [1344, 768, 124] (37,806 packed rows) with
+    ``gpu_usable_gib: 139.0`` used to load clean and dry-run green — 37,806 < the widened 64,342
+    ceiling — then OOM on the booked A100. The coherence guard must fire FIRST, before the budget
+    prices anything against a ceiling the booked card cannot honor.
+    """
+    payload = _h3_payload(
+        training_dims=[1344, 768, 124],
+        data={
+            "preprocessed_data_root": "/data/h3_preprocessed",
+            "batch_size": 1,
+            "resolution_buckets": ["1344x768x124"],
+        },
+    )
+    payload["h3"] = {"references_per_sample": 0, "gpu_usable_gib": 139.0}  # no-ref t2v baseline
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(payload)
+    assert "modal_gpu" in str(exc.value), (
+        "the refusal must be the COHERENCE guard (booking vs budget), not a budget pass — a "
+        "widened ceiling passing this config is exactly the audited OOM-in-a-paid-container path"
+    )
+
+
+def test_an_escalated_booking_accepts_the_matching_budget_and_rate() -> None:
+    """The honest escalation — ``modal_gpu``, the triple, AND ``hourly_rate_usd`` together — must
+    load. 139.0 usable on an H200 clears the 37,806-row campaign geometry (P10-1-MEASURED section
+    4 extrapolation).
+    """
+    payload = _h3_payload(
+        training_dims=[1344, 768, 124],
+        data={
+            "preprocessed_data_root": "/data/h3_preprocessed",
+            "batch_size": 1,
+            "resolution_buckets": ["1344x768x124"],
+        },
+    )
+    payload["h3"] = {
+        "references_per_sample": 0,
+        "modal_gpu": "H200",
+        "gpu_usable_gib": 139.0,
+    }
+    payload["modal"] = {"hourly_rate_usd": 3.5}  # a re-measured H200 rate, NOT the A100 default
+    cfg = SignetConfig.model_validate(payload)
+    assert cfg.h3.modal_gpu == "H200"
+    assert cfg.h3.gpu_usable_gib == pytest.approx(139.0)
+    assert cfg.modal.hourly_rate_usd == pytest.approx(3.5)
+
+
+def test_a_lowered_budget_on_the_default_booking_still_loads() -> None:
+    """Coherence bounds the budget ABOVE only: declaring LESS usable VRAM than measured is a
+    conservative operator choice (a tighter ceiling), never a lie about the hardware.
+    78.0 GiB keeps the ceiling above the worst declared pair in the default h3 payload, so the
+    budget check itself still passes — this isolates the coherence guard's direction.
+    """
+    payload = _h3_payload()
+    payload["h3"]["gpu_usable_gib"] = 78.0
+    cfg = SignetConfig.model_validate(payload)
+    assert cfg.h3.gpu_usable_gib == pytest.approx(78.0)
+
+
+def test_modal_gpu_default_matches_the_measured_budget_card() -> None:
+    """The field default and the constant the coherence guards compare against are ONE fact — the
+    card the P10-1b triple was measured on.
+    """
+    from signet_trainer.config.validators import H3_DEFAULT_MODAL_GPU
+
+    assert H3Config().modal_gpu == H3_DEFAULT_MODAL_GPU == "A100-80GB"
+
+
+def test_the_budget_coherence_guard_is_importable_and_returns_the_value_unchanged() -> None:
+    """The Pydantic-validator shape contract, same as every other validator in the module."""
+    from signet_trainer.config.validators import validate_h3_gpu_budget_coherence
+
+    assert validate_h3_gpu_budget_coherence("A100-80GB", 79.25) == pytest.approx(79.25)
+    assert validate_h3_gpu_budget_coherence("H200", 139.0) == pytest.approx(139.0)
+    with pytest.raises(ValueError):
+        validate_h3_gpu_budget_coherence("A100-80GB", 79.26)
+
+
+# --- must-fix 1: normalization (Modal uppercases the GPU string before booking) ------------------
+
+
+@pytest.mark.parametrize("spelling", ["a100-80gb", " A100-80GB ", "A100-80gb", "\tA100-80GB\n"])
+def test_a_differently_spelled_default_booking_is_still_recognized_as_the_default(
+    spelling: str,
+) -> None:
+    """⛔ NAMED REGRESSION (must-fix 1): Modal uppercases the GPU string itself before booking, so
+    a lowercase/whitespace-padded spelling of the default is the SAME booking to Modal but used to
+    be a DIFFERENT string to a bare ``==`` coherence check — reopening the audited escalation trap
+    just by spelling. ``modal_gpu`` must be stored canonicalized, so this raises exactly like the
+    canonical spelling does.
+    """
+    payload = _h3_payload()
+    payload["h3"]["modal_gpu"] = spelling
+    payload["h3"]["gpu_usable_gib"] = 139.0
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(payload)
+    assert "modal_gpu" in str(exc.value)
+
+
+def test_modal_gpu_is_stored_canonicalized() -> None:
+    """The STORED value is canonical (strip + upper), not the operator's raw spelling — every
+    downstream reader (coherence guards, entrypoint dispatch) then compares what Modal actually
+    books.
+    """
+    assert H3Config(modal_gpu=" h200 ").modal_gpu == "H200"
+    assert H3Config(modal_gpu="a100-80gb").modal_gpu == "A100-80GB"
+
+
+# --- must-fix 2: single-GPU house rule (no ':<count>' suffix / ',' fallback list) -----------------
+
+
+@pytest.mark.parametrize(
+    "modal_gpu",
+    ["A100-80GB:2", "A100-80GB:8", "H100,A100-80GB", "H200,H100"],
+)
+def test_multi_gpu_and_fallback_list_spellings_are_refused(modal_gpu: str) -> None:
+    """⛔ NAMED REGRESSION (must-fix 2): Modal reads a ':<count>' suffix as a GPU COUNT (N-fold
+    real spend against a cost print that assumes one card) and a ',' -separated string as a
+    FALLBACK LIST (the booked card becomes non-deterministic at dispatch time). Both must be
+    refused at config load, naming the single-GPU house rule — this hole did not exist before the
+    ``modal_gpu`` field did.
+    """
+    with pytest.raises(ValidationError) as exc:
+        H3Config(modal_gpu=modal_gpu)
+    msg = str(exc.value)
+    assert "single-GPU" in msg or "single GPU" in msg
+
+
+# --- must-fix 3: cost basis coupled to the booking (mirrors WR-04's cpu_hourly_rate_usd split) ----
+
+
+def test_an_escalated_booking_with_the_untouched_a100_rate_is_refused() -> None:
+    """⛔ NAMED REGRESSION (must-fix 3): ``modal.hourly_rate_usd`` prices the pre-approval cost
+    print AND the ``$50`` guardrail. Escalating ``h3.modal_gpu`` while leaving the rate at its
+    A100-80GB default prints A100 money for hardware that is not an A100.
+    """
+    payload = _h3_payload()
+    payload["h3"]["modal_gpu"] = "H200"
+    # modal.hourly_rate_usd intentionally left at the schema default — the untouched A100 rate.
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(payload)
+    msg = str(exc.value)
+    assert "hourly_rate_usd" in msg
+    assert "H200" in msg
+
+
+def test_the_default_booking_never_trips_the_rate_guard_regardless_of_rate() -> None:
+    """The rate guard only fires on an ESCALATED booking — the default A100-80GB booking is exempt
+    even if the operator has, for unrelated reasons, changed ``hourly_rate_usd``.
+    """
+    payload = _h3_payload()
+    payload["modal"] = {"hourly_rate_usd": 1.64}  # byte-identical to the untouched default
+    cfg = SignetConfig.model_validate(payload)
+    assert cfg.h3.modal_gpu == "A100-80GB"
+    payload["modal"] = {"hourly_rate_usd": 9.99}  # any rate at all, unrelated to h3
+    cfg = SignetConfig.model_validate(payload)
+    assert cfg.modal.hourly_rate_usd == pytest.approx(9.99)
+
+
+def test_the_rate_coherence_guard_reads_its_default_off_modalconfig_not_a_second_literal() -> None:
+    """D-NOHARDCODE: the guard's notion of 'the untouched A100 rate' must be ONE fact, read off
+    ``ModalConfig``'s own field default — never a second hardcoded copy that could drift.
+    """
+    from signet_trainer.config.validators import validate_h3_gpu_rate_coherence
+
+    default_rate = ModalConfig.model_fields["hourly_rate_usd"].default
+    assert validate_h3_gpu_rate_coherence("A100-80GB", default_rate, default_rate) == pytest.approx(
+        default_rate
+    )
+    assert validate_h3_gpu_rate_coherence("H200", 3.5, default_rate) == pytest.approx(3.5)
+    with pytest.raises(ValueError):
+        validate_h3_gpu_rate_coherence("H200", default_rate, default_rate)
+
+
+# --- must-fix 4: shape validation beyond min_length=1, refused PRE-APPROVAL at config load --------
+
+
+@pytest.mark.parametrize("modal_gpu", ["NOTAGPU", " ", "\t", "RTX4090"])
+def test_an_unrecognized_or_blank_modal_gpu_is_refused_at_config_load(modal_gpu: str) -> None:
+    """⛔ NAMED REGRESSION (must-fix 4): a typo'd or blank ``modal_gpu`` used to load clean and
+    fail only inside the metered ``.spawn()`` call — AFTER the operator's approval, the exact
+    burned-gate class this entrypoint guards against elsewhere. It must die at config load
+    instead, before the cost print.
+    """
+    with pytest.raises(ValidationError):
+        H3Config(modal_gpu=modal_gpu)
+
+
+@pytest.mark.parametrize("modal_gpu", ["A100-80GB", "A100-40GB", "H100", "H200", "B200", "L40S"])
+def test_every_known_modal_gpu_type_loads_clean(modal_gpu: str) -> None:
+    """The allowlist must not be so narrow it blocks legitimate Modal GPU types."""
+    assert H3Config(modal_gpu=modal_gpu).modal_gpu == modal_gpu
+
+
+def test_normalize_h3_modal_gpu_is_importable_and_returns_the_canonical_value() -> None:
+    """The Pydantic-validator shape contract, same as every other validator in the module."""
+    from signet_trainer.config.validators import normalize_h3_modal_gpu
+
+    assert normalize_h3_modal_gpu("a100-80gb") == "A100-80GB"
+    assert normalize_h3_modal_gpu(" H200 ") == "H200"
+    with pytest.raises(ValueError):
+        normalize_h3_modal_gpu("")
+    with pytest.raises(ValueError):
+        normalize_h3_modal_gpu("A100-80GB:2")
+    with pytest.raises(ValueError):
+        normalize_h3_modal_gpu("NOTAGPU")
 
 
 def test_ltx_frame_law_is_still_enforced_for_the_ltx_family() -> None:

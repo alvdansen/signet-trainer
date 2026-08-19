@@ -60,6 +60,7 @@ __all__ = [
     "H3_CANVAS_MAX_PIXELS",
     "H3_CANVAS_MULTIPLE",
     "H3_CANVAS_SHORT_EDGE",
+    "H3_DEFAULT_MODAL_GPU",
     "H3_FPS",
     "H3_FRAMES_PER_CHUNK",
     "H3_LATENTS_PER_CHUNK",
@@ -149,6 +150,22 @@ H3_VISION_TOKENS_EQUAL_LATENT_ROWS: bool = True
 H3_A100_80GB_USABLE_GIB: float = 79.25
 H3_RESIDENT_GIB_RANK64: float = 62.97  # weights 61.73 + rank-64 LoRA inject
 H3_MIB_PER_PACKED_ROW: float = 1.21  # marginal activation cost, gradient checkpointing ON
+
+#: The Modal GPU the three measured numbers above were taken ON — and the DEFAULT booking every
+#: TRAIN-tier H3 stage (``h3_preprocess`` / ``h3_train``) dispatches onto (``h3.modal_gpu`` ->
+#: ``.with_options(gpu=...)`` at the entrypoint, strictly after approval). Named here, next to the
+#: triple, because the two are one fact: a budget that outgrows this card while the booking still
+#: says this card is a config the coherence guard must refuse
+#: (``config.validators.validate_h3_gpu_budget_coherence``), not a wider ceiling.
+#:
+#: RULING (bundle PR-5 rework, 2026-08-18): this field governs the TRAIN tier only. ``h3_sample``'s
+#: GPU stays on its own pre-existing ``SIGNET_H3_SAMPLE_GPU`` env override (#55/PR#51 house audit,
+#: an orthogonal fix for a Qwen3-VL text-encode OOM on a 3-reference render leg) — see
+#: ``modal/entrypoint.py``'s h3_sample dispatch arm and ``modal/fns.py``'s ``H3_SAMPLE_GPU`` for the
+#: full rationale. Threading this field into the sample dispatch too would make
+#: ``.with_options(gpu=...)`` silently override an operator's exported env var with this field's
+#: default on every run that has not also escalated ``modal_gpu`` — regressing #55 by composition.
+H3_DEFAULT_MODAL_GPU: str = "A100-80GB"
 
 #: The configuration MEASURED passing: 22f target + 2 refs @1024, 76.36 GiB peak, 16.6 s/it.
 H3_MEASURED_PASSING_PACKED_ROWS: int = 12362
