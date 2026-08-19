@@ -12,9 +12,20 @@ The module splits in two, deliberately:
   * **``H3RefStrategy``** (bottom) — the ``TrainingStrategy`` that turns a dataloader batch into the
     packed H3 batch, with the reference prefix out of the loss.
 
-⛔ EXACTLY 2 SLOTS, ALWAYS — THE ENVIRONMENT REFERENCE SUBSTITUTES, IT NEVER APPENDS
-------------------------------------------------------------------------------------
-Operator ruling, verbatim: *"for the three reference just remove one character reference."*
+⛔ THE LIVE UNION IS {0, 1, 2, 3} — 3 IS EXPLICIT-MANIFEST ONLY, AND THE ENVIRONMENT REFERENCE
+SUBSTITUTES, NEVER APPENDS
+--------------------------------------------------------------------------------------------------------
+``references_per_sample`` is 0 (NO-REFERENCE, ALPHA — smoke-tested only), 1 (single-control: one
+rotating character ref, no environment substitution possible at 1 slot — an environment ref needs a
+character slot to substitute for), 2 (Ref2VA, the case this section documents), or 3 (PR #51,
+EXPLICIT-MANIFEST ONLY — every row supplies its own ``reference_paths``, never a
+``character_references`` pool; the pool branch below stays capped at 2, see
+``_check_references_per_sample``). Every live value is priced by the packed-sequence VRAM budget
+(``conditioning/h3_geometry``, ``validate_h3_reference_budget``) before it ever reaches a metered
+A100 — the historical risk here was an UNPRICED count sailing past config load, not the count itself.
+
+Operator ruling, verbatim, for the 2-slot case: *"for the three reference just remove one character
+reference."*
 
 So a non-environment segment (~76 of 88) carries **two rotating character refs** (AB / AC / BC), and
 an environment-bearing segment (~12 of 88) carries **ONE rotating character ref plus the environment
@@ -24,9 +35,8 @@ on top of rather than folded into.
 
 **D-10-ASYM is unaffected and still honored:** the reference REGIME still varies across the corpus
 (character+character vs character+environment), which is the point — *"we dont want to bias and lock
-a particular reference behavior."* What no longer varies is the reference COUNT. A 3-slot sample was
-never priced by the packed-sequence VRAM budget (``conditioning/h3_geometry``,
-``validate_h3_reference_budget``), so it would not fail locally — it would OOM a metered A100.
+a particular reference behavior."* What no longer varies, AT 2 SLOTS, is the reference COUNT — that
+invariant is scoped to the 2-slot case; the union as a whole varies the count too (0 / 1 / 2 / 3).
 
 Why the rotation exists at all
 ------------------------------
@@ -727,10 +737,14 @@ class H3RefStrategy(TrainingStrategy):
         loss curve, and an adapter that pushes every render the wrong way.
 
     Args:
-        references_per_sample: Fixed slot count (2). The environment ref SUBSTITUTES for the second
-            character slot rather than being appended. 0 = NO-REFERENCE training (ALPHA): the
-            reference source is never read, the text conditions on the PROMPT-ONLY state, and the
-            packed batch carries zero conditioning-video rows — through the same packer.
+        references_per_sample: The slot count — live union {0, 1, 2, 3} (module banner); 3 is
+            EXPLICIT-MANIFEST ONLY (PR #51), the pool branch below stays capped at 2. 2 = Ref2VA:
+            the environment ref SUBSTITUTES for the second character slot rather than being
+            appended. 1 = single-control: one rotating character ref; no environment substitution
+            is possible (it needs a character slot to substitute for, and there is none left at 1
+            total slot). 0 = NO-REFERENCE training (ALPHA): the reference source is never read, the
+            text conditions on the PROMPT-ONLY state, and the packed batch carries zero
+            conditioning-video rows — through the same packer.
         reference_dropout: D-10-REFDROP probability, per ``(segment, step)``.
         reference_pair_seed: D-10-PAIRSEED. One seed feeds three domain-separated streams (pair,
             single-character, dropout), so the schedules are reproducible AND uncorrelated.
@@ -969,6 +983,7 @@ class H3RefStrategy(TrainingStrategy):
         text_state, vision_spans = read_h3_text_state(
             _lookup(batch, H3_TEXT_BATCH_KEYS, "text condition"),
             reference_dropped=dropped or no_reference,
+            references_per_sample=self.references_per_sample,
         )
         text = _as_rows(text_state, "text conditions")
 

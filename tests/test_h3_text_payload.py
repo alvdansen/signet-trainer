@@ -23,6 +23,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from signet_trainer.prep.h3_text_payload import (  # noqa: E402
+    H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY,
     H3_TEXT_PAYLOAD_PROMPT_ONLY_KEY,
     H3_TEXT_PAYLOAD_PROMPT_ONLY_SPANS_KEY,
     H3_TEXT_PAYLOAD_SPANS_KEY,
@@ -55,13 +56,13 @@ def _payload(**overrides: object) -> dict:
 
 
 def test_the_reference_bearing_state_comes_back_with_its_spans() -> None:
-    hidden, spans = read_h3_text_state(_payload(), reference_dropped=False)
+    hidden, spans = read_h3_text_state(_payload(), reference_dropped=False, references_per_sample=2)
     assert spans == _SPANS, "the spans PHASE A measured must survive verbatim — they ARE the fix"
     assert hidden.shape == (12, 4)
 
 
 def test_a_dropped_step_gets_the_prompt_only_state_and_NO_spans() -> None:
-    hidden, spans = read_h3_text_state(_payload(), reference_dropped=True)
+    hidden, spans = read_h3_text_state(_payload(), reference_dropped=True, references_per_sample=2)
     assert hidden.shape == (5, 4), (
         "a dropped step must condition on the PROMPT-ONLY state; reading the reference-bearing one "
         "is the defect — the latents are gone but the text still describes them"
@@ -74,7 +75,7 @@ def test_the_payload_survives_torch_save_and_load(tmp_path) -> None:
     path = tmp_path / "sample.pt"
     torch.save(_payload(), path)
     loaded = torch.load(path, weights_only=True)
-    hidden, spans = read_h3_text_state(loaded, reference_dropped=False)
+    hidden, spans = read_h3_text_state(loaded, reference_dropped=False, references_per_sample=2)
     assert spans == _SPANS
     assert torch.equal(hidden, _payload()[H3_TEXT_PAYLOAD_STATE_KEY])
 
@@ -87,12 +88,55 @@ def test_the_payload_declares_its_version_and_both_states() -> None:
         H3_TEXT_PAYLOAD_SPANS_KEY,
         H3_TEXT_PAYLOAD_PROMPT_ONLY_KEY,
         H3_TEXT_PAYLOAD_PROMPT_ONLY_SPANS_KEY,
+        H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY,
     ):
         assert key in payload, f"the payload must be SELF-DESCRIBING; {key} is missing"
     assert payload[H3_TEXT_PAYLOAD_PROMPT_ONLY_SPANS_KEY] == (), (
         "the prompt-only spans are empty BY CONSTRUCTION, and stored anyway so the reader's "
         "contract is symmetric"
     )
+    assert payload[H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY] is True, (
+        "#31 finding 2 — has_references is enforced at write time but must ALSO be PERSISTED so "
+        "the reader can check the cache's recorded regime against the run's own slot count"
+    )
+
+
+# ==================================================================================================
+# #31 finding 2 — the persisted regime discriminator and its reader-side cross-check
+# ==================================================================================================
+
+
+def test_has_references_false_is_persisted_too() -> None:
+    payload = _payload(has_references=False, vision_spans=(), hidden_states=torch.zeros(5, 4))
+    assert payload[H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY] is False
+
+
+def test_a_missing_has_references_field_is_refused_as_malformed_not_stale() -> None:
+    """A version-3 payload lacking the field it was bumped FOR is malformed, not merely stale."""
+    payload = _payload()
+    del payload[H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY]
+    with pytest.raises(ValueError, match="malformed"):
+        read_h3_text_state(payload, reference_dropped=False, references_per_sample=2)
+
+
+def test_a_no_reference_cache_is_refused_when_the_run_declares_reference_slots() -> None:
+    """The measured failure #31 finding 2 closes: a NO-REFERENCE cache read by a run that WILL
+    resolve and pack real reference-latent rows (references_per_sample >= 1) — e.g. a Ref2VA root
+    re-preprocessed at 0 slots and then resumed at the original slot count without a re-encode."""
+    payload = _payload(has_references=False, vision_spans=(), hidden_states=torch.zeros(5, 4))
+    with pytest.raises(ValueError, match="regime mismatch"):
+        read_h3_text_state(payload, reference_dropped=False, references_per_sample=2)
+    with pytest.raises(ValueError, match="regime mismatch"):
+        read_h3_text_state(payload, reference_dropped=True, references_per_sample=1)
+
+
+def test_a_reference_bearing_cache_is_NOT_refused_when_the_run_declares_zero_slots() -> None:
+    """The deliberate MIRROR-is-not-an-error case (module docstring): a references_per_sample == 0
+    run always selects the prompt-only state regardless of has_references, which is how a
+    no-reference train stays able to reuse an existing Ref2VA cache without a re-encode."""
+    hidden, spans = read_h3_text_state(_payload(), reference_dropped=True, references_per_sample=0)
+    assert spans == ()
+    assert hidden.shape == (5, 4)
 
 
 # ==================================================================================================
@@ -103,18 +147,22 @@ def test_the_payload_declares_its_version_and_both_states() -> None:
 def test_the_STALE_v1_bare_tensor_is_refused_and_names_the_re_encode() -> None:
     """The 88 payloads on the dataset Volume are exactly this. They are refused, not deleted."""
     with pytest.raises(ValueError, match="version-1"):
-        read_h3_text_state(torch.zeros(12, 4), reference_dropped=False)
+        read_h3_text_state(torch.zeros(12, 4), reference_dropped=False, references_per_sample=2)
     with pytest.raises(ValueError, match="RE-ENCODED"):
-        read_h3_text_state(torch.zeros(12, 4), reference_dropped=False)
+        read_h3_text_state(torch.zeros(12, 4), reference_dropped=False, references_per_sample=2)
 
 
 def test_an_undeclared_or_unknown_version_is_refused() -> None:
     with pytest.raises(ValueError, match="declares no"):
-        read_h3_text_state({H3_TEXT_PAYLOAD_STATE_KEY: torch.zeros(3, 4)}, reference_dropped=False)
+        read_h3_text_state(
+            {H3_TEXT_PAYLOAD_STATE_KEY: torch.zeros(3, 4)},
+            reference_dropped=False,
+            references_per_sample=2,
+        )
     payload = _payload()
     payload[H3_TEXT_PAYLOAD_VERSION_KEY] = H3_TEXT_PAYLOAD_VERSION + 1
     with pytest.raises(ValueError, match="version"):
-        read_h3_text_state(payload, reference_dropped=False)
+        read_h3_text_state(payload, reference_dropped=False, references_per_sample=2)
 
 
 def test_a_reference_bearing_state_with_NO_spans_is_refused_at_WRITE_time() -> None:
@@ -141,14 +189,14 @@ def test_a_prompt_only_state_carrying_spans_is_refused_at_READ_time() -> None:
     payload = _payload()
     payload[H3_TEXT_PAYLOAD_PROMPT_ONLY_SPANS_KEY] = ((0, 2),)
     with pytest.raises(ValueError, match="PROMPT-ONLY state carries"):
-        read_h3_text_state(payload, reference_dropped=True)
+        read_h3_text_state(payload, reference_dropped=True, references_per_sample=2)
 
 
 def test_a_missing_state_is_refused_rather_than_falling_back_to_the_other_one() -> None:
     payload = _payload()
     del payload[H3_TEXT_PAYLOAD_PROMPT_ONLY_KEY]
     with pytest.raises(ValueError, match="prompt_only_hidden_states"):
-        read_h3_text_state(payload, reference_dropped=True)
+        read_h3_text_state(payload, reference_dropped=True, references_per_sample=2)
 
 
 def test_a_degenerate_span_is_refused() -> None:

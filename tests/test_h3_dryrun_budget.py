@@ -391,15 +391,21 @@ def test_h3_ok_banner_reports_the_worst_pair_length_and_headroom(
 
 
 def test_reference_free_h3_config_is_still_budget_checked() -> None:
-    """A t2v-shaped H3 config busts the ceiling on target length alone — price it, do not skip it."""
-    ok = _h3_cfg(h3={})
+    """A t2v-shaped H3 config busts the ceiling on target length alone — price it, do not skip it.
+
+    ``references_per_sample: 0`` is EXPLICIT (not the bare ``h3={}`` this test used pre-#31): the
+    block's default ``references_per_sample`` is 2 (Ref2VA), so an empty ``h3: {}`` with no size
+    lists is now refused at config load by the #31 finding-1 mirror guard (a 2-slot config with an
+    un-priced reference corpus), rather than reaching this reference-free t2v pricing path at all.
+    """
+    ok = _h3_cfg(h3={"references_per_sample": 0})
     assert assert_h3_seq_len_budget(ok).worst_pair_label == ""
     assert run_dryrun(ok) == 0
 
     # Campaign target length busts the ceiling with ZERO references, so trimming the reference set
     # cannot rescue it. Reached by assignment for the same reason as ``_over_budget_cfg``: config
     # load already refuses it outright, and this gate is the second line of defence against drift.
-    campaign = _h3_cfg(h3={})
+    campaign = _h3_cfg(h3={"references_per_sample": 0})
     campaign.training_dims = [1344, 768, 124]
     with pytest.raises(ValueError) as excinfo:
         assert_h3_seq_len_budget(campaign)

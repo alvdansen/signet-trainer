@@ -247,6 +247,25 @@ def test_source_never_uses_the_salted_builtin_hash() -> None:
     )
 
 
+def test_the_module_banner_states_the_live_union_not_the_superseded_fixed_count() -> None:
+    """#31 finding 3 — the module the repo designates as the normative decision record must not
+    lead with a headline asserting the slot count is fixed at 2, inside the same file that
+    implements the reference-count union (h3_ref.py:789/904). A maintainer who reads a stale ⛔
+    headline and then writes or reviews on that premise is the failure mode this closes.
+
+    PR #51 (explicit-manifest sequence tasks, merged after this bundle was authored) widened the
+    live union from {0, 1, 2} to {0, 1, 2, 3} — the banner correctly states the WIDER union now;
+    this test pins the union not being stale, not any one specific literal set."""
+    source = _H3_REF_SRC.read_text(encoding="utf-8")
+    assert "EXACTLY 2 SLOTS, ALWAYS" not in source, (
+        "the banner still asserts a fixed slot count the live union superseded"
+    )
+    assert "{0, 1, 2, 3}" in source, "the banner must state the live union (widened by PR #51)"
+    assert "Fixed slot count (2)" not in source, (
+        "resolve_reference_slots' docstring opener is still the pre-union phrase"
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # 3. resolve_reference_slots — EXACTLY 2, environment SUBSTITUTES
 # --------------------------------------------------------------------------------------------------

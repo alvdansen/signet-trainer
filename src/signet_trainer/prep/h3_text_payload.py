@@ -20,23 +20,46 @@ regime matched no inference regime that exists — at the pin, a no-reference re
 contains no vision blocks at all. Identity leaked into 20% of steps while the model was being told
 there were no references.
 
-The fix for both is the same shape: **PHASE A already knows these things, so PHASE A writes them
-down.** The payload carries the reference-bearing hidden state WITH its spans, and a second
-**prompt-only** hidden state whose spans are empty BY CONSTRUCTION. ``H3RefStrategy`` selects
-between them by the dropout draw.
+**(3) The regime that wrote a cache was never recorded IN the cache (#31 finding 2).**
+``build_h3_text_payload`` enforced ``has_references`` as an ARGUMENT at write time and then dropped
+it on the floor — the returned dict carried no field a reader could check it against. A cache
+written at ``references_per_sample: 0`` (prompt-only text, empty spans) and one written at
+``references_per_sample: 2`` (Ref2VA text, real spans) were then indistinguishable BY SHAPE to
+``read_h3_text_state``: same keys, same dtypes, only the SPAN CONTENT differs, and an empty-spans
+reference-bearing payload is nonsensical only from the writer's side, not the reader's. An operator
+who re-runs ``--mode preprocess`` at 0 slots over an existing Ref2VA-cache root overwrites
+``h3_conditions/`` in place with NO-REFERENCE text while ``h3_reference_latents/`` is untouched —
+and a later train that flips back to the original slot count reads a same-version, wrong-regime
+cache with no raise: real reference-latent rows packed against a text presentation that describes
+none of them. The fix is the same shape as (1) and (2): the writer already knows the regime, so it
+WRITES IT DOWN, and the reader refuses a ``has_references=False`` cache when the run's own
+``references_per_sample`` is ``>= 1``. The MIRROR direction is deliberately NOT refused — a
+``references_per_sample == 0`` run always selects the prompt-only state regardless of what the
+cache's OTHER key holds, which is how a no-reference train stays able to reuse an existing Ref2VA
+cache without a re-encode (see ``H3RefStrategy.prepare_training_inputs``'s ``no_reference`` branch).
+
+The fix for all three is the same shape: **PHASE A already knows these things, so PHASE A writes them
+down.** The payload carries the reference-bearing hidden state WITH its spans, a second
+**prompt-only** hidden state whose spans are empty BY CONSTRUCTION, and the ``has_references`` flag
+that says which regime the SAMPLE (not the per-step dropout draw) was encoded under. ``H3RefStrategy``
+selects between the two states by the dropout draw, and separately checks the recorded regime
+against its own ``references_per_sample``.
 
 Versioning, and why a stale cache must be REFUSED
 -------------------------------------------------
 Version 1 was a bare ``(L, 5120)`` tensor. It is indistinguishable-by-duck-typing from the tensor
 inside version 2, so a reader that merely "accepts a tensor or a dict" would consume a v1 cache
-silently — with no spans and no prompt-only state, i.e. exactly the two defects above, restored.
+silently — with no spans and no prompt-only state, i.e. exactly defects (1) and (2) above, restored.
 There are **88 v1 payloads on the dataset Volume right now** (the partial cache the D-10-DEF-9 run
 committed before failing). They are NOT deleted — never auto-delete an intermediate — so the reader
-is what has to refuse them, by shape, with the re-encode named.
+is what has to refuse them, by shape, with the re-encode named. Version 3 adds ``has_references``
+(defect 3) — a version-2 cache has every OTHER field a version-3 reader wants, which is exactly why
+it must still be refused by version number rather than read for the fields that happen to match: the
+one field that would catch a same-version regime mismatch is the field a v2 cache does not have.
 
 ⚠ **This costs a PHASE A re-encode**: two Qwen3-VL passes per sample instead of one. That is
-expected and was decided deliberately — defect (1) needs the re-encode regardless, so (2) rides
-along in the same pass over the corpus rather than buying a second one.
+expected and was decided deliberately — defect (1) needs the re-encode regardless, so (2) and (3)
+ride along in the same pass over the corpus rather than buying a second or third one.
 
 Import tier: ``torch`` + stdlib only. Both the WRITER (``prep/h3_encode`` via ``modal/fns``) and the
 READER (``conditioning/h3_ref``) import this module, which is the whole point — one format, one
@@ -50,6 +73,7 @@ from typing import Any
 import torch
 
 __all__ = [
+    "H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY",
     "H3_TEXT_PAYLOAD_PROMPT_ONLY_KEY",
     "H3_TEXT_PAYLOAD_PROMPT_ONLY_SPANS_KEY",
     "H3_TEXT_PAYLOAD_SPANS_KEY",
@@ -63,7 +87,13 @@ __all__ = [
 #: Bumped whenever the payload gains or loses a field a reader depends on. A reader that finds a
 #: version it does not know REFUSES — it never falls back to "read what I recognize", which is how a
 #: stale cache gets consumed as a fresh one.
-H3_TEXT_PAYLOAD_VERSION: int = 2
+#:
+#: v2 -> v3 (#31 finding 2): added ``has_references`` (below) — the regime discriminator was
+#: enforced at WRITE time and never persisted, so a v2 cache written under one
+#: ``references_per_sample`` regime was indistinguishable BY SHAPE from one written under another.
+#: Bumping the version (rather than just adding the key) means every pre-fix v2 cache is refused by
+#: the existing version check above, instead of silently reading as "has_references missing".
+H3_TEXT_PAYLOAD_VERSION: int = 3
 H3_TEXT_PAYLOAD_VERSION_KEY: str = "h3_text_payload_version"
 
 #: The reference-BEARING state and the spans of its vision blocks, half-open, in emission order.
@@ -76,6 +106,13 @@ H3_TEXT_PAYLOAD_SPANS_KEY: str = "vision_spans"
 #: describes them".
 H3_TEXT_PAYLOAD_PROMPT_ONLY_KEY: str = "prompt_only_hidden_states"
 H3_TEXT_PAYLOAD_PROMPT_ONLY_SPANS_KEY: str = "prompt_only_vision_spans"
+
+#: (#31 finding 2, v3) Whether the SAMPLE (not the per-step dropout draw) was encoded under a
+#: reference-bearing regime. Recorded so a reader can refuse a cache whose recorded regime
+#: disagrees with the run's OWN ``references_per_sample`` — the mismatch that let a Ref2VA train
+#: silently pack reference latents against prompt-only text (or vice versa) after a preprocess
+#: re-run at a different slot count over the same output root.
+H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY: str = "has_references"
 
 
 def _normalize_spans(spans: Any, what: str) -> tuple[tuple[int, int], ...]:
@@ -150,11 +187,14 @@ def build_h3_text_payload(
         # future edit that starts putting spans here fails the round-trip check rather than the
         # first metered forward.
         H3_TEXT_PAYLOAD_PROMPT_ONLY_SPANS_KEY: (),
+        # (#31 finding 2) THE DISCRIMINATOR, persisted — previously enforced only as an argument
+        # at write time and then dropped; see the module docstring's defect (3).
+        H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY: bool(has_references),
     }
 
 
 def read_h3_text_state(
-    payload: Any, *, reference_dropped: bool
+    payload: Any, *, reference_dropped: bool, references_per_sample: int
 ) -> tuple[torch.Tensor, tuple[tuple[int, int], ...]]:
     """Select the hidden state this step conditions on, WITH its vision spans.
 
@@ -167,6 +207,14 @@ def read_h3_text_state(
         payload: What ``PrecomputedDataset`` returned for the ``h3_conditions`` source.
         reference_dropped: The D-10-REFDROP draw for this ``(segment, step)``. ``True`` selects the
             PROMPT-ONLY state, which is what makes a dropped step a real no-reference request.
+        references_per_sample: The CURRENT run's ``h3.references_per_sample``. Compared against the
+            payload's persisted ``has_references`` (#31 finding 2), ONE-DIRECTIONALLY: a
+            ``has_references=False`` cache read at ``references_per_sample >= 1`` is REFUSED — the
+            run would resolve and pack real reference-latent rows against a text presentation that
+            describes none of them (e.g. a Ref2VA root re-preprocessed at 0 slots and then resumed
+            at 2 without a re-encode). The mirror (``has_references=True`` read at
+            ``references_per_sample == 0``) is NOT an error — it is how a no-reference train stays
+            able to reuse an existing Ref2VA cache (see the module docstring).
 
     Returns:
         ``(hidden_states, vision_spans)``. ``vision_spans`` is ``()`` on a dropped step.
@@ -200,6 +248,44 @@ def read_h3_text_state(
             f"version {H3_TEXT_PAYLOAD_VERSION}. Re-encode — a text-conditioning format is not "
             f"forward- or backward-compatible by accident, and reading the fields that happen to "
             f"match is how a stale cache trains a run that reports success."
+        )
+
+    # (#31 finding 2) THE REGIME CROSS-CHECK — persisted at write time, checked here against the
+    # CURRENT run's slot count. Independent of `reference_dropped` (which only selects a per-STEP
+    # presentation): this catches a cache whose SAMPLE was encoded under a different
+    # `references_per_sample` regime than the one training now, e.g. a Ref2VA root
+    # re-preprocessed at 0 slots and then resumed at 2 without a re-encode.
+    #
+    # ONE-DIRECTIONAL, deliberately: refuse ``has_references=False`` when ``references_per_sample
+    # >= 1`` (the run WILL resolve and pack real reference-latent rows against a text presentation
+    # that describes none — the measured failure above). The MIRROR is NOT an error — a
+    # ``references_per_sample == 0`` run always forces ``reference_dropped=True`` (see
+    # ``H3RefStrategy.prepare_training_inputs``'s ``dropped or no_reference``) and therefore always
+    # selects the PROMPT-ONLY key regardless of ``has_references``; reading only the prompt-only
+    # half of an otherwise reference-bearing cache is the documented, tested way a NO-REFERENCE
+    # train stays able to reuse an existing Ref2VA cache (module docstring, "keeps a REF-BEARING
+    # cache consumable by a no-reference train") — no reference-latent row is ever packed at 0
+    # slots, so there is no regime for that direction to clash with.
+    has_references = payload.get(H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY)
+    if not isinstance(has_references, bool):
+        raise ValueError(
+            f"[h3-text-payload] the h3_conditions payload declares no boolean "
+            f"{H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY!r} (keys: {sorted(payload)}), despite declaring "
+            f"version {H3_TEXT_PAYLOAD_VERSION}. Every version-{H3_TEXT_PAYLOAD_VERSION} payload "
+            f"`build_h3_text_payload` writes carries this field; a version-3 payload without it is "
+            f"malformed, not merely stale — re-encode."
+        )
+    if references_per_sample >= 1 and not has_references:
+        raise ValueError(
+            f"[h3-text-payload] regime mismatch: this cache was encoded with "
+            f"{H3_TEXT_PAYLOAD_HAS_REFERENCES_KEY}=False (a NO-REFERENCE sample — no vision "
+            f"blocks describing any reference), but the current run declares "
+            f"references_per_sample={references_per_sample}, which resolves and packs "
+            f"{references_per_sample} real reference-latent row(s) per sample. Reading through "
+            f"this mismatch would pack reference latents against a text presentation that "
+            f"describes none of them — no shape error, an ordinary loss curve, and a regime that "
+            f"exists nowhere at inference. Re-run `--mode preprocess` against this output root at "
+            f"the current references_per_sample before training."
         )
 
     key = H3_TEXT_PAYLOAD_PROMPT_ONLY_KEY if reference_dropped else H3_TEXT_PAYLOAD_STATE_KEY

@@ -474,6 +474,12 @@ def _extract_reported_rows(message: str) -> str:
 def test_a_reference_free_h3_config_is_still_budget_checked() -> None:
     """The 124f no-reference t2v baseline is 37,806 rows against a 13,777 ceiling — so this is NOT a
     reference-cost problem, and an H3 config that declares no references must not skip the budget.
+
+    ``references_per_sample: 0`` (explicit, not the bare ``{}`` this test used pre-#31) is what
+    makes "no references declared" a VALID reference-free config rather than the mirror-direction
+    refusal (#31 finding 1): the block's default ``references_per_sample`` is 2 (Ref2VA), so an
+    empty ``h3: {}`` with no size lists is now the exact un-priced-corpus shape that guard exists
+    to reject, not a reference-free t2v declaration.
     """
     payload = _h3_payload(
         training_dims=[1344, 768, 124],
@@ -483,7 +489,7 @@ def test_a_reference_free_h3_config_is_still_budget_checked() -> None:
             "resolution_buckets": ["1344x768x124"],
         },
     )
-    payload["h3"] = {}  # no references declared at all
+    payload["h3"] = {"references_per_sample": 0}  # no references declared at all, EXPLICITLY
     with pytest.raises(ValidationError) as exc:
         SignetConfig.model_validate(payload)
     # Positional again: 37,806 also appears in every refusal's remedy prose as the t2v-baseline
@@ -641,3 +647,82 @@ def test_default_timestep_std_loads_fine_under_qwen_edit() -> None:
     cfg = SignetConfig.model_validate(_qwen_edit_payload())
     assert cfg.model.family == "qwen_edit"
     assert cfg.training.timestep_std == 1.0
+
+
+# ======================================================================================
+# #31 finding 1 / #39 finding 1 — the H3 schema guards this bundle adds
+# ======================================================================================
+#
+# #31 finding 1 (mirror direction): H3Config._check_no_reference_fields only ever guarded the
+# references_per_sample == 0 direction. A 1- or 2-slot config with BOTH size lists left empty
+# passed load clean, and the SignetConfig cross-field pricing arm keys on the size lists (not the
+# slot count) — so it took the "no reference corpus declared" branch and certified the layout as
+# if references_per_sample were 0, while the metered container still resolves real slots per
+# sample. This guard is asserted at the SignetConfig level (never on a bare H3Config()) because
+# H3Config's OWN default combination — references_per_sample=2, both size lists empty — is exactly
+# this shape, and that combination must stay legal on an LTX/qwen_edit config's inert, all-default
+# h3 block (test_all_default_h3_block_loads_fine_under_the_ltx_family above). A sub-model cannot
+# see model.family, so the mirror guard lives where the family is actually known to be h3.
+
+
+@pytest.mark.parametrize("slots", [1, 2])
+def test_mirror_direction_refuses_declared_slots_with_no_reference_corpus(slots: int) -> None:
+    payload = _h3_payload(h3={"references_per_sample": slots})
+    with pytest.raises(ValidationError) as exc:
+        SignetConfig.model_validate(payload)
+    msg = str(exc.value)
+    assert f"references_per_sample is {slots}" in msg
+    assert "neither" in msg and "declared" in msg, (
+        "the refusal must name that NEITHER size list was declared, not just that the config failed"
+    )
+
+
+def test_mirror_direction_does_not_fire_on_the_all_default_h3_block_under_ltx() -> None:
+    """The negative control for the guard above: family stays ltx, so the all-default h3 block
+    (references_per_sample=2, empty size lists) must NOT trip the mirror guard."""
+    cfg = SignetConfig.model_validate(_ltx_payload())
+    assert cfg.model.family == "ltx"
+    assert cfg.h3.references_per_sample == 2
+    assert cfg.h3.character_reference_sizes == []
+
+
+def test_single_control_one_slot_needs_only_a_character_reference() -> None:
+    """A 1-slot config declaring ONLY character_reference_sizes is a legitimate single-control
+    task and must load — the mirror guard only refuses BOTH lists empty, never one of them."""
+    payload = _h3_payload(
+        h3={
+            "references_per_sample": 1,
+            "character_reference_sizes": [CHARACTER_REFS[0]],
+            "environment_reference_sizes": [],
+        }
+    )
+    cfg = SignetConfig.model_validate(payload)
+    assert cfg.h3.references_per_sample == 1
+
+
+# #39 finding 1: an environment reference SUBSTITUTES for the LAST character slot (h3_ref.py's own
+# rule), so it needs >= 2 total slots to have a character slot to substitute for.
+# `resolve_reference_slots` / `H3RefStrategy._resolve_slots` both refuse any environment-bearing
+# sample at 1 slot by construction; this guard closes the matching config-load hole so the priced
+# domain (h3_reference_pairing_domain) can never be asked about a pair the runtime cannot produce.
+
+
+def test_environment_references_below_two_slots_are_refused() -> None:
+    with pytest.raises(ValidationError) as exc:
+        H3Config(references_per_sample=1, environment_reference_sizes=[(1344, 768)])
+    msg = str(exc.value)
+    assert "invalid references_per_sample 1" in msg
+    assert "SUBSTITUTES" in msg and "at least 2" in msg, (
+        "the message must reuse resolve_reference_slots' own wording (conditioning/h3_ref.py) so "
+        "the local and runtime refusals read identically"
+    )
+
+
+def test_environment_references_at_two_slots_are_fine() -> None:
+    h3 = H3Config(
+        references_per_sample=2,
+        character_reference_sizes=list(CHARACTER_REFS),
+        environment_reference_sizes=[(1344, 768)],
+    )
+    assert h3.references_per_sample == 2
+    assert len(h3.environment_reference_sizes) == 1

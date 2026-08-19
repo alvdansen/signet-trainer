@@ -349,6 +349,26 @@ def test_unlabelled_reference_tuples_still_work() -> None:
     assert label == "C+E3"
 
 
+def test_environment_leg_is_skipped_below_two_slots() -> None:
+    """#39 finding 1 / step 2: an environment reference SUBSTITUTES for the LAST character slot
+    (h3_ref.py's own rule), so it needs >= 2 total slots to have a character slot to substitute
+    for. Before this fix, at references_per_sample == 1, itertools.combinations(characters, 0)
+    yielded the single empty combo, so `pair = (env,)` had length 1 -- which EQUALS
+    references_per_sample and sailed past the length invariant even though no such sample is
+    resolvable (resolve_reference_slots / H3RefStrategy._resolve_slots refuse it by construction).
+    """
+    domain = h3_reference_pairing_domain(CHARACTER_REFS, ENVIRONMENT_REFS, references_per_sample=1)
+    # Character-only leg: C(3, 1) = 3 single-character entries. NO environment-bearing entry.
+    assert len(domain) == 3
+    environment_labels = {env[2] for env in ENVIRONMENT_REFS}
+    for label, pair in domain:
+        assert len(pair) == 1
+        assert pair[0].label not in environment_labels, (
+            f"pair {label!r} carries an environment-only reference at 1 slot -- exactly the "
+            f"phantom pair the runtime can never resolve"
+        )
+
+
 @pytest.mark.parametrize("references_per_sample", [0, -1, 4])
 def test_an_out_of_range_slot_count_is_a_caller_bug(references_per_sample: int) -> None:
     """The slot count is FIXED at 2 by operator ruling; 0/negative or more slots than characters
