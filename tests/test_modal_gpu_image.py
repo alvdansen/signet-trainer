@@ -43,7 +43,12 @@ _APP = _SRC / "app.py"
 #: ``pydantic==1.10.13`` instead. Adding it is a widening of the ALLOWLIST, not of the RULE — the
 #: rule ("a gpu= function must name one of these") is unchanged, and the companion test below still
 #: requires every name here to be a real module-level image in app.py, so a typo cannot buy a pass.
-_KNOWN_GPU_IMAGES = ("gpu_image", "h3_gpu_image", "qwen_gpu_image", "wan_musubi_image")
+#: ⚠ WIDENED again for LTX-2.5 Stage 1 (issue #53). ``ltx25_gpu_image`` is NOT a new family — it is
+#: a second GENERATION of the same ``ltx`` family, built as a PARALLEL image (LTX25_STAGE1_DESIGN.md
+#: §0/§3): ``model.family`` stays ``"ltx"`` for both 2.3 and 2.5, and the discriminator that selects
+#: this image is ``model.ltx_generation``, read at the entrypoint dispatch (never sniffed from the
+#: checkpoint — the image graph builds at module-import time, before any GPU container exists).
+_KNOWN_GPU_IMAGES = ("gpu_image", "h3_gpu_image", "qwen_gpu_image", "wan_musubi_image", "ltx25_gpu_image")
 
 # Each @app.function(...) decorator paired with its function name. The decorators contain no nested
 # parens (only {}/[] for volumes/secrets), so a non-greedy match to the first ')' is safe.
@@ -274,3 +279,108 @@ def h3_stage() -> str:
     ...
 '''
     assert _offenders(synthetic) == []
+
+
+# --------------------------------------------------------------------------------------------------
+# LTX-2.5 Stage 1 (issue #53) — ltx25_gpu_image pins + positive control.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_positive_control_ltx25_image_is_accepted() -> None:
+    """A GPU function declaring the LTX-2.5 image must NOT be flagged (issue #53 Stage 1)."""
+    synthetic = '''
+@app.function(
+    gpu="A100-80GB",
+    image=ltx25_gpu_image,
+    volumes={"/weights": weights_vol},
+)
+def ltx25_stage() -> str:
+    ...
+'''
+    assert _offenders(synthetic) == []
+
+
+def test_ltx25_commit_sha_is_a_literal_40_hex_sha_never_main() -> None:
+    """Supply-chain: ``LTX25_COMMIT_SHA`` is a literal 40-hex SHA, never ``main`` — the SAME
+    D-10-PIN discipline as ``LTX2_COMMIT_SHA``, and the design's explicit "do not touch
+    LTX2_COMMIT_SHA / gpu_image for this bump" guarantee (LTX25_STAGE1_DESIGN.md §11 #1)."""
+    src = _APP.read_text(encoding="utf-8")
+
+    sha = re.search(r'^LTX25_COMMIT_SHA = "([0-9a-f]{40})"$', src, re.MULTILINE)
+    assert sha, "LTX25_COMMIT_SHA must be a literal 40-hex commit SHA assigned at module scope"
+    # The v1.2.0 tag this design cites, verified live against the upstream clone.
+    assert sha.group(1) == "d151147788a9284cca791edc6ce898007e727fe6"
+
+    pin = re.search(
+        r"git checkout (?:\{LTX25_COMMIT_SHA\}|[0-9a-f]{40})",
+        src,
+    )
+    assert pin, "the ltx25_gpu_image checkout must be pinned to LTX25_COMMIT_SHA (or a literal SHA)"
+
+    installs = [line for line in re.sub(r"#.*", "", src).splitlines() if "/opt/LTX-25" in line]
+    assert installs, "the /opt/LTX-25 clone/checkout lines vanished — the scan is broken"
+    assert not any("main" in line for line in installs), (
+        "ltx25_gpu_image must never checkout `main` — the tri-family D-10-PIN discipline"
+    )
+
+    # Byte-identity guarantee #1 (LTX25_STAGE1_DESIGN.md §11): LTX2_COMMIT_SHA / gpu_image untouched.
+    assert re.search(r'^LTX2_COMMIT_SHA = "d6053703e00195bc668cbd1d5eda9dc0b2e7b74a"$', src, re.MULTILINE)
+
+
+def test_ltx25_transformers_pin_is_a_literal_version_in_upstream_window() -> None:
+    """``transformers`` is pinned EXACTLY on ltx25_gpu_image, inside the v1.2.0 upstream window
+    ``>=5.8.0,<5.15`` (LTX25_UPSTREAM_DIFF.md §B) — a static string-compare, cheap insurance
+    against a future edit silently drifting the literal outside that window."""
+    src = _APP.read_text(encoding="utf-8")
+
+    version = re.search(r'^LTX25_TRANSFORMERS_VERSION = "([0-9][0-9A-Za-z.\-]*)"$', src, re.MULTILINE)
+    assert version, (
+        "LTX25_TRANSFORMERS_VERSION must be a literal version assigned at module scope, the same "
+        "single-source-of-truth shape as TRANSFORMERS_VERSION / QWEN_TRANSFORMERS_VERSION"
+    )
+    parts = tuple(int(p) for p in version.group(1).split(".")[:2])
+    assert (5, 8) <= parts < (5, 15), (
+        f"LTX25_TRANSFORMERS_VERSION {version.group(1)!r} must parse inside the upstream window "
+        f">=5.8.0,<5.15 (transformers>=5.15 breaks Gemma-4 config attribute access per the inline "
+        f"upstream comment cited in LTX25_UPSTREAM_DIFF.md §B)"
+    )
+
+    assert re.search(r"transformers==\{LTX25_TRANSFORMERS_VERSION\}", src), (
+        "the ltx25_gpu_image install must pin transformers to LTX25_TRANSFORMERS_VERSION with "
+        "`==`, interpolated rather than restated"
+    )
+    installs = [
+        line for line in re.sub(r"#.*", "", src).splitlines() if "transformers" in line and "LTX25" in line
+    ]
+    assert installs or re.search(r"transformers==\{LTX25_TRANSFORMERS_VERSION\}", src)
+
+
+def test_ltx25_gpu_image_shares_the_tri_family_torch_line() -> None:
+    """Structural proof of §0/§3's "same torch line, no confound" claim: regex-extract the
+    ``torch~=``/``torchvision~=`` literal from both ``gpu_image`` and ``ltx25_gpu_image``'s
+    ``run_commands`` strings and assert they are equal."""
+    src = _APP.read_text(encoding="utf-8")
+
+    torch_lines = re.findall(r"'torch~=[^']+' '[^']+'", src)
+    assert len(torch_lines) >= 2, "expected at least two torch pin lines (gpu_image + ltx25_gpu_image)"
+    assert len(set(torch_lines)) == 1, (
+        f"every GPU image's torch/torchvision pin must be byte-identical (no per-family/generation "
+        f"torch confound) — found distinct pins: {set(torch_lines)}"
+    )
+
+
+def test_ltx25_gpu_image_does_not_install_ltx_pipelines() -> None:
+    """Stage 1 is train-only (§9 non-goal: no sampling/rendering) — ``ltx-pipelines`` (home of
+    ``ICLoraPipeline``/``TI2VidTwoStagesPipeline``) must not be installed on this image."""
+    src = _APP.read_text(encoding="utf-8")
+    # Isolate the ltx25_gpu_image block so a match against gpu_image's own (separately-scoped)
+    # ltx-pipelines install (D-DEPTH-1's two-stage upscaler toggle) cannot leak a false pass.
+    start = src.index("ltx25_gpu_image = (")
+    end = src.index("\n\n", src.index("h3_gpu_image = ("))
+    # Strip line comments first (this test file's OWN prose above mentions "ltx-pipelines" by
+    # name, same reason every other pin-format test here strips comments before scanning).
+    block = re.sub(r"#.*", "", src[start:end])
+    assert "ltx-pipelines" not in block, (
+        "ltx25_gpu_image must not install ltx-pipelines — Stage 1 is train-only and nothing in it "
+        "imports ltx_pipelines (ICLoraPipeline/TI2VidTwoStagesPipeline are Stage-2/inference scope)"
+    )

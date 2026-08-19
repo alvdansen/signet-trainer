@@ -52,6 +52,28 @@ def refusals(config: Any) -> list[str]:
             f"model.family={fam!r}: local beta supports ONLY the {SUPPORTED_FAMILY!r} family. "
             f"The h3/qwen local paths are roadmap items -- {ROADMAP_ISSUE}"
         )
+    # issue #53 (LTX25_STAGE1_DESIGN.md) -- a loud pointer to Stage 3, not a silent half-run. Stage
+    # 1 is Modal-only (ltx25_gpu_image / ltx25_train); this module still imports the UNMODIFIED
+    # load_ltxv_components / run_validation_gate (2.3-only: EXPECTED_* constants, the 6-check gate)
+    # and would otherwise load a split-layout 2.5 checkpoint through the wrong loader and arch gate.
+    # A PLAIN `if`, not `elif` off the family check above: `fam != SUPPORTED_FAMILY` (e.g. a
+    # family="h3" config) must not swallow this refusal -- refusals() collects every applicable
+    # reason, it does not stop at the first (test_refusal_survives_alongside_family_refusal).
+    # `family == SUPPORTED_FAMILY` already passed for a 2.5 config on its own (family stays "ltx"
+    # for both generations, LTX25_STAGE1_DESIGN.md §0) -- so without this check a 2.5 config would
+    # sail past every refusal above and crash cryptically deep inside a multi-GB load, on the
+    # operator's own workstation. `getattr(..., "2.3")` is defensive only: the field always
+    # exists post-Stage-1; the default keeps this refusal inert for a config from before this
+    # field existed.
+    if getattr(config.model, "ltx_generation", "2.3") != "2.3":
+        out.append(
+            f"model.ltx_generation={config.model.ltx_generation!r}: local beta supports ONLY "
+            "ltx_generation '2.3'. LTX-2.5 Stage 1 is Modal-only (ltx25_gpu_image / ltx25_train) "
+            "-- the local runner still imports the UNMODIFIED, 2.3-only load_ltxv_components / "
+            "run_validation_gate and would otherwise load a split-layout 2.5 checkpoint through "
+            "the wrong loader and arch gate. Local LTX-2.5 support is Stage 3 (48GB-class "
+            f"workstations, likely int8-quanto/deep-swap territory) -- {ROADMAP_ISSUE} / issue #53."
+        )
     mode = config.conditioning.mode
     if mode not in SUPPORTED_CONDITIONING_MODES:
         out.append(

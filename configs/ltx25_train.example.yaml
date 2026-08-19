@@ -1,0 +1,99 @@
+# Example LTX-2.5 Stage 1 LoRA run config (issue #53 / LTX25_STAGE1_DESIGN.md).
+#
+# ⚠⚠ HONESTY: this is a PLACEHOLDER shape, not a validated recipe. No real LTX-2.5 checkpoint has
+# been downloaded or read by this repo (D3 is still open — an operator decision, issue #53). The
+# model_id / text_encoder_id / ltx25.* filenames below are illustrative; replace them with the real
+# gated checkpoint's filenames once D3 resolves. training_dims / lora / training values are carried
+# over from the validated LTX-2.3 recipe (configs/ltx23_lora.example.yaml) as a STARTING POINT — the
+# metadata-driven arch gate (models.ltx25_loader.read_ltx25_checkpoint_metadata) will RECORD the
+# real architecture facts once a real checkpoint is mounted; nothing here asserts them.
+#
+# --mode preprocess / --mode train route to ltx25_preprocess / ltx25_train (issue #53 Stage 1).
+# --mode sample and --mode fuse are REFUSED for this config (Stage 2+ scope) — see
+# config/mode_gate.py.
+training_dims: [768, 352, 25]
+
+model:
+  # Replace with the real LTX-2.5 checkpoint filename once downloaded under WEIGHTS_DIR (D3).
+  model_id: ltx-2.5-22b-dev.safetensors
+  # Gemma-4 root under WEIGHTS_DIR — no new schema field: model.text_encoder_id doubles as the
+  # Gemma-4 root for a 2.5 config (LTX25_STAGE1_DESIGN.md §1).
+  text_encoder_id: gemma-4-12b-it
+  ltx_generation: "2.5"
+
+# ltx25: demonstrates BOTH checkpoint_layout values in comments — pick ONE.
+#
+# Monolith (the LTX-2.3 shape — transformer + VAE + audio VAE packed together): leave this block
+# entirely unset (all-default), exactly like a 2.3 config.
+#
+# Split (a transformer-only file; VAE/audio-VAE live in separate files):
+# ltx25:
+#   checkpoint_layout: split
+#   video_vae_path: ltx25_video_vae.safetensors
+#   audio_vae_path: ltx25_audio_vae.safetensors   # forward-declared; Stage 1 does not read it
+
+data:
+  preprocessed_data_root: /data/preprocessed_ltx25/my_subject
+  num_dataloader_workers: 2
+  batch_size: 1
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - attn1.to_q
+    - attn1.to_k
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_q
+    - attn2.to_k
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training:
+  max_steps: 100
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  optimizer: adamw8bit
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+  uniform_prob: 0.30
+  scheduler: cosine_with_min_lr
+  min_lr_ratio: 0.01
+  warmup_steps: 0
+  checkpoint_every: 200
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+
+offload:
+  blocks_to_swap: 0
+
+modal:
+  hourly_rate_usd: 1.64      # [ASSUMED] A100-80GB guardrail; confirm vs live Modal pricing
+  cost_guardrail_usd: 60.0
+  est_hours: 2.0
+  huggingface_secret_name: my-huggingface-secret
+  wandb_secret_name: my-wandb-secret
+
+validation:
+  # in_loop_sampling / two_stage_upscale MUST stay at their default False for ltx_generation: "2.5"
+  # (Stage 2+ scope — SignetConfig._cross_field_checks refuses True for either).
+  interval: 250
+  prompts:
+    - "a portrait of my subject, cinematic lighting"
+  frame_count: 25
+  guidance_scale: 3.0
+  num_samples: 1
+  seed: 42
+
+conditioning:
+  mode: none   # ic_lora / inpaint / audio_to_video are out of Stage-1 scope for LTX-2.5 (§9)
+
+seed: 42
+output_dir: outputs/ltx25_train_example

@@ -34,6 +34,7 @@ from signet_trainer.modal.app import (
     gpu_image,
     h3_gpu_image,
     huggingface_secret,
+    ltx25_gpu_image,
     qwen_gpu_image,
     wan_musubi_image,
     wandb_secret,
@@ -310,6 +311,119 @@ def preprocess(
 
     # Pitfall 3 commit-or-vanish: without commit() the encoded output_dir is lost on container
     # exit and `modal volume ls signe-trainer-dataset` would show nothing.
+    dataset_vol.commit()
+
+    return output_dir
+
+
+@app.function(
+    # Same GPU class as the 2.3 preprocess arm (22B LoRA fits A100-80GB); ltx25_gpu_image carries
+    # the v1.2.0 pin (LTX25_COMMIT_SHA) instead of gpu_image's LTX2_COMMIT_SHA (issue #53 Stage 1).
+    gpu="A100-80GB",
+    image=ltx25_gpu_image,
+    volumes={**WEIGHTS_MOUNT, **DATASET_MOUNT},
+    secrets=[huggingface_secret],
+    timeout=TWENTY_FOUR_HOURS,
+)
+def ltx25_preprocess(
+    metadata_path: str = str(DATASET_DIR / "fresh" / "metadata.jsonl"),
+    resolution_buckets: list = [(25, 352, 768), (49, 352, 768), (81, 352, 768)],  # noqa: B006
+    output_dir: str = str(DATASET_DIR / ".precomputed_ltx25"),
+    model_id: str = "ltx-2.5-22b-dev.safetensors",
+    gemma_root: str = "gemma-4-12b-it",
+    video_vae_path: str | None = None,
+    audio_vae_path: str | None = None,
+    overwrite: bool = False,
+) -> str:
+    """LTX-2.5 Stage 1 (issue #53) — the canonical pre-encode, running upstream's OWN v1.2.0
+    ``process_dataset.py``/``process_captions.py`` (from ``/opt/LTX-25``, NOT ``/opt/LTX-2``) with
+    a Gemma-4 text-encode path. Mirrors ``preprocess()`` almost verbatim (LTX25_STAGE1_DESIGN.md
+    §5 — "run the CANONICAL path, don't hand-port it") with three deltas:
+
+        1. ``sys.path`` points at ``/opt/LTX-25``'s scripts dir, not ``/opt/LTX-2``'s.
+        2. ``model_id``/``gemma_root`` resolve the 2.5 checkpoint / Gemma-4 root (threaded by the
+           entrypoint from ``cfg.model.model_id``/``cfg.model.text_encoder_id`` — the defaults
+           here are standalone-call placeholders, mirrored in shape from ``preprocess()``'s own
+           literal defaults, never the value an entrypoint dispatch actually threads);
+           ``video_vae_path``/``audio_vae_path`` thread straight into upstream's OWN
+           ``preprocess_dataset(video_vae_path=, audio_vae_path=)`` kwargs — [v1.2.0 verified] the
+           canonical script gained these itself, so this wrapper only passes them through, no
+           reimplementation.
+        3. After the canonical encode, STRICTLY BEFORE ``dataset_vol.commit()``, write
+           ``PROVENANCE.json`` (``data/cache_provenance.write_provenance`` — see that function's
+           own docstring for why the ORDER is load-bearing: writing after ``commit()`` would
+           vanish with the container, refuter MUST-CHANGE HIGH).
+
+    Mixed-dir refusal (refuter MUST-FIX, HIGH): a non-empty ``output_dir`` lacking MATCHING
+    provenance is refused BEFORE any encode call, unless ``overwrite=True`` forces a full
+    re-encode — see ``data/cache_provenance.assert_output_dir_ready_for_ltx25_encode``'s own
+    docstring for the exact silent-corruption case this closes (an incremental encode into a
+    stale 2.3/Gemma-3 — or different-Gemma-root — dir would silently skip its old items while
+    ``write_provenance`` stamped the WHOLE root ``'2.5'``, certifying a mixed cache as clean).
+
+    Also runs the header-only VAE-compression self-check (``models.ltx25_loader.
+    assert_ltx25_vae_compression``) before any encode spend, so a checkpoint whose real VAE
+    compression differs from the ``(8, 32, 32)`` every resolution bucket was validated against is
+    caught before the FIRST bucket is encoded, not merely before training starts.
+
+    a2v / ic_lora reference-latent encoding are OUT OF SCOPE for Stage 1 (LTX25_STAGE1_DESIGN.md
+    §9) — unlike ``preprocess()`` this fn takes no ``with_audio``/``reference_column`` args at all.
+
+    HONESTY (D3 open): this runs the SAME canonical script ``preprocess()`` does, against a NEW
+    pin (``LTX25_COMMIT_SHA``) — it has not been exercised against a real LTX-2.5/Gemma-4
+    checkpoint or GPU.
+    """
+    from signet_trainer.data.cache_provenance import (  # noqa: PLC0415
+        assert_output_dir_ready_for_ltx25_encode,
+        write_provenance,
+    )
+    from signet_trainer.models.ltx25_loader import assert_ltx25_vae_compression  # noqa: PLC0415
+
+    checkpoint_path = str(WEIGHTS_DIR / model_id)
+    text_encoder_path = str(WEIGHTS_DIR / gemma_root)
+
+    # Mixed-cache refusal FIRST — before any GPU work, before the VAE check, before the encode.
+    assert_output_dir_ready_for_ltx25_encode(
+        output_dir, gemma_root=gemma_root, overwrite=overwrite
+    )
+
+    assert_ltx25_vae_compression(checkpoint_path, video_vae_path)
+
+    import sys  # noqa: PLC0415
+
+    # Pitfall 2 sibling-import shim (mirrors preprocess()): process_dataset.py imports its siblings
+    # by BARE name, so its scripts/ dir must be on sys.path before the import. /opt/LTX-25, NOT
+    # /opt/LTX-2 — the v1.2.0 checkout this image built (delta 1).
+    sys.path.insert(0, "/opt/LTX-25/packages/ltx-trainer/scripts")
+    from process_dataset import preprocess_dataset  # noqa: PLC0415
+
+    preprocess_dataset(
+        dataset_file=metadata_path,
+        caption_column="caption",
+        video_column="media_path",
+        resolution_buckets=resolution_buckets,
+        batch_size=1,  # multi-bucket REQUIRES batch_size=1 (per-sample shapes differ).
+        output_dir=output_dir,
+        lora_trigger=None,
+        vae_tiling=True,
+        decode=False,
+        model_path=checkpoint_path,
+        text_encoder_path=text_encoder_path,
+        device="cuda",
+        with_audio=False,  # a2v-on-2.5 is out of scope (§9)
+        overwrite=overwrite,
+        reference_column=None,  # ic_lora-on-2.5 is out of scope (§9)
+        reference_downscale_factor=1,
+        # [v1.2.0 verified] the split-layout kwargs preprocess_dataset gained upstream (delta 2) —
+        # None on both keeps a monolith checkpoint's encode byte-identical to omitting them.
+        video_vae_path=video_vae_path,
+        audio_vae_path=audio_vae_path,
+    )
+
+    # Pitfall 3 commit-or-vanish, applied to write_provenance TOO (refuter MUST-CHANGE, HIGH):
+    # write BEFORE dataset_vol.commit(), never after — see write_provenance's own docstring.
+    write_provenance(output_dir, ltx_generation="2.5", gemma_root=gemma_root)
+
     dataset_vol.commit()
 
     return output_dir
@@ -927,6 +1041,215 @@ def train(config_yaml: str) -> None:
     print(
         f"[train] done — reached step {final_step}/{config.training.max_steps}; final checkpoint "
         f"committed to signe-trainer-checkpoints under {config.output_dir}/ (commit-or-vanish)."
+    )
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=ltx25_gpu_image,  # v1.2.0 pin (LTX25_COMMIT_SHA) — NOT gpu_image (issue #53 Stage 1).
+    volumes={**WEIGHTS_MOUNT, **DATASET_MOUNT, **CHECKPOINTS_MOUNT},
+    secrets=[huggingface_secret, wandb_secret],
+    timeout=TWENTY_FOUR_HOURS,
+    # Same preemption contract as `train` (F9, 2026-07-12) — this arm resumes in-dir from the
+    # latest committed checkpoint via the SAME CheckpointManager.resume path and commits per save,
+    # so a retry can never observe a half-written checkpoint.
+    retries=modal.Retries(max_retries=10, initial_delay=60.0, backoff_coefficient=2.0),
+    single_use_containers=True,
+)
+def ltx25_train(config_yaml: str) -> None:
+    """LTX-2.5 Stage 1 (issue #53) — the gated LTX-2.5 LoRA training run. Never auto-launched.
+
+    Mirrors ``train()`` structurally (LTX25_STAGE1_DESIGN.md §7): cold-path import probe -> load
+    config -> mode-gate refusal -> ``assert_cache_provenance`` -> ``load_ltx25_components`` ->
+    the metadata-driven arch gate (record, don't compare — §4.3/§4.2) -> LoRA injection ->
+    ``PrecomputedDataset`` -> ``train_loop``. Three DELIBERATE deviations from ``train()``, each
+    named rather than silently absent:
+
+      1. **No Gemma load at all** — not even the "load for the gate's hidden_size read, then
+         free" two-phase dance ``train()`` runs. Stage 1's metadata gate reads the CHECKPOINT's
+         own embedded config (``read_ltx25_checkpoint_metadata``), never Gemma's, and training
+         reads precomputed text conditions and never calls Gemma either — so
+         ``load_ltx25_components(..., with_text_encoder=False)``, and there is nothing to free.
+      2. **The 6-check architecture validation gate is DELIBERATELY NOT RUN.**
+         ``train/validate_gate.py::run_validation_gate``'s constants (``EXPECTED_NUM_BLOCKS`` /
+         ``EXPECTED_HIDDEN_DIM`` / …) are 2.3-only (LTX25_STAGE1_DESIGN.md §4.3/§11 #3 — no
+         ``_25`` suffix constant exists), and its check-#4-FAIL fallback branch
+         (``use_builder`` -> ``ltx_trainer.model_builder`` / wrong ``SingleGPUModelBuilder``
+         kwargs) is a confirmed PRE-EXISTING, pin-independent bug (LTX25_UPSTREAM_DIFF.md §A,
+         issue #53 D4 — deferred, not fixed here). Running the 2.3 gate against a 2.5 checkpoint
+         would assert wrong constants and risk tripping straight into that broken fallback. This
+         is an ACKNOWLEDGED Stage-1 coverage gap: the adapter-roundtrip proof (checks #5/#6) and
+         the forward-pass smoke (check #4) have NO 2.5 replacement in Stage 1. LoRA is injected
+         directly below instead of reusing a gate-built adapter.
+      3. **No in-loop validation sampling.** Refused twice already before this function is ever
+         reached: at config load (``validation.in_loop_sampling`` guard, ``SignetConfig.
+         _cross_field_checks``) and by ``load_ltx25_components`` itself (raises on
+         ``with_video_vae_decoder=True``) — so there is no ``_in_loop`` branch to mirror here.
+
+    HONESTY (D3 open): the metadata gate RECORDS observed values; it does not assert them against
+    any ``EXPECTED_*_25`` constant, because none exists — no real LTX-2.5 checkpoint has been read
+    by this repo. This function has not been exercised against real weights or a real GPU.
+    """
+    import torch  # noqa: PLC0415
+
+    # ── (1) COLD-PATH IMPORT PROBE — same shape as train()'s, before any model load ──────────────
+    try:
+        import bitsandbytes as bnb  # noqa: PLC0415
+        import peft  # noqa: PLC0415
+        import wandb  # noqa: PLC0415
+    except ImportError as exc:
+        raise RuntimeError(
+            f"[ltx25_train] cold-path dependency missing ({exc.name!r}). The ltx25_gpu_image must "
+            "carry peft / bitsandbytes / wandb before any sustained GPU spend."
+        ) from exc
+    print(
+        f"[ltx25_train] cold-path imports OK — peft={peft.__version__} "
+        f"bitsandbytes={getattr(bnb, '__version__', '?')} wandb={wandb.__version__}"
+    )
+
+    from signet_trainer.config.load import load_config_from_text  # noqa: PLC0415
+    from signet_trainer.config.mode_gate import validate_mode_config  # noqa: PLC0415
+    from signet_trainer.data.cache_provenance import assert_cache_provenance  # noqa: PLC0415
+    from signet_trainer.data.precomputed import PrecomputedDataset  # noqa: PLC0415
+    from signet_trainer.lora.peft import (  # noqa: PLC0415
+        P1_FF_LORA_TARGETS,
+        build_lora_config,
+        inject_lora,
+    )
+    from signet_trainer.models.ltx25_loader import (  # noqa: PLC0415
+        assert_ltx25_vae_compression,
+        load_ltx25_components,
+        read_ltx25_checkpoint_metadata,
+    )
+    from signet_trainer.offload.block_swap import BlockSwapOffloader  # noqa: PLC0415
+    from signet_trainer.train.checkpoint import CheckpointManager  # noqa: PLC0415
+    from signet_trainer.train.flow_match import FlowMatchingSchedule  # noqa: PLC0415
+    from signet_trainer.train.loop import (  # noqa: PLC0415
+        build_optimizer,
+        build_scheduler,
+        should_warm_start,
+        train_loop,
+    )
+
+    # ── (2) load + revalidate the config in-container ────────────────────────────────────────────
+    config = load_config_from_text(config_yaml)
+
+    # Fail-fast defence-in-depth (WR-04) — the free gates already refuse this pre-dispatch; kept
+    # here in case this fn is ever reached by a path that bypasses them.
+    validate_mode_config(config, "train")
+
+    if config.model.family != "ltx" or config.model.ltx_generation != "2.5":
+        raise RuntimeError(
+            f"[ltx25_train] refuses model.family={config.model.family!r} / "
+            f"model.ltx_generation={config.model.ltx_generation!r}: this fn is dispatched ONLY "
+            "for family=='ltx' + ltx_generation=='2.5' — reaching it otherwise means the "
+            "entrypoint's dispatch condition and this guard have drifted apart."
+        )
+    if config.conditioning.mode not in ("none", "single_frame", "multi_frame"):
+        raise RuntimeError(
+            f"[ltx25_train] conditioning.mode={config.conditioning.mode!r} is out of Stage-1 "
+            "scope (issue #53 §9 — ic_lora/inpaint/audio_to_video-on-2.5 are not implemented by "
+            "this PR). Use ltx_generation: '2.3' for those modes, or file an issue for Stage 2+."
+        )
+
+    checkpoint_path = str(WEIGHTS_DIR / config.model.model_id)
+    text_encoder_path = str(WEIGHTS_DIR / config.model.text_encoder_id)
+
+    # ── (2b) cache provenance — refuse a generation/Gemma-root mismatch BEFORE any GPU spend ─────
+    assert_cache_provenance(
+        config.data.preprocessed_data_root,
+        configured_generation=config.model.ltx_generation,
+        configured_gemma_root=config.model.text_encoder_id,
+    )
+
+    # ── (3) the metadata-driven arch gate — record + self-consistency ONLY, before any load ──────
+    # Header-only (no tensor materialization) — cheap, mirrors train/validate_gate.py's own
+    # header-only pattern. Fires BEFORE load_ltx25_components mounts the checkpoint.
+    read_ltx25_checkpoint_metadata(checkpoint_path)
+    assert_ltx25_vae_compression(checkpoint_path, config.ltx25.video_vae_path)
+
+    # ── (4) load LTX-2.5 components — no Gemma (deviation #1 above) ──────────────────────────────
+    device = "cuda"
+    components = load_ltx25_components(
+        checkpoint_path=checkpoint_path,
+        text_encoder_path=text_encoder_path,
+        device=device,
+        video_vae_path=config.ltx25.video_vae_path,
+        audio_vae_path=config.ltx25.audio_vae_path,
+        with_video_vae_decoder=False,  # in-loop sampling refused above (deviation #3)
+        with_text_encoder=False,  # never needed — precomputed conditions only (deviation #1)
+    )
+
+    # ── (5) LoRA injection — DIRECT, no gate-built adapter to reuse (deviation #2) ────────────────
+    lora_config = build_lora_config(
+        rank=config.lora.rank,
+        alpha=config.lora.alpha,
+        dropout=config.lora.dropout,
+        targets=config.lora.target_modules or P1_FF_LORA_TARGETS,
+    )
+    model = inject_lora(
+        components.transformer,
+        lora_config,
+        gradient_checkpointing=config.training.gradient_checkpointing,
+    )
+
+    block_list = None
+    for attr in ("transformer_blocks", "blocks"):
+        block_list = getattr(components.transformer, attr, None)
+        if block_list is not None:
+            break
+    if block_list is None:
+        raise RuntimeError(
+            "[ltx25_train] could not locate the transformer block ModuleList (tried "
+            ".transformer_blocks / .blocks) — required for the offloader."
+        )
+    BlockSwapOffloader(
+        block_list,
+        blocks_to_swap=config.offload.blocks_to_swap,
+        device=torch.device(device),
+    )
+
+    # ── (6) the loop-pure dataset over the precomputed latents ────────────────────────────────────
+    dataset = PrecomputedDataset(
+        config.data.preprocessed_data_root,
+        strict=config.data.strict_precomputed_pairing,
+    )
+
+    # ── (7) checkpoint manager + chained warm-restart cold-start branch ───────────────────────────
+    ckpt_manager = CheckpointManager(
+        CHECKPOINTS_DIR / config.output_dir, keep_n=config.training.keep_checkpoints
+    )
+    if should_warm_start(
+        ckpt_manager.find_latest() is not None, config.training.init_adapter_path
+    ):
+        from signet_trainer.lora.peft import load_adapter_into  # noqa: PLC0415
+
+        init_dir = CHECKPOINTS_DIR / config.training.init_adapter_path
+        load_adapter_into(model, init_dir)
+        print(f"[ltx25_train][chain] warm-started from {init_dir} (fresh optimizer, step 0).")
+
+    optimizer = build_optimizer(model, config)
+    scheduler = build_scheduler(optimizer, config, total_steps=config.training.max_steps)
+    schedule = FlowMatchingSchedule(
+        uniform_prob=config.training.uniform_prob, std=config.training.timestep_std
+    )
+
+    # ── (8) the step-driven loop — "done" == checkpoint-step-{max_steps} committed to the Volume ─
+    final_step = train_loop(
+        model,
+        dataset,
+        optimizer,
+        scheduler,
+        schedule,
+        ckpt_manager,
+        config,
+        checkpoints_vol,
+        on_checkpoint=None,  # no in-loop sampler (deviation #3) — nothing to fire on checkpoint.
+    )
+    print(
+        f"[ltx25_train] done — reached step {final_step}/{config.training.max_steps}; final "
+        f"checkpoint committed to signe-trainer-checkpoints under {config.output_dir}/ "
+        "(commit-or-vanish)."
     )
 
 

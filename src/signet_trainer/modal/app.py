@@ -191,6 +191,80 @@ gpu_image = (
 )
 
 # --------------------------------------------------------------------------------------------------
+# LTX-2.5 GPU-stage image (issue #53 Stage 1 / LTX25_STAGE1_DESIGN.md §3) — a PARALLEL image, built
+# fresh (NOT chained off ``gpu_image``), NOT an in-place bump of ``LTX2_COMMIT_SHA``. Recommendation
+# (E) in LTX25_UPSTREAM_DIFF.md: two upstream signature breaks (`load_embeddings_processor`'s new
+# required `gemma_model_path` arg; `ICLoraPipeline`'s path collapse into `ModelPaths`) would have to
+# be patched merely to keep the CURRENT LTX-2.3 path alive after an in-place bump, and the removed
+# `ltx_trainer.validation_sampler` module invalidates the sampling design entirely — none of that is
+# a risk worth taking with the working, validated LTX-2.3 `gpu_image` above. Mirrors the tri-family
+# pattern (`h3_gpu_image` / `qwen_gpu_image`) exactly: separate image, separate pinned SHA, explicit
+# `transformers==` pin.
+#
+# Do NOT touch `LTX2_COMMIT_SHA` / `gpu_image` above for this bump — byte-identity guarantee #1
+# (LTX25_STAGE1_DESIGN.md §11).
+# --------------------------------------------------------------------------------------------------
+
+# Pinned to the `v1.2.0` tag ("Support for LTX 2.5"), 2026-08-11 — a LITERAL SHA, never `main`
+# (the same D-10-PIN discipline as `LTX2_COMMIT_SHA` above). Bump deliberately.
+LTX25_COMMIT_SHA = "d151147788a9284cca791edc6ce898007e727fe6"
+
+# [v1.2.0 verified, LTX25_UPSTREAM_DIFF.md §B] packages/ltx-core's `transformers` pin narrowed from
+# an unbounded floor (>=4.52) to a bounded window (>=5.8.0,<5.15) — the upper bound exists because
+# transformers>=5.15 breaks Gemma-4 config attribute access (inline upstream comment). Pin a LITERAL
+# version inside that window rather than let uv float within it (the same `TRANSFORMERS_VERSION` /
+# `QWEN_TRANSFORMERS_VERSION` discipline two images up in this file). 5.14.1 REUSES the
+# already-vetted `h3_gpu_image` pin rather than inventing a third number.
+#
+# ⚠⚠ HONESTY (D3 is still open — no real LTX-2.5/Gemma-4 checkpoint has been read by this repo):
+# this reuses an EXISTING, already-vetted pin; it is NOT yet verified against a real Gemma-4
+# checkpoint load. Re-verify this exact version the day the gated Gemma-4 root is downloaded and
+# do not treat "reuses an existing pin" as "verified for 2.5."
+LTX25_TRANSFORMERS_VERSION = "5.14.1"
+
+# Build fresh (NOT chained off ``gpu_image``) — every image in this file ends with
+# ``add_local_python_source`` and Modal forbids a build step after it. Every install step comes
+# FIRST and ``add_local_python_source`` LAST, same shape as every image above.
+ltx25_gpu_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    # git for the clone below; ffmpeg for the SAME torchaudio-demux reason as gpu_image (a2v
+    # audio extraction needs the FFmpeg shared libs) — Stage 1 does not train a2v-on-2.5 (out of
+    # scope, §9), but the canonical `preprocess_dataset` script this image runs is the SAME script
+    # `preprocess` uses and shares that dependency unconditionally.
+    .apt_install("git", "ffmpeg")
+    .pip_install("uv")
+    # [LTX25_UPSTREAM_DIFF.md §B] no mandatory torch bump — ltx-core still declares torch~=2.7,
+    # ltx-trainer torch>=2.6.0 at v1.2.0. The new torch==2.13/cu132 pin is gated behind the opt-in
+    # `natten` extra; `ltx-kernels` is excluded from the default workspace. SAME literal
+    # torch/torchvision line as gpu_image/h3_gpu_image/qwen_gpu_image — no family/generation
+    # carries a torch-version confound relative to the others.
+    .run_commands(
+        "uv pip install --system --index-strategy unsafe-best-match "
+        "--extra-index-url https://download.pytorch.org/whl/cu129 'torch~=2.7' 'torchvision~=0.22'"
+    )
+    .run_commands(
+        "git clone https://github.com/Lightricks/LTX-2 /opt/LTX-25",
+        f"cd /opt/LTX-25 && git checkout {LTX25_COMMIT_SHA}",
+        # Pin transformers EXPLICITLY at the editable-install step (unlike ``gpu_image``, which lets
+        # uv resolve it transitively — a gap this bump is a good moment to close, per the gate
+        # report's Recommendation §B). ``ltx-pipelines`` is DELIBERATELY NOT installed here: Stage 1
+        # is train-only, and ``ICLoraPipeline``/``TI2VidTwoStagesPipeline`` are Stage-2/inference-only
+        # concerns (§9) — nothing in Stage 1 imports ltx_pipelines.
+        f"cd /opt/LTX-25 && uv pip install --system --index-strategy unsafe-best-match "
+        f"--extra-index-url https://download.pytorch.org/whl/cu129 "
+        f"'transformers=={LTX25_TRANSFORMERS_VERSION}' -e packages/ltx-core -e packages/ltx-trainer",
+    )
+    # Same VRAM-fragmentation mitigation as every other GPU image — must be a process env var set
+    # BEFORE torch's CUDA allocator initializes, so it lives on the image, not in code.
+    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+    # CODE ONLY: copy the local signet_trainer package in. NO weights (MODL-01) — the split-layout
+    # 2.5 checkpoint + Gemma-4 root are staged onto the weights Volume manually until issue #53's
+    # D3 (gated-checkpoint download approval) resolves; this design does not add a download fn
+    # (LTX25_STAGE1_DESIGN.md §9 non-goal — weights staging is explicitly out of Stage 1).
+    .add_local_python_source("signet_trainer")
+)
+
+# --------------------------------------------------------------------------------------------------
 # H3 GPU-stage image (Phase 10 — H3-07) — the MiniMax-H3 Ref2VA image. SEPARATE from ``gpu_image``:
 # the H3 path goes through ``diffusers``' ``MiniMaxH3Transformer3DModel``, NOT ltx-core/ltx-trainer, so
 # it does not carry (and must not pay for) the LTX-2 monorepo clone + three editable installs.

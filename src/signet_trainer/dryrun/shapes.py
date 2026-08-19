@@ -1329,6 +1329,45 @@ def _wan_ok_banner(cfg: SignetConfig, manifest: WanDryrunManifest) -> str:
     )
 
 
+def _assert_ltx25_dryrun_contract(cfg: SignetConfig) -> None:
+    """Belt-and-braces re-check of the ltx25 config guards, inside ``build_dryrun_inputs`` itself.
+
+    ``SignetConfig._cross_field_checks`` already refuses an illegal ltx25 shape at config LOAD
+    time — this assertion exists anyway because ``build_dryrun_inputs`` can in principle be called
+    with a config already past that stage, and the dry-run gate should never rely on a guard that
+    lives only in ``SignetConfig``'s own constructor. A no-op for every ``ltx_generation != '2.5'``
+    config (i.e. every config that exists today).
+
+    Also exercises the ``(8, 32, 32)`` VAE-compression assumption every LTX resolution bucket is
+    validated against — bounded to what is checkable WITHOUT weights (D3 is still open: no real
+    LTX-2.5 checkpoint has been read by this repo). This cannot prove the real compression factor;
+    it proves only that the dry-run's OWN seq_len arithmetic is self-consistent under the assumed
+    one, so a future edit that silently diverges the two would fail here first, on CPU, for free.
+    """
+    if cfg.model.ltx_generation != "2.5":
+        return
+    assert cfg.ltx25.checkpoint_layout in ("monolith", "split"), (
+        f"cfg.ltx25.checkpoint_layout {cfg.ltx25.checkpoint_layout!r} is not a legal layout "
+        "('monolith' or 'split')."
+    )
+    if cfg.ltx25.checkpoint_layout == "split":
+        assert cfg.ltx25.video_vae_path is not None, (
+            "cfg.ltx25.checkpoint_layout == 'split' requires ltx25.video_vae_path to be set "
+            "(redundant with the SignetConfig-level guard — belt-and-braces at the dry-run gate)."
+        )
+    width, height, frames = cfg.training_dims
+    seq_len = compute_seq_len(width, height, frames)
+    lat_f = (frames - 1) // TIME_SCALE + 1
+    lat_h = height // HEIGHT_SCALE
+    lat_w = width // WIDTH_SCALE
+    assert seq_len == lat_f * lat_h * lat_w, (
+        f"seq_len {seq_len} != lat_f*lat_h*lat_w ({lat_f}*{lat_h}*{lat_w}="
+        f"{lat_f * lat_h * lat_w}) under the assumed (8,32,32) VAE compression — the dry-run's "
+        "own arithmetic is not self-consistent (this proves nothing about the REAL 2.5 VAE "
+        "compression, which remains unread — D3)."
+    )
+
+
 def build_dryrun_inputs(cfg: SignetConfig) -> ModelInputs:
     """Build a synthetic CPU ``ModelInputs`` from the validated config dims (D-12).
 
@@ -1364,6 +1403,16 @@ def build_dryrun_inputs(cfg: SignetConfig) -> ModelInputs:
         return build_qwen_edit_dryrun_inputs(cfg)
     if cfg.model.family == "wan":
         return assert_wan_dryrun_geometry(cfg)
+
+    # LTX-2.5 Stage 1 (issue #53, LTX25_STAGE1_DESIGN.md §8) -- NOT a new dispatch arm: family
+    # stays "ltx" for both generations (§0), so the existing LTX branch below already runs for a
+    # ltx_generation=='2.5' config unchanged. This is an ADDITION inside that branch: a
+    # belt-and-braces re-check of the ltx25 config guards (redundant with the SignetConfig-level
+    # guard -- cheap, and the dry-run gate should never rely on a guard living only in
+    # SignetConfig's own constructor, since this function can in principle be called with a config
+    # already past that stage) plus one dryrun-only exercise of the (8,32,32) VAE-compression
+    # assumption every LTX bucket is validated against.
+    _assert_ltx25_dryrun_contract(cfg)
 
     width, height, frames = cfg.training_dims
     seq_len = compute_seq_len(width, height, frames)
