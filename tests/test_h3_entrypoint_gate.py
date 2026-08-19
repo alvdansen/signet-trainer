@@ -547,7 +547,11 @@ def test_h3_sample_refuses_a_missing_pipeline_root_id_pre_approval() -> None:
         "load asked for it"
     )
     refusal = source.index("config.model.pipeline_root_id is unset")
-    approval = source.index("_require_approval(approve)")
+    # issue #37's session-cap ask-first downgrade (already merged) renamed the argument passed
+    # here to `approve_for_gate` — match the CALL site ("not _require_approval(...)") generically
+    # rather than pinning the argument name, so this test does not confuse the call with the
+    # `def _require_approval(approve: bool)` definition earlier in the file.
+    approval = source.index("not _require_approval(")
     assert refusal < approval, (
         "the pipeline_root_id refusal must fire BEFORE the approval gate (zero-spend), exactly "
         "like the sibling no-reference --mode sample refusal it sits beside"
