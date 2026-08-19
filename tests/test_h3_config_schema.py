@@ -820,7 +820,13 @@ def test_multi_bucket_budget_prices_the_largest_declared_bucket() -> None:
             "resolution_buckets": ["1344x768x5", "1344x768x124"],
         },
     )
-    payload["h3"] = {}  # no references declared — exactly one layout per frame count
+    # #31 finding 1's mirror-direction guard (already merged) refuses references_per_sample != 0
+    # with BOTH size lists empty — declare 0 explicitly (NO-REFERENCE) rather than relying on the
+    # h3 block's all-default references_per_sample=2, so this config exercises ONLY the bucketing
+    # budget path under test, not the unrelated reference-corpus guard. h3_packed_seq_len's
+    # reference-free branch below takes an empty tuple either way, so the priced row count (and
+    # this test's point — the largest bucket is priced) is unchanged.
+    payload["h3"] = {"references_per_sample": 0}
     with pytest.raises(ValidationError) as exc:
         SignetConfig.model_validate(payload)
     msg = str(exc.value)

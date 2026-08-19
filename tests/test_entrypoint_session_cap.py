@@ -27,6 +27,10 @@ FILESYSTEM DISCIPLINE: every config below sets ``modal.session_spend_ledger_path
 and running these tests without the override would write that path onto the real repo tree as a
 side effect of the test suite (caught by hand: an untracked ``.planning/`` directory appeared in
 the worktree the first time this landed without the override).
+
+``run_dryrun`` stubs below take ``mode=None`` (not a bare ``cfg``): issue #45's later merge threads
+``run_dryrun(cfg, mode=mode)`` through ``main()`` for the mode-conditional dry-run refusals, and a
+stub that only accepts ``cfg`` raises ``TypeError`` on that extra keyword.
 """
 
 from __future__ import annotations
@@ -95,7 +99,7 @@ def _stub_train(monkeypatch):
 def test_within_cap_dispatches_with_raw_approve_and_books_the_ledger(tmp_path, monkeypatch) -> None:
     """Under cap: --approve authorizes as before, and the dispatch is booked to the ledger."""
     entrypoint, raw_main = _raw_main()
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _stub_train(monkeypatch)
     ledger_path = tmp_path / "SESSION-STATE.json"
 
@@ -117,7 +121,7 @@ def test_within_cap_dispatches_with_raw_approve_and_books_the_ledger(tmp_path, m
 def test_over_cap_disables_approve_but_a_present_operator_still_proceeds(tmp_path, monkeypatch) -> None:
     """ASK-FIRST DOWNGRADE: over cap, --approve is disabled but a typed 'approved' still dispatches."""
     entrypoint, raw_main = _raw_main()
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _stub_train(monkeypatch)
     # cap 1.0 < projected 2.0 -> over cap even against a fresh (spend-0.0) ledger.
     ledger_path = tmp_path / "SESSION-STATE.json"
@@ -146,7 +150,7 @@ def test_over_cap_disables_approve_but_a_present_operator_still_proceeds(tmp_pat
 def test_over_cap_non_interactive_refuses_with_no_dispatch(tmp_path, monkeypatch) -> None:
     """Over cap AND non-interactive (no operator to ask) refuses -- the yolo bound working."""
     entrypoint, raw_main = _raw_main()
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _stub_train(monkeypatch)
     monkeypatch.setattr(builtins, "input", lambda *a, **k: (_ for _ in ()).throw(EOFError()))
     ledger_path = tmp_path / "SESSION-STATE.json"
@@ -167,7 +171,7 @@ def test_over_cap_non_interactive_refuses_with_no_dispatch(tmp_path, monkeypatch
 def test_session_cap_usd_override_in_ledger_file_takes_priority_over_config(tmp_path, monkeypatch) -> None:
     """WR-02: SESSION-STATE.json's session_cap_usd, when present, is the LIVE cap over the config's."""
     entrypoint, raw_main = _raw_main()
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _stub_train(monkeypatch)
     monkeypatch.setattr(builtins, "input", lambda *a, **k: (_ for _ in ()).throw(EOFError()))
     ledger_path = tmp_path / "SESSION-STATE.json"
@@ -191,7 +195,7 @@ def test_session_cap_usd_override_in_ledger_file_takes_priority_over_config(tmp_
 def test_cumulative_spend_across_two_dispatches_trips_the_cap(tmp_path, monkeypatch) -> None:
     """A SECOND dispatch that alone fits under cap is refused once prior spend is counted (CR-01)."""
     entrypoint, raw_main = _raw_main()
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _stub_train(monkeypatch)
     ledger_path = tmp_path / "SESSION-STATE.json"
     # cap 3.0: the first $2.00 dispatch fits (cumulative 2.0 <= 3.0); a second $2.00 dispatch would
@@ -218,7 +222,7 @@ def test_corrupt_ledger_refuses_with_an_actionable_message_not_a_traceback(
     message on stderr -- never a bare ValueError traceback out of ``main()`` (medium finding,
     verify2_r.json #1)."""
     entrypoint, raw_main = _raw_main()
-    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg: 0)
+    monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
     rec = _stub_train(monkeypatch)
     ledger_path = tmp_path / "SESSION-STATE.json"
     ledger_path.write_text("{not valid json", encoding="utf-8")
