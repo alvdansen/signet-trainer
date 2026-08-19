@@ -736,7 +736,10 @@ def test_a_wan_dispatch_WITH_approve_still_refuses_on_the_declared_gaps(monkeypa
     assert "  est_hours: 6.0" in raw
     raw = raw.replace(
         "  est_hours: 6.0",
-        f'  est_hours: 6.0\n  session_spend_ledger_path: "{ledger_path}"',
+        # session_cap_usd explicit: the worst-case-priced ledger (issue #45 PR-2) would otherwise
+        # drop this non-interactive dispatch to ask-first at the $10 house-default cap BEFORE the
+        # gap refusal this test is about.
+        f'  est_hours: 6.0\n  session_spend_ledger_path: "{ledger_path}"\n  session_cap_usd: 500.0',
     )
     ungapped = tmp_path / "wan_undeclared.yaml"
     ungapped.write_text(raw, encoding="utf-8")

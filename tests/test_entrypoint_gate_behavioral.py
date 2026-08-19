@@ -36,6 +36,12 @@ data:
   preprocessed_data_root: "precomputed"
 training:
   max_steps: 10
+modal:
+  # explicit generous values: these tests exercise dispatch mechanics, not the house-default
+  # guardrail/cap (whose worst-case-ceiling pricing would otherwise ask/refuse first — see
+  # ModalConfig.session_cap_usd).
+  cost_guardrail_usd: 500.0
+  session_cap_usd: 500.0
 """
 
 
@@ -114,6 +120,10 @@ modal:
   hourly_rate_usd: {hourly_rate_usd}
   est_hours: {est_hours}
   cost_guardrail_usd: {cost_guardrail_usd}
+  # explicit generous cap: these tests exercise the guardrail/dispatch mechanics, not the $10
+  # house-default session cap (whose ask-first downgrade would otherwise refuse the non-interactive
+  # dispatch the moment the worst-case ceiling exceeds it — see ModalConfig.session_cap_usd).
+  session_cap_usd: 500.0
 """,
         encoding="utf-8",
     )
@@ -128,6 +138,9 @@ def test_retry_priced_guardrail_blocks_before_any_dispatch(tmp_path, monkeypatch
     """
     entrypoint, raw_main = _raw_main()
     monkeypatch.setattr(entrypoint, "run_dryrun", lambda cfg, mode=None: 0)
+    # If the guardrail ever regresses (the exact bug this test guards), the run would DISPATCH and
+    # book the ledger — neutralize so a red run can never write the project-relative ledger (PR #78).
+    monkeypatch.setattr(entrypoint, "append_spend", lambda *a, **k: None)
     rec = _stub_train(monkeypatch)
 
     config = _write_train_config(tmp_path, hourly_rate_usd=1.64, est_hours=2.0, cost_guardrail_usd=50.0)

@@ -1477,13 +1477,13 @@ class ModalConfig(_Base):
         description="[ASSUMED 1.64] A100-80GB $/hr guardrail constant; confirm vs live Modal pricing.",
     )
     cost_guardrail_usd: float = Field(
-        default=60.0,
+        default=50.0,
         ge=0.0,
-        description="enochiatron precedent ($50), RE-BASELINED to $60 for issue #45 PR-2: the "
-        "default train dispatch (2.0h @ 1.64/hr, timeout_margin 1.5, train's 10 server-side "
-        "retries) now prices its honest worst-case ceiling of $54.12, which the pre-PR-2 $50 "
-        "default would have blocked. Raise further (or lower est_hours / hourly_rate_usd) if your "
-        "own config's worst case still exceeds this.",
+        description="enochiatron precedent. NOTE (issue #45 PR-2): the guardrail now compares the "
+        "honest worst-case RETRY ceiling, and a default train dispatch (2.0h @ 1.64/hr, "
+        "timeout_margin 1.5, train's 10 server-side retries) prices $54.12 — over this default, so "
+        "it asks instead of auto-passing. That is the honest behavior; whether the house default "
+        "moves is the operator's call (shipped example configs carry their own explicit values).",
     )
     # WR-04: CPU-only modes (backup / restore / fuse) run on Modal fns with NO gpu= — the A100
     # hourly_rate_usd is the WRONG basis for their cost print, and with a large training est_hours
@@ -1512,8 +1512,9 @@ class ModalConfig(_Base):
         gt=0.0,
         description="[AUDIT-#5] Multiplier on est_hours used to DERIVE the sample/preprocess Modal "
         "function timeout at entrypoint dispatch (timeout ≈ est_hours * timeout_margin hours, applied "
-        "via .with_options(timeout=...)). Keeps a wedged render from burning to the 24h ceiling; "
-        "train() keeps its own 24h timeout. Consumed by 09.1-04 (no consumer logic here).",
+        "via .with_options(timeout=...)). Keeps a wedged container from burning to the 24h ceiling; "
+        "since issue #45 PR-2 this covers train() too (its bare-decorator exemption is retired). "
+        "Consumed by 09.1-04 (no consumer logic here).",
     )
     # D-10-DEF-17: the entrypoint dispatches ASYNC (``.spawn()``) so the server does not cancel an
     # in-flight run when the local client disappears. This field is the BOUNDED window the client
@@ -1662,22 +1663,28 @@ class ModalConfig(_Base):
     # D-8-YOLOCAP — cumulative session-spend cap + ledger path. Bounds yolo autonomy by REAL
     # cumulative spend (session_cap.py), not just the per-run cost_guardrail_usd above. Both are
     # config-driven (D-NOHARDCODE) so the harness/skill never hardcodes the cap or the ledger path.
-    # issue #45 PR-2 RE-BASELINE: the RESEARCH A3 house default was 10.0, calibrated to a single-life
-    # cost basis. Now that the ledger books the WORST-CASE authorized ceiling (cost.guardrail_check's
-    # lives x bounded_hours), a single train-shaped dispatch alone books ~$54 at the ModalConfig
-    # defaults — a $10 cap would drop EVERY such dispatch to ask-first regardless of prior spend,
-    # silently killing yolo/blanket autonomy rather than bounding it. Raised to 200.0, matching the
-    # live operator SESSION-STATE cap the audit found in practice (this default is what a FRESH
-    # session with no SESSION-STATE.json override gets; raise or lower per session at setup, A3).
+    # 10.0 is the RESEARCH A3 proposed house default the operator confirms at setup. Known tension
+    # since issue #45 PR-2: the ledger now books the WORST-CASE authorized ceiling
+    # (cost.guardrail_check's lives x bounded_hours), so a single train-shaped dispatch alone books
+    # ~$54 at the ModalConfig defaults and a fresh $10-cap session asks on its FIRST dispatch. That
+    # bounds unattended autonomy exactly as designed, at the cost of yolo runs asking until the cap
+    # is raised at setup (the live setup-gate cap observed in practice is $200). Moving this HOUSE
+    # default — or booking the single-life estimate while only the guardrail prices the ceiling —
+    # is an operator ruling, deliberately left open here.
     session_cap_usd: float = Field(
-        default=200.0,
+        default=10.0,
         ge=0.0,
         description="[D-8-YOLOCAP] cumulative session-spend cap (USD) — the HOUSE DEFAULT in the "
         "WR-02 chain. projected + spent must stay <= this or the harness drops to ask-first. The "
         "per-session override is the session_cap_usd the setup gate writes into "
-        "session_spend_ledger_path; when present that value is the live cap, else this default. The "
-        "training-run skill reads this chain (never a hardcoded cap); confirm the house default at "
-        "setup (A3). Re-baselined 10.0 -> 200.0 for issue #45 PR-2's worst-case ledger pricing.",
+        "session_spend_ledger_path; when present that value is the live cap, else this default. "
+        "NOTE (issue #45 PR-2): the ledger now books the worst-case retry ceiling, so a single "
+        "default train dispatch ($54.12 ceiling) exceeds this $10 default and drops to ask-first "
+        "immediately — that bounds unattended autonomy exactly as D-8-YOLOCAP intends, but makes "
+        "yolo runs ask on their first dispatch until the operator raises the cap at setup (the "
+        "live setup-gate cap observed in practice is $200). Whether the HOUSE default moves, or "
+        "the ledger should book the single-life estimate while only the guardrail prices the "
+        "ceiling, is an operator ruling — deliberately not decided here.",
     )
     session_spend_ledger_path: str = Field(
         default=".planning/harness/SESSION-STATE.json",
